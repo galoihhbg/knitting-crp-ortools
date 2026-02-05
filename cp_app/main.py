@@ -53,6 +53,7 @@ class SolverTask(BaseModel):
     sub_tasks: Optional[List['SolverTask']] = Field(default=None, alias="sub_tasks")
     design_item_id: str = Field(alias="design_item_id")
     compatible_resource_ids: List[str] = Field(default=[], alias="compatible_resource_ids")
+    sub_task_completion_offsets: Optional[Dict[str, int]] = Field(default=None, alias="sub_task_completion_offsets")
     class Config:
         populate_by_name = True
 

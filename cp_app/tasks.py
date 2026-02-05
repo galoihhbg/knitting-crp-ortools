@@ -23,6 +23,24 @@ def filter_dummy_tasks(assignments):
             
     return cleaned_assignments
 
+def filter_dummy_overloads(overloads):
+    """
+    Lọc bỏ các overload có task ID bắt đầu bằng 'DUMMY_' hoặc operation là 'Unavailability'
+    trước khi trả về cho Backend.
+    """
+    if not overloads:
+        return []
+    
+    cleaned_overloads = []
+    for overload in overloads:
+        task_id = str(overload.get("task_id", ""))
+        operation = str(overload.get("operation", ""))
+        
+        if not task_id.startswith("DUMMY_") and operation != "Unavailability":
+            cleaned_overloads.append(overload)
+            
+    return cleaned_overloads
+
 @celery_app.task(bind=True, name="optimize_schedule")
 def optimize_schedule(self, payload: dict):
     try:
@@ -32,16 +50,20 @@ def optimize_schedule(self, payload: dict):
         result = engine.solve()
         
         raw_assignments = result.get("assignments", [])
+        overloads = result.get("overloads", [])
         clean_assignments = filter_dummy_tasks(raw_assignments)
-
+        clean_overloads = filter_dummy_overloads(overloads)
         response_data = {
             "job_id": payload.get("job_id"),
             "task_id": self.request.id,
             "status": result["status"],
-            "assignments": clean_assignments
+            "assignments": clean_assignments,
+            "overloads": clean_overloads
         }
 
         print(f"Sending back to main service: {WEBHOOK_URL}")
+
+        print(f"Response Data: {response_data}")
         
         resp = requests.post(WEBHOOK_URL, json=response_data, timeout=10)
         
