@@ -760,7 +760,13 @@ class TaskModelBuilder:
         """Extract assignments and overloads from the solved model."""
         if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
             logger.warning("❌ Infeasible solution")
-            return {"status": "infeasible", "assignments": [], "overloads": []}
+            return {
+                "status": "infeasible",
+                "assignments": [],
+                "overloads": [],
+                "objective_value": None,
+                "solve_time_seconds": solver.WallTime(),
+            }
 
         logger.info(f"✅ Feasible! Objective value: {solver.ObjectiveValue()}")
         assignments = []
@@ -801,4 +807,10 @@ class TaskModelBuilder:
                         "quantity": tv.get("qty", 0),
                     })
 
-        return {"status": "feasible", "assignments": assignments, "overloads": overloads}
+        return {
+            "status": "feasible",
+            "assignments": assignments,
+            "overloads": overloads,
+            "objective_value": solver.ObjectiveValue(),
+            "solve_time_seconds": solver.WallTime(),
+        }

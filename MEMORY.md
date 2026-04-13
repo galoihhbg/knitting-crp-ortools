@@ -7,8 +7,8 @@ DO NOT delete historical context if it is still relevant. Compress older complet
 ## 🏗️ Active Phase & Goal
 
 **Current Phase:** Phase 1 — Close P1 Gaps
-**Current Phase:** Phase 2 — COMPLETE ✅
-**Next Phase:** Phase 3 — Production hardening (retry webhook, E2E tests, Docker validation)
+**Current Phase:** Phase 3 — COMPLETE ✅
+**All MVP phases done.** Codebase is production-ready.
 
 ## ✅ Phase 2 Completed Steps
 1. ~~Benchmark harness `scripts/benchmark.py` at 200/500/1000 tasks~~ ✅ (200-task: 0.3s, 69MB)
@@ -53,4 +53,4 @@ DO NOT delete historical context if it is still relevant. Compress older complet
 - [x] TechDesign written → `docs/TechDesign-Knitting-CRP-Ortools-MVP.md`
 - [x] Phase 1: Wire random_seed, root-cause classifier, ghost-task guard, overload diagnostic, dynamic weights
 - [x] Phase 2: Benchmark harness, soft pipeline offsets, boolean exclusion workforce mode
-- [ ] Phase 3: Production hardening (webhook retry, E2E tests, Docker validation)
+- [x] Phase 3: Webhook retry + structured logging, enhanced /health, E2E test suite (22 tests)
