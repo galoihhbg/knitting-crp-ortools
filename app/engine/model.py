@@ -67,15 +67,71 @@ class Engine:
         if not self.tasks:
             return {"status": "feasible", "assignments": [], "overloads": []}
 
-        builder = (
-            TaskModelBuilder(self.config, self.resources, self.tasks, self.machine_states)
-            .build_time_variables()
+        builder = TaskModelBuilder(self.config, self.resources, self.tasks, self.machine_states)
+        builder.build_time_variables()
+
+        # If any tasks have no compatible resource, the schedule is infeasible.
+        # Return structured overloads so the Go backend / operator can act on them.
+        if builder.no_resource_tasks:
+            ids = [t["task_id"] for t in builder.no_resource_tasks]
+            logger.error(
+                f"❌ {len(ids)} task(s) have no compatible resource — "
+                f"returning infeasible: {ids}"
+            )
+            return {
+                "status": "infeasible",
+                "assignments": [],
+                "overloads": [
+                    {
+                        "task_id": t["task_id"],
+                        "order_id": t.get("original_order_id", ""),
+                        "status": "UNSCHEDULABLE",
+                        "delay_minutes": 0,
+                        "root_cause_code": "NO_COMPATIBLE_RESOURCE",
+                        "bottleneck_resource_id": None,
+                        "quantity": t.get("qty", 0),
+                    }
+                    for t in builder.no_resource_tasks
+                ],
+                "objective_value": None,
+                "solve_time_seconds": 0.0,
+            }
+
+        (
+            builder
             .build_resource_allocations()
             .apply_routing_constraints()
             .apply_dependency_constraints()
             .apply_batch_offset_constraints()
             .define_objective()
         )
+
+        # After full model build, check again — build_resource_allocations may discover
+        # tasks whose compatible_resource_ids are all absent from resource_map.
+        if builder.no_resource_tasks:
+            ids = [t["task_id"] for t in builder.no_resource_tasks]
+            logger.error(
+                f"❌ {len(ids)} task(s) found no matching resources in resource_map — "
+                f"returning infeasible: {ids}"
+            )
+            return {
+                "status": "infeasible",
+                "assignments": [],
+                "overloads": [
+                    {
+                        "task_id": t["task_id"],
+                        "order_id": t.get("original_order_id", ""),
+                        "status": "UNSCHEDULABLE",
+                        "delay_minutes": 0,
+                        "root_cause_code": "NO_COMPATIBLE_RESOURCE",
+                        "bottleneck_resource_id": None,
+                        "quantity": t.get("qty", 0),
+                    }
+                    for t in builder.no_resource_tasks
+                ],
+                "objective_value": None,
+                "solve_time_seconds": 0.0,
+            }
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = int(self.config.get("max_search_time", 60))

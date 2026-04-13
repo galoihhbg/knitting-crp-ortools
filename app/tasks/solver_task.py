@@ -21,6 +21,7 @@ _ROOT_CAUSE_CODES = (
     "WORKFORCE_SHORTAGE",
     "PINNED_TASK_CONFLICT",
     "CAPACITY_FULL",
+    "NO_COMPATIBLE_RESOURCE",
 )
 
 
@@ -103,4 +104,16 @@ def optimize_schedule(self, payload: dict):
 
     except Exception as exc:
         logger.error(f"[Task {self.request.id}] Error: {exc}", exc_info=True)
+        # Notify the Go backend so it doesn't wait forever for a callback that
+        # will never arrive.  The task is still re-raised so Celery marks it failed.
+        _post_webhook(
+            {
+                "job_id": payload.get("job_id"),
+                "task_id": self.request.id,
+                "status": "infeasible",
+                "assignments": [],
+                "overloads": [],
+            },
+            self.request.id,
+        )
         raise

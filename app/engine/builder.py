@@ -63,6 +63,12 @@ class TaskModelBuilder:
         # a 1-minute delay doesn't appear negligible relative to the huge time scale.
         self.lateness_scale: int = max(1, self.horizon // 1000)
 
+        # Tasks that were skipped because no compatible resource exists.
+        # Populated by build_time_variables() and build_resource_allocations().
+        # Engine.solve() checks this after the builder chain to return a structured
+        # infeasible result instead of silently proceeding with a partial model.
+        self.no_resource_tasks: List[Dict[str, Any]] = []
+
         # Build the sub-task → batch-task translation map once during construction
         self.task_translation_map: Dict[str, str] = {}
         self._build_translation_map()
@@ -194,6 +200,7 @@ class TaskModelBuilder:
             operation = t.get("operation", "").lower()
             if t.get("operation") != "capacity_block" and not compatible_ids:
                 logger.warning(f"⚠️ Task {t_id} has NO compatible resources — skipping.")
+                self.no_resource_tasks.append(t)
                 continue
 
             priority = int(t.get("priority", 5))
@@ -424,6 +431,14 @@ class TaskModelBuilder:
                 if penalty > 0:
                     self.objective_terms.append(is_selected * penalty * 10 * self.lateness_scale)
 
+            if not literals:
+                logger.warning(
+                    f"⚠️ Task {t_id}: none of {tv['r_ids']} found in resource_map — "
+                    "no assignment possible. Marking as unschedulable."
+                )
+                self.no_resource_tasks.append(t)
+                continue
+
             self.model.AddExactlyOne(literals)
             tv["literals"] = literals
 
@@ -466,6 +481,9 @@ class TaskModelBuilder:
                 # Lọc các biến (variables) của PO này trên máy r_id
                 for t in tasks_in_po:
                     tid = t["task_id"]
+                    if tid not in self.task_vars:
+                        # Task was skipped (no compatible resources) — do not crash
+                        continue
                     tv = self.task_vars[tid]
                     lit = next((l for l in tv["literals"] if l.Name().endswith(f"_on_{r_id}")), None)
                     if lit is not None:
