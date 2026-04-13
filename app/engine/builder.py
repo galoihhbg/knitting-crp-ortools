@@ -196,7 +196,6 @@ class TaskModelBuilder:
                 logger.warning(f"⚠️ Task {t_id} has NO compatible resources — skipping.")
                 continue
 
-            duration = int(t["duration"])
             priority = int(t.get("priority", 5))
             due_at = int(t.get("due_at_min", self.horizon))
             start_after = int(t.get("start_after_min", 0))
@@ -247,9 +246,6 @@ class TaskModelBuilder:
         return self
     
     def build_workforce_constraints(self):
-        knitting_intervals = []
-        demands = []
-        
         # Lấy giới hạn tuyệt đối của xưởng từ data truyền sang (Ví dụ: 100 máy)
         # Nếu không có, mặc định là 100
         print(f"\n🔢 MAX_FACTORY_MACHINES from config: {self.config.get('max_factory_machines', 'Not set, defaulting to 100')}")
@@ -266,42 +262,102 @@ class TaskModelBuilder:
                 "AddCumulative propagation may slow. Consider splitting shift windows."
             )
 
+        # Choose workforce constraint strategy.
+        # Boolean exclusion (slot-based NoOverlap) is lighter on RAM when there are many
+        # capacity_block ghost tasks, because it avoids adding them all to one large
+        # AddCumulative propagator.  It trades RAM for slightly more BoolVars.
+        # Triggered automatically when ghost_count > 200, or by explicit config flag.
+        _use_bool = bool(self.config.get("use_boolean_exclusion", False)) or _ghost_count > 200
+
+        if _use_bool:
+            logger.info(
+                f"⚙️  Workforce mode: BOOLEAN EXCLUSION (ghost_count={_ghost_count}, "
+                f"max_machines={MAX_FACTORY_MACHINES})"
+            )
+            self._build_workforce_boolean(MAX_FACTORY_MACHINES)
+        else:
+            self._build_workforce_cumulative(MAX_FACTORY_MACHINES)
+
+    def _build_workforce_cumulative(self, MAX_FACTORY_MACHINES: int) -> None:
+        """Original AddCumulative approach — fast and compact for < 200 ghost tasks."""
+        knitting_intervals = []
+        demands = []
+
         for t_id, tv in self.task_vars.items():
-            # Tìm thông tin task gốc
             task_info = next((t for t in self.tasks if t["task_id"] == t_id), {})
             operation = task_info.get("operation", "").lower()
             duration = int(task_info.get("duration", 0))
-            
+
             # 1. NẾU LÀ TASK DỆT THỰC TẾ
             if operation == "knitting":
-                # Tạo một IntervalVar ghép từ start_var, duration, và end_var
                 interval = self.model.NewIntervalVar(
-                    tv["start"], 
-                    duration, 
-                    tv["end"],      
+                    tv["start"], duration, tv["end"],
                     f"global_interval_{t_id}"
                 )
                 knitting_intervals.append(interval)
-                demands.append(1) # Mỗi mẻ dệt chiếm 1 năng lực (1 máy)
-                
+                demands.append(1)
+
             # 2. NẾU LÀ GHOST TASK KHÓA NĂNG LỰC
             elif operation == "capacity_block":
-                # Dummy Task đã bị ghim, tv["start"] và tv["end"] đang là hằng số
                 interval = self.model.NewIntervalVar(
-                    tv["start"], 
-                    duration, 
-                    tv["end"], 
+                    tv["start"], duration, tv["end"],
                     f"global_interval_{t_id}"
                 )
                 knitting_intervals.append(interval)
-                
-                # Lấy số lượng máy cần chặn từ trường demand
                 blocked_demand = int(task_info.get("demand", 0))
                 demands.append(blocked_demand)
 
-        # 3. Add Cumulative Ràng buộc tổng năng lực
         if knitting_intervals:
             self.model.AddCumulative(knitting_intervals, demands, MAX_FACTORY_MACHINES)
+
+    def _build_workforce_boolean(self, MAX_FACTORY_MACHINES: int) -> None:
+        """
+        Slot-based NoOverlap alternative to AddCumulative.
+
+        Each knitting task is assigned to exactly one of MAX_FACTORY_MACHINES virtual
+        machine slots via a BoolVar.  capacity_block tasks occupy their first `demand`
+        slots as fixed intervals, preventing knitting tasks on those slots from running
+        concurrently with the block.
+
+        RAM trade-off vs. AddCumulative:
+          - Saves: no large cumulative propagator with many ghost-task intervals
+          - Costs: MAX_FACTORY_MACHINES BoolVars per knitting task
+          - Break-even: typically around 200 ghost tasks (hence the auto-trigger)
+        """
+        n_slots = max(1, int(MAX_FACTORY_MACHINES))
+        slot_intervals: List[List] = [[] for _ in range(n_slots)]
+
+        for t_id, tv in self.task_vars.items():
+            task_info = next((t for t in self.tasks if t["task_id"] == t_id), {})
+            operation = task_info.get("operation", "").lower()
+            duration = int(task_info.get("duration", 0))
+
+            if operation == "capacity_block":
+                # Occupy first `demand` slots — same semantics as AddCumulative demand.
+                blocked = min(int(task_info.get("demand", 0)), n_slots)
+                for s in range(blocked):
+                    iv = self.model.NewIntervalVar(
+                        tv["start"], duration, tv["end"],
+                        f"block_{t_id}_vslot_{s}"
+                    )
+                    slot_intervals[s].append(iv)
+
+            elif operation == "knitting":
+                slot_bools = [
+                    self.model.NewBoolVar(f"{t_id}_vslot_{s}")
+                    for s in range(n_slots)
+                ]
+                self.model.AddExactlyOne(slot_bools)
+                for s, sb in enumerate(slot_bools):
+                    opt_iv = self.model.NewOptionalIntervalVar(
+                        tv["start"], duration, tv["end"], sb,
+                        f"k_{t_id}_vslot_{s}"
+                    )
+                    slot_intervals[s].append(opt_iv)
+
+        for s in range(n_slots):
+            if slot_intervals[s]:
+                self.model.AddNoOverlap(slot_intervals[s])
 
     def build_resource_allocations(self) -> "TaskModelBuilder":
         resource_usage_literals: Dict[str, List[cp_model.IntVar]] = {
@@ -525,8 +581,30 @@ class TaskModelBuilder:
 
         Go backend provides:
             WaitOffsets — dictionary mapping BatchTaskID -> offset in minutes
+
+        Overload-adaptive mode:
+            When factory load > 85 %, hard offsets risk making the model infeasible
+            because the solver cannot find a slot that simultaneously satisfies both
+            the machine capacity and the pipeline window.  In that case we relax to
+            soft constraints: a penalty proportional to the pipeline violation is
+            added to the objective (weight = P5_lateness / 10) so the solver can
+            slide the linking start slightly without being declared infeasible.
         """
-        logger.info("\n⏱  BATCH OFFSET CONSTRAINTS (WaitOffsets):")
+        # Compute factory load once to decide hard vs. soft mode.
+        _total_knitting = sum(
+            int(t.get("duration", 0))
+            for t in self.tasks
+            if t.get("operation", "").lower() == "knitting"
+        )
+        _cap = int(self.config.get("max_factory_machines", 100)) * self.horizon
+        _is_overloaded = (_total_knitting / max(1, _cap)) > 0.85
+
+        # PIPELINE_VIOLATION_WEIGHT ≈ P5 lateness weight / 10 (less severe than real lateness)
+        _pipeline_w = 100 * self.lateness_scale
+
+        mode_label = "SOFT (factory overloaded)" if _is_overloaded else "HARD"
+        logger.info(f"\n⏱  BATCH OFFSET CONSTRAINTS (WaitOffsets) — {mode_label}:")
+
         for t in self.tasks:
             t_id = t["task_id"]
             if t_id not in self.task_vars:
@@ -539,7 +617,7 @@ class TaskModelBuilder:
 
             for raw_batch_id, offset in wait_offsets.items():
                 actual_batch = self.task_translation_map.get(raw_batch_id, raw_batch_id)
-                
+
                 if actual_batch not in self.task_vars:
                     logger.warning(
                         f"   ⚠️ '{t_id}': wait_for_batch '{raw_batch_id}' "
@@ -548,12 +626,29 @@ class TaskModelBuilder:
                     continue
 
                 offset_val = int(offset)
-                logger.info(f"   ⏱  {t_id} waits for {actual_batch} at offset +{offset_val}")
-                
-                self.model.Add(
-                    self.task_vars[t_id]["start"]
-                    >= self.task_vars[actual_batch]["start"] + offset_val
-                )
+
+                if _is_overloaded:
+                    # Soft: penalise pipeline violations but never block the solver.
+                    # violation = max(0, (batch.start + offset) - downstream.start)
+                    viol = self.model.NewIntVar(
+                        0, self.horizon, f"pipe_viol_{t_id}_{actual_batch}"
+                    )
+                    self.model.Add(
+                        viol >= self.task_vars[actual_batch]["start"]
+                               + offset_val
+                               - self.task_vars[t_id]["start"]
+                    )
+                    self.objective_terms.append(viol * _pipeline_w)
+                    logger.info(
+                        f"   ⚠️  SOFT {t_id} ← {actual_batch} +{offset_val}"
+                    )
+                else:
+                    # Hard: strict pipeline dependency.
+                    self.model.Add(
+                        self.task_vars[t_id]["start"]
+                        >= self.task_vars[actual_batch]["start"] + offset_val
+                    )
+                    logger.info(f"   ⏱  {t_id} waits for {actual_batch} at offset +{offset_val}")
 
         return self
 
