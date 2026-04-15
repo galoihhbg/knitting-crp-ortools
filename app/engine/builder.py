@@ -235,6 +235,20 @@ class TaskModelBuilder:
             self.model.Add(lateness >= end_var - due_at)
             self.objective_terms.append(lateness * weight * 1000 * self.lateness_scale)
 
+            # Early-start preference: push every free task to start as early as
+            # its constraints allow.  Without this, the solver accepts lazy
+            # schedules where tasks sit idle for no reason (because lateness is
+            # only penalised when end_var > due_at, not when there's slack).
+            #
+            # Weight = priority_weight × lateness_scale (1/1000 of lateness
+            # per minute).  This is strong enough to outweigh the machine
+            # activation cost (2 × lateness_scale) for any delay > ~1 minute,
+            # so the solver will prefer assigning batches to separate machines
+            # (parallelism) over serialising them on one machine to save
+            # activation — which is the root cause of delayed linking.
+            if not is_pinned and operation != "capacity_block":
+                self.objective_terms.append(start_var * weight * self.lateness_scale)
+
             self.task_vars[t_id] = {
                 "start": start_var,
                 "end": end_var,
@@ -539,7 +553,38 @@ class TaskModelBuilder:
         2. Inferred: Linking tasks must wait for all Knitting batches of the same
            order to finish — used as a fallback when Go hasn't yet set
            wait_for_batch_task_id on older payload versions.
+
+        Flow continuity: for each A→B dependency where B is not a washing
+        operation, a gap penalty (start_B - end_A) is added to the objective so
+        the solver schedules B immediately after A instead of drifting lazily.
+        Weight = priority_weight * lateness_scale (1000× lighter than lateness
+        per minute, so gaps are closed when cheap but never override urgency).
         """
+        _gap_ctr: List[int] = [0]  # mutable counter for unique CP-SAT var names
+
+        def _add_gap_penalty(parent_id: str, child_id: str) -> None:
+            """Add a flow-continuity gap penalty for the parent→child edge."""
+            child_info = next((t for t in self.tasks if t["task_id"] == child_id), {})
+            # Washing tasks intentionally batch up before starting — no gap pressure.
+            if child_info.get("operation", "").lower() == "washing":
+                return
+            # Pinned tasks can't move; adding a penalty is pointless.
+            if child_info.get("is_pinned", False):
+                return
+            priority = int(child_info.get("priority", 5))
+            # Gap weight is 1/10 of early-start weight so that when L has
+            # multiple K predecessors the solver never delays an early-finishing
+            # K just to shrink its gap (perverse incentive).  The early-start
+            # term on each K already handles unnecessary idle time.
+            _gap_w = max(1, (10 ** (6 - priority)) * self.lateness_scale // 10)
+            _gap_ctr[0] += 1
+            gap_var = self.model.NewIntVar(0, self.horizon, f"gap_{_gap_ctr[0]}")
+            self.model.Add(
+                gap_var >= self.task_vars[child_id]["start"] - self.task_vars[parent_id]["end"]
+            )
+            self.objective_terms.append(gap_var * _gap_w)
+            logger.info(f"   ⏩ GAP: {child_id} should follow {parent_id} immediately (w={_gap_w})")
+
         # 1. Explicit final_depends_on
         logger.info("\n📋 APPLYING DEPENDENCY CONSTRAINTS:")
         for t_id, tv in self.task_vars.items():
@@ -548,6 +593,7 @@ class TaskModelBuilder:
                 if actual in self.task_vars:
                     logger.info(f"   ✅ DEP: {t_id} waits for END of {actual} (raw: '{parent_id}')")
                     self.model.Add(tv["start"] >= self.task_vars[actual]["end"])
+                    _add_gap_penalty(actual, t_id)
                 else:
                     logger.warning(
                         f"⚠️ Task '{t_id}' depends on '{parent_id}' "
@@ -585,6 +631,7 @@ class TaskModelBuilder:
             for k_batch_id in sorted(k_batch_ids):
                 logger.info(f"   🔗 INFERRED: {l_id} waits for END of {k_batch_id}")
                 self.model.Add(l_tv["start"] >= self.task_vars[k_batch_id]["end"])
+                _add_gap_penalty(k_batch_id, l_id)
 
             if not k_batch_ids:
                 logger.warning(f"   ⚠️ No K batch found for L task '{l_id}' (base: '{l_base}')")
