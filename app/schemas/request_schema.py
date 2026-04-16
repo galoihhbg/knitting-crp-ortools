@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 
 
+
 class TimeWindow(BaseModel):
     start: int
     end: int
@@ -69,6 +70,7 @@ class SolverTask(BaseModel):
     pinned_start_time: Optional[int] = Field(default=None, alias="pinned_start_time")
     pinned_end_time: Optional[int] = Field(default=None, alias="pinned_end_time")
     demand: int = Field(default=1, alias="demand")
+    material_demands: Dict[str, int] = Field(default_factory=dict, alias="material_demands")
 
     class Config:
         populate_by_name = True
@@ -89,3 +91,7 @@ class SolverPayload(BaseModel):
     machines: List[Machine]
     resources: List[SolverResource] = Field(default_factory=list)
     tasks: List[SolverTask]
+    material_capacities: Dict[str, int] = Field(
+        default_factory=dict,
+        description="Per-material creel capacity: material_code → total available rolls/slots",
+    )

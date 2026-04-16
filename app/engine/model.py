@@ -62,12 +62,25 @@ class Engine:
 
         self.resources = payload.get("resources", [])
         self.tasks = payload.get("tasks", [])
+        # Top-level material creel capacities: material_code → max concurrent rolls/slots.
+        # Empty dict when the Go backend does not send the field (feature disabled).
+        self.material_capacities: Dict[str, int] = payload.get("material_capacities") or {}
+        if self.material_capacities:
+            logger.info(
+                f"📦 material_capacities received: {self.material_capacities} "
+                f"({len(self.material_capacities)} material(s))"
+            )
+        else:
+            logger.info("📦 material_capacities: not present in payload — material constraints disabled")
 
     def solve(self) -> Dict[str, Any]:
         if not self.tasks:
             return {"status": "feasible", "assignments": [], "overloads": []}
 
-        builder = TaskModelBuilder(self.config, self.resources, self.tasks, self.machine_states)
+        builder = TaskModelBuilder(
+            self.config, self.resources, self.tasks, self.machine_states,
+            self.material_capacities,
+        )
         builder.build_time_variables()
 
         # If any tasks have no compatible resource, the schedule is infeasible.
@@ -100,6 +113,7 @@ class Engine:
         (
             builder
             .build_resource_allocations()
+            .build_material_constraints()
             .apply_routing_constraints()
             .apply_dependency_constraints()
             .apply_batch_offset_constraints()

@@ -58,23 +58,15 @@ These rules apply to all AI coding assistants working in this repo:
 
 ## Active Phase
 
-**Phase 1 — Close P1 Gaps (current)**
+**Phase 4 — Dynamic Material Constraints ✅ COMPLETE**
 
-See `MEMORY.md` for current task state.
+All prior phases (P1–P3) are complete. See `MEMORY.md`.
 
-Implementation order from `docs/TechDesign-Knitting-CRP-Ortools-MVP.md`:
-1. Wire `random_seed` + `num_search_workers` → `request_schema.py` + `model.py`
-2. Write determinism regression test + 200-task fixture
-3. Implement `_classify_root_cause()` in `builder.py`
-4. Write root-cause classification tests + fixtures
-5. Add ghost-task count guard + warning
-6. Add overload-ratio diagnostic log to `model.py`
-7. Implement dynamic objective weight calibration in `builder.py`
-
-**Phase 2 — Validation (after Phase 1)**
-- Benchmark harness at 200/500/1000 tasks
-- Soft pipeline offset relaxation
-- Boolean exclusion option for workforce constraints
+**Phase 4 additions (2026-04-15):**
+1. ~~`SolverPayload.material_capacities` + `SolverTask.material_demands` schema fields~~ ✅
+2. ~~`TaskModelBuilder.build_material_constraints()` — `AddCumulative` per material~~ ✅
+3. ~~`Engine.solve()` wired: `build_resource_allocations → build_material_constraints → apply_routing_constraints`~~ ✅
+4. ~~`tests/test_material_constraints.py` (6 tests)~~ ✅
 
 ## Key Files Reference
 
@@ -85,6 +77,7 @@ Implementation order from `docs/TechDesign-Knitting-CRP-Ortools-MVP.md`:
 | `app/schemas/request_schema.py` | Go → Python contract (DO NOT break aliases) |
 | `app/schemas/response_schema.py` | Python → Go contract |
 | `app/tasks/solver_task.py` | Celery task + webhook callback |
+| `tests/test_material_constraints.py` | Material cumulative constraint tests |
 | `docs/PRD-Knitting-CRP-Ortools-MVP.md` | What to build + acceptance criteria |
 | `docs/TechDesign-Knitting-CRP-Ortools-MVP.md` | How to build it + implementation sketches |
 | `agent_docs/code_patterns.md` | CP-SAT patterns specific to this project |

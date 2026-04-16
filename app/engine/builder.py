@@ -1,6 +1,6 @@
 import re
 import logging
-from typing import Dict, Any, List, Set
+from typing import Dict, Any, List, Optional, Set
 
 from ortools.sat.python import cp_model
 
@@ -38,6 +38,7 @@ class TaskModelBuilder:
         resources: List[Dict[str, Any]],
         tasks: List[Dict[str, Any]],
         machine_states: Dict[str, Dict[str, str]],
+        material_capacities: Optional[Dict[str, int]] = None,
     ) -> None:
         self.model = cp_model.CpModel()
         self.config = config
@@ -68,6 +69,10 @@ class TaskModelBuilder:
         # Engine.solve() checks this after the builder chain to return a structured
         # infeasible result instead of silently proceeding with a partial model.
         self.no_resource_tasks: List[Dict[str, Any]] = []
+
+        # Per-material creel capacities: material_code → max concurrent rolls/slots.
+        # Populated from SolverPayload.material_capacities; empty dict = feature disabled.
+        self.material_capacities: Dict[str, int] = material_capacities or {}
 
         # Build the sub-task → batch-task translation map once during construction
         self.task_translation_map: Dict[str, str] = {}
@@ -527,6 +532,123 @@ class TaskModelBuilder:
         self.build_workforce_constraints()
         return self
 
+    def build_material_constraints(self) -> "TaskModelBuilder":
+        """
+        Apply per-material Creel capacity constraints via AddCumulative (Profile Sweep).
+
+        For each material declared in self.material_capacities this method:
+          1. Collects fixed IntervalVars bound strictly to each task's [start, end].
+          2. Collects the integer demand for that material from task.material_demands.
+          3. Calls model.AddCumulative(intervals, demands, capacity) — O(n log n) sweep,
+             no combinatorial BoolVar explosion, no tracking between task pairs.
+
+        Material is released automatically when the task ends because the interval
+        is anchored to tv["end"]. Called after build_resource_allocations() so
+        task_vars are fully populated.
+
+        Guardrails (per implementation spec):
+          - NO O(N²) transition BoolVars between tasks.
+          - ALL demands and capacities are int — no float.
+          - Intervals are strictly [task.start, task.end] — material released on finish.
+        """
+        if not self.material_capacities:
+            logger.info("📦 build_material_constraints: material_capacities is empty — skipped")
+            return self
+
+        logger.info(
+            f"\n📦 MATERIAL CONSTRAINTS: {len(self.material_capacities)} material(s) declared\n"
+            + "\n".join(
+                f"   capacity['{mat}'] = {cap}"
+                for mat, cap in self.material_capacities.items()
+            )
+        )
+
+        # Step 1: Initialize per-material interval/demand lists
+        mat_intervals: Dict[str, List] = {mat: [] for mat in self.material_capacities}
+        mat_demands: Dict[str, List[int]] = {mat: [] for mat in self.material_capacities}
+
+        # Step 2: Flatten task demands into per-material lists
+        tasks_with_demands = 0
+        for t in self.tasks:
+            t_id = t["task_id"]
+            if t_id not in self.task_vars:
+                continue  # No compatible resource — excluded from the model
+
+            task_mat_demands: Dict[str, int] = t.get("material_demands") or {}
+            if not task_mat_demands:
+                continue
+
+            tasks_with_demands += 1
+            tv = self.task_vars[t_id]
+
+            # Compute actual duration — pinned tasks use their exact pinned window
+            pinned_start = t.get("pinned_start_time")
+            pinned_end = t.get("pinned_end_time")
+            is_fully_pinned = (
+                t.get("is_pinned") and pinned_start is not None and pinned_end is not None
+            )
+            duration: int = (
+                int(pinned_end) - int(pinned_start)
+                if is_fully_pinned
+                else int(t.get("duration", 0))
+            )
+
+            if duration <= 0:
+                logger.warning(
+                    f"   ⚠️ Task {t_id}: non-positive duration ({duration}) — "
+                    "skipping material interval"
+                )
+                continue
+
+            for mat_code, demand in task_mat_demands.items():
+                if mat_code not in mat_intervals:
+                    logger.warning(
+                        f"   ⚠️ Task {t_id}: material '{mat_code}' not in material_capacities "
+                        f"(declared: {list(self.material_capacities)}) — skipping"
+                    )
+                    continue
+
+                demand_int = int(demand)
+                if demand_int <= 0:
+                    continue
+
+                # Strictly bound to this task's start/end — material released when task finishes
+                interval = self.model.NewIntervalVar(
+                    tv["start"], duration, tv["end"],
+                    f"mat_{mat_code}_{t_id}",
+                )
+                mat_intervals[mat_code].append(interval)
+                mat_demands[mat_code].append(demand_int)
+                logger.info(
+                    f"   📌 {t_id} → '{mat_code}': demand={demand_int}, duration={duration}"
+                )
+
+        logger.info(
+            f"   📊 Tasks with material_demands: {tasks_with_demands}/{len(self.tasks)} total tasks"
+        )
+
+        # Step 3: Apply AddCumulative per material
+        for mat_code, capacity in self.material_capacities.items():
+            intervals = mat_intervals.get(mat_code, [])
+            demands = mat_demands.get(mat_code, [])
+
+            if not intervals:
+                logger.warning(
+                    f"   ⚠️ '{mat_code}': capacity declared ({capacity}) but NO task has "
+                    "material_demands for this material — AddCumulative skipped. "
+                    "Check that task.material_demands keys match material_capacities keys."
+                )
+                continue
+
+            capacity_int = int(capacity)
+            self.model.AddCumulative(intervals, demands, capacity_int)
+            logger.info(
+                f"   ✅ '{mat_code}': AddCumulative applied "
+                f"({len(intervals)} tasks, capacity={capacity_int})"
+            )
+
+        return self
+
     def apply_routing_constraints(self) -> "TaskModelBuilder":
         """
         Enforce that no two tasks overlap on the same resource, and that tasks
@@ -585,15 +707,35 @@ class TaskModelBuilder:
             self.objective_terms.append(gap_var * _gap_w)
             logger.info(f"   ⏩ GAP: {child_id} should follow {parent_id} immediately (w={_gap_w})")
 
+        def _resolve_dependency(upstream_id: str, downstream_id: str) -> None:
+            """
+            Add the standard end-dependency: downstream must wait for upstream
+            to fully complete before it can start.
+
+            Linking requires full sub-batch output (material is only ready when
+            the knitting run finishes), so no mid-batch pipelining is allowed.
+            """
+            self.model.Add(
+                self.task_vars[downstream_id]["start"] >= self.task_vars[upstream_id]["end"]
+            )
+            _add_gap_penalty(upstream_id, downstream_id)
+
         # 1. Explicit final_depends_on
         logger.info("\n📋 APPLYING DEPENDENCY CONSTRAINTS:")
         for t_id, tv in self.task_vars.items():
             for parent_id in tv["depends_on"]:
-                actual = self.task_translation_map.get(parent_id, parent_id)
+                # Direct-lookup preference: if the dependency ID is already a
+                # schedulable unit (in task_vars), use it as-is so Go can send
+                # granular sub-batch IDs (e.g. K1_b1) and bypass batch aggregation.
+                # Fall back to the translation map only when the direct ID is absent.
+                if parent_id in self.task_vars:
+                    actual = parent_id
+                else:
+                    actual = self.task_translation_map.get(parent_id, parent_id)
+
                 if actual in self.task_vars:
-                    logger.info(f"   ✅ DEP: {t_id} waits for END of {actual} (raw: '{parent_id}')")
-                    self.model.Add(tv["start"] >= self.task_vars[actual]["end"])
-                    _add_gap_penalty(actual, t_id)
+                    logger.info(f"   ✅ DEP: {t_id} ← {actual} (raw: '{parent_id}')")
+                    _resolve_dependency(actual, t_id)
                 else:
                     logger.warning(
                         f"⚠️ Task '{t_id}' depends on '{parent_id}' "
@@ -629,9 +771,8 @@ class TaskModelBuilder:
                     k_batch_ids.add(batch_id)
 
             for k_batch_id in sorted(k_batch_ids):
-                logger.info(f"   🔗 INFERRED: {l_id} waits for END of {k_batch_id}")
-                self.model.Add(l_tv["start"] >= self.task_vars[k_batch_id]["end"])
-                _add_gap_penalty(k_batch_id, l_id)
+                logger.info(f"   🔗 INFERRED: {l_id} ← {k_batch_id}")
+                _resolve_dependency(k_batch_id, l_id)
 
             if not k_batch_ids:
                 logger.warning(f"   ⚠️ No K batch found for L task '{l_id}' (base: '{l_base}')")
