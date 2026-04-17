@@ -250,6 +250,7 @@ def test_scaling_workers_5_to_10():
         )
 
 
+
 # ── Test 5: Diagnostic — print all internal state ─────────────────────────
 
 def test_diagnostic_print_builder_state():
@@ -330,3 +331,50 @@ def test_diagnostic_print_builder_state():
     assert result["status"] == "feasible"
     assigns = {a["task_id"]: a for a in result["assignments"]}
     assert "FREE_B" in assigns, f"FREE_B not scheduled!"
+
+
+# ── Test 6: Two pinned knitting tasks with mismatched "duration" field ─────
+
+def test_two_pinned_knitting_tasks_duration_mismatch():
+    """
+    Regression for "2-order infeasible" bug.
+
+    When Go sends pinned knitting task with:
+      pinned_start_time = 0, pinned_end_time = 480
+      but "duration" field = 0 (or any value != 480)
+
+    The old code called:
+      NewIntervalVar(NewConstant(0), 0, NewConstant(480))
+    which forces 480 == 0 + 0 → HARD CONTRADICTION → INFEASIBLE.
+
+    With 1 task the constraint might accidentally be satisfied (if duration
+    matches), but with 2 tasks even one mismatch makes the whole model fail.
+    """
+    resources = [_resource("KM_00"), _resource("KM_01")]
+
+    # Pinned start=0, end=480, but "duration" field = 0 (Go sends wrong value)
+    pinned_wrong_duration = {
+        **_pinned_task("PINNED_KM00", "KM_00", 0, 480),
+        "duration": 0,   # ← This is what the old code used for NewIntervalVar size
+    }
+    pinned_correct = {
+        **_pinned_task("PINNED_KM01", "KM_01", 0, 480),
+        "duration": 0,   # Same issue on second machine
+    }
+
+    tasks = [
+        pinned_wrong_duration,
+        pinned_correct,
+        _free_task("FREE_A", ["KM_00", "KM_01"], duration=200),
+    ]
+
+    result = _solve(resources, tasks)
+    # Without fix: infeasible (NewIntervalVar forces 480 == 0 + 0)
+    # With fix: feasible (uses pinned_end - pinned_start = 480)
+    assert result["status"] == "feasible", (
+        f"Expected feasible but got {result['status']}. "
+        "This is the 2-order duration mismatch regression."
+    )
+    assigns = _get_assignments_by_id(result)
+    assert "FREE_A" in assigns, f"FREE_A not scheduled!"
+

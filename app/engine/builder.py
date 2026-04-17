@@ -77,10 +77,86 @@ class TaskModelBuilder:
         # Build the sub-task → batch-task translation map once during construction
         self.task_translation_map: Dict[str, str] = {}
         self._build_translation_map()
+        
+        # Merge overlapping dummy shift tasks to prevent AddNoOverlap infeasible crashes
+        self._sanitize_dummy_tasks()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _sanitize_dummy_tasks(self) -> None:
+        """
+        Groups and merges any overlapping dummy tasks (is_pinned=True, qty=0) that are
+        assigned to the same machine.
+        
+        Why: When worker count spikes exceed the available W_LINKING_XX virtual slots,
+        the Go backend maps multiple shift blockers to the same virtual machine.
+        If these blockers overlap in time, OR-Tools will fail immediately on AddNoOverlap.
+        Since dummy tasks just represent 'blocked time' rather than real jobs,
+        overlapping them just means a continuous blocked interval.
+        """
+        # Separate dummies and real tasks
+        dummies = [t for t in self.tasks if t.get("is_pinned") and t.get("qty", 0) == 0]
+        real_tasks = [t for t in self.tasks if not (t.get("is_pinned") and t.get("qty", 0) == 0)]
+        
+        if not dummies:
+            return
+
+        # Group by effective machine ID
+        from collections import defaultdict
+        grouped_dummies = defaultdict(list)
+        for t in dummies:
+            m_id = t.get("pinned_machine_id") or t.get("compatible_resource_ids", [None])[0]
+            if not m_id:
+                real_tasks.append(t) # Should be caught by normal no_resource block later
+                continue
+            grouped_dummies[m_id].append(t)
+            
+        merged_dummies = []
+        for m_id, tasks_for_machine in grouped_dummies.items():
+            # Filter and sort intervals
+            intervals = []
+            for t in tasks_for_machine:
+                s = t.get("pinned_start_time")
+                e = t.get("pinned_end_time")
+                if s is not None and e is not None:
+                    intervals.append((int(s), int(e), t))
+                else:
+                    real_tasks.append(t) # Malformed dummy, leave it for normal workflow
+            
+            if not intervals:
+                continue
+                
+            intervals.sort(key=lambda x: x[0])
+            
+            # Sweep line merge
+            merged = []
+            current_start, current_end, base_t = intervals[0]
+            
+            for s, e, t in intervals[1:]:
+                if s <= current_end:  # Overlap or contiguous
+                    current_end = max(current_end, e)
+                else:
+                    merged.append((current_start, current_end, base_t))
+                    current_start, current_end, base_t = s, e, t
+            merged.append((current_start, current_end, base_t))
+            
+            # Create consolidated dummy tasks
+            for idx, (s, e, base_t) in enumerate(merged):
+                new_dummy = dict(base_t) # Copy to preserve group_id, operation, etc
+                new_dummy["task_id"] = f"DUMMY_MERGED_{m_id}_{s}_{e}_{idx}"
+                new_dummy["original_order_id"] = new_dummy["task_id"]
+                new_dummy["pinned_start_time"] = s
+                new_dummy["pinned_end_time"] = e
+                new_dummy["duration"] = e - s
+                merged_dummies.append(new_dummy)
+                
+            if len(intervals) > len(merged):
+                logger.info(f"🧹 Merged {len(intervals)} overlapping dummy tasks into {len(merged)} for machine {m_id}")
+                
+        # Rebuild full task list
+        self.tasks = real_tasks + merged_dummies
 
     def _build_translation_map(self) -> None:
         """
@@ -236,11 +312,13 @@ class TaskModelBuilder:
                     if start_after > 0 and not is_pinned:
                         self.model.Add(start_var >= start_after)
 
-            # Weighted lateness
-            weight = 10 ** (6 - priority)
-            lateness = self.model.NewIntVar(0, self.horizon, f"lat_{t_id}")
-            self.model.Add(lateness >= end_var - due_at)
-            self.objective_terms.append(lateness * weight * 1000 * self.lateness_scale)
+            # Weighted lateness (Only for real tasks, avoid horizon violations on pure dummy blockers)
+            is_dummy = is_pinned and (t.get("qty", 0) == 0 or operation == "capacity_block")
+            if not is_dummy:
+                weight = 10 ** (6 - priority)
+                lateness = self.model.NewIntVar(0, self.horizon, f"lat_{t_id}")
+                self.model.Add(lateness >= end_var - due_at)
+                self.objective_terms.append(lateness * weight * 1000 * self.lateness_scale)
 
             # Early-start preference: push every free task to start as early as
             # its constraints allow.  Without this, the solver accepts lazy
@@ -314,7 +392,14 @@ class TaskModelBuilder:
         for t_id, tv in self.task_vars.items():
             task_info = next((t for t in self.tasks if t["task_id"] == t_id), {})
             operation = task_info.get("operation", "").lower()
-            duration = int(task_info.get("duration", 0))
+
+            # Use actual duration: for pinned tasks, end-start may differ from "duration" field
+            pinned_start = task_info.get("pinned_start_time")
+            pinned_end = task_info.get("pinned_end_time")
+            is_fully_pinned = (
+                task_info.get("is_pinned") and pinned_start is not None and pinned_end is not None
+            )
+            duration = int(pinned_end) - int(pinned_start) if is_fully_pinned else int(task_info.get("duration", 0))
 
             # 1. NẾU LÀ TASK DỆT THỰC TẾ
             if operation == "knitting":
@@ -358,7 +443,14 @@ class TaskModelBuilder:
         for t_id, tv in self.task_vars.items():
             task_info = next((t for t in self.tasks if t["task_id"] == t_id), {})
             operation = task_info.get("operation", "").lower()
-            duration = int(task_info.get("duration", 0))
+
+            # Use actual duration: for pinned tasks, end-start may differ from "duration" field
+            pinned_start = task_info.get("pinned_start_time")
+            pinned_end = task_info.get("pinned_end_time")
+            is_fully_pinned = (
+                task_info.get("is_pinned") and pinned_start is not None and pinned_end is not None
+            )
+            duration = int(pinned_end) - int(pinned_start) if is_fully_pinned else int(task_info.get("duration", 0))
 
             if operation == "capacity_block":
                 # Occupy first `demand` slots — same semantics as AddCumulative demand.
