@@ -229,8 +229,10 @@ class TaskModelBuilder:
             else:
                 start_var = self.model.NewIntVar(0, self.horizon, f"start_{t_id}")
                 end_var = self.model.NewIntVar(0, self.horizon, f"end_{t_id}")
-                # Chỉ ép duration cho biến tự do
                 if operation != "capacity_block":
+                    # Ép duration rõ ràng: end == start + duration
+                    duration_val = int(t.get("duration", 0))
+                    self.model.Add(end_var == start_var + duration_val)
                     if start_after > 0 and not is_pinned:
                         self.model.Add(start_var >= start_after)
 
@@ -405,11 +407,36 @@ class TaskModelBuilder:
             start_var = tv["start"]
             end_var = tv["end"]
             
-            # Nếu ghim, chỉ cần ghi đè danh sách r_ids thành 1 máy duy nhất trước khi vào vòng lặp
+            # Nếu ghim, tính toán effective_id thay vì dùng trực tiếp
             if t.get("is_pinned"):
-                tv["r_ids"] = [t["pinned_machine_id"]]
+                effective_id = t.get("pinned_machine_id") or (
+                    t.get("compatible_resource_ids", [None])[0]
+                )
+                if not effective_id:
+                    logger.warning(f"⚠️ Pinned {t_id}: no machine ID — skipping")
+                    self.no_resource_tasks.append(t)
+                    continue
+
+                tv["r_ids"] = [effective_id]
+                
+                # Auto-register: Guard if pinned machine is omitted from resources list
+                if effective_id not in self.resource_map:
+                    logger.warning(f"⚠️ Auto-registering omitted resource {effective_id} for pinned {t_id}")
+                    self.resource_map[effective_id] = {
+                        "id": effective_id,
+                        "type": "serial",
+                        "capacity": 1,
+                        "unavailability": [],
+                        "available_at_min": 0,
+                    }
+                    self.resource_map[effective_id].setdefault("intervals", [])
+                    # Track literals list for Objective activation constraints later
+                    if "resource_usage_literals" in locals(): 
+                        pass # Fixed cleanly by tracking within resource_map if needed, 
+                             # but we don't activate phantom resources, we just avoid crashing
 
             literals = []
+            actual_r_ids = []
 
             for r_id in tv["r_ids"]:
                 if r_id not in self.resource_map:
@@ -418,6 +445,7 @@ class TaskModelBuilder:
                 # Tạo biến is_selected CHUẨN (Chỉ tạo 1 lần)
                 is_selected = self.model.NewBoolVar(f"{t_id}_on_{r_id}")
                 literals.append(is_selected)
+                actual_r_ids.append(r_id)
 
                 # NẾU TASK BỊ GHIM -> ÉP BIẾN NÀY = 1
                 if t.get("is_pinned"):
@@ -429,8 +457,12 @@ class TaskModelBuilder:
                 # available_at > pinned_start would make the model INFEASIBLE.
                 if available_at > 0 and not t.get("is_pinned"):
                     self.model.Add(start_var >= available_at).OnlyEnforceIf(is_selected)
-                
-                resource_usage_literals[r_id].append(is_selected)
+
+                if "resource_usage_literals" in locals() and r_id in resource_usage_literals:
+                    resource_usage_literals[r_id].append(is_selected)
+                # Dành cho resource mới tạo từ auto-register (safe access)
+                elif "resource_usage_literals" in locals():
+                    resource_usage_literals.setdefault(r_id, []).append(is_selected)
 
                 # OptionalIntervalVar dùng cho AddNoOverlap
                 # Cần tính lại duration thực tế nếu đã ghim để tránh lỗi Infeasible
@@ -460,6 +492,7 @@ class TaskModelBuilder:
 
             self.model.AddExactlyOne(literals)
             tv["literals"] = literals
+            tv["r_ids"] = actual_r_ids
 
         # Activation weights scale with lateness_scale to preserve LATENESS : ACTIVATION ≈ 1000 : 2.
         # Labor activation is a pure tie-breaker — keep it zero.
