@@ -107,7 +107,8 @@ class TaskModelBuilder:
         from collections import defaultdict
         grouped_dummies = defaultdict(list)
         for t in dummies:
-            m_id = t.get("pinned_machine_id") or t.get("compatible_resource_ids", [None])[0]
+            _rids = t.get("compatible_resource_ids") or []
+            m_id = t.get("pinned_machine_id") or (_rids[0] if _rids else None)
             if not m_id:
                 real_tasks.append(t) # Should be caught by normal no_resource block later
                 continue
@@ -385,7 +386,15 @@ class TaskModelBuilder:
             self._build_workforce_cumulative(MAX_FACTORY_MACHINES)
 
     def _build_workforce_cumulative(self, MAX_FACTORY_MACHINES: int) -> None:
-        """Original AddCumulative approach — fast and compact for < 200 ghost tasks."""
+        """
+        AddCumulative approach — uses OptionalIntervalVar for free knitting tasks
+        so that demand is only counted when the task is actually assigned to a machine.
+
+        BUG FIX: Previously used hard NewIntervalVar for knitting tasks. This caused
+        ALL knitting tasks to always contribute demand=1 to the cumulative constraint,
+        even at t=0 when no machine was selected yet, resulting in all tasks appearing
+        to start simultaneously and violating the capacity limit.
+        """
         knitting_intervals = []
         demands = []
 
@@ -401,16 +410,27 @@ class TaskModelBuilder:
             )
             duration = int(pinned_end) - int(pinned_start) if is_fully_pinned else int(task_info.get("duration", 0))
 
-            # 1. NẾU LÀ TASK DỆT THỰC TẾ
+            # 1. TASK DỆT THỰC TẾ — dùng OptionalInterval để demand chỉ tính khi task đã được assign
             if operation == "knitting":
-                interval = self.model.NewIntervalVar(
-                    tv["start"], duration, tv["end"],
-                    f"global_interval_{t_id}"
-                )
+                literals = tv.get("literals", [])
+                if literals:
+                    # any_assigned = True khi task được gán vào bất kỳ máy nào
+                    any_assigned = self.model.NewBoolVar(f"cumul_active_{t_id}")
+                    self.model.AddMaxEquality(any_assigned, literals)
+                    interval = self.model.NewOptionalIntervalVar(
+                        tv["start"], duration, tv["end"], any_assigned,
+                        f"global_interval_{t_id}"
+                    )
+                else:
+                    # Pinned knitting task — luôn active, dùng hard interval
+                    interval = self.model.NewIntervalVar(
+                        tv["start"], duration, tv["end"],
+                        f"global_interval_{t_id}"
+                    )
                 knitting_intervals.append(interval)
                 demands.append(1)
 
-            # 2. NẾU LÀ GHOST TASK KHÓA NĂNG LỰC
+            # 2. GHOST TASK KHÓA NĂNG LỰC — luôn active (pinned), dùng hard interval
             elif operation == "capacity_block":
                 interval = self.model.NewIntervalVar(
                     tv["start"], duration, tv["end"],
@@ -420,7 +440,76 @@ class TaskModelBuilder:
                 blocked_demand = int(task_info.get("demand", 0))
                 demands.append(blocked_demand)
 
+        # Lấp đầy khoảng TRỐNG giữa các ca làm (inter-shift gaps).
+        # Trong khoảng trống không có capacity_block nào, solver có thể xếp tất cả
+        # MAX_FACTORY_MACHINES task đồng thời (không có ràng buộc nào chặn).
+        # Fix: với mỗi khoảng trống [gap_start, gap_end), thêm một interval cứng với
+        # demand=MAX_FACTORY_MACHINES để chiếm hết slot → không task knitting nào
+        # được lên lịch trong ca nghỉ.
+        horizon = int(self.config.get("horizon_minutes", 57600))
+        # Thu thập các khoảng thời gian của capacity_block (đã được pinned)
+        block_windows: List[tuple] = []
+        for t in self.tasks:
+            if t.get("operation", "").lower() == "capacity_block":
+                ps = t.get("pinned_start_time")
+                pe = t.get("pinned_end_time")
+                if ps is not None and pe is not None and int(pe) > int(ps):
+                    block_windows.append((int(ps), int(pe)))
+        # Sắp xếp và hợp nhất các block window (merge overlapping)
+        block_windows.sort()
+        merged: List[tuple] = []
+        for s, e in block_windows:
+            if merged and s <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+        # Lấp khoảng TRỐNG giữa các ca làm bằng demand của ca có ràng buộc chặt nhất.
+        # Chỉ áp dụng khi Go đã gửi ít nhất một capacity_block (có cấu trúc ca làm).
+        # Nếu không có block nào → môi trường test/dev, bỏ qua.
+        #
+        # Dùng max_block_demand thay vì MAX_FACTORY_MACHINES để các task có thể
+        # tiếp tục chạy qua ranh giới ca (autonomous machines), nhưng số lượng
+        # đồng thời vẫn bị giới hạn như trong ca (không tăng đột biến trong gap).
+        gap_count = 0
+        if merged:
+            max_block_demand = max(
+                int(t.get("demand", 0))
+                for t in self.tasks
+                if t.get("operation", "").lower() == "capacity_block"
+            )
+            prev_end = 0
+            for s, e in merged:
+                if s > prev_end:
+                    gap_iv = self.model.NewIntervalVar(
+                        self.model.NewConstant(prev_end),
+                        s - prev_end,
+                        self.model.NewConstant(s),
+                        f"gap_block_{prev_end}_{s}"
+                    )
+                    knitting_intervals.append(gap_iv)
+                    demands.append(max_block_demand)
+                    gap_count += 1
+                prev_end = max(prev_end, e)
+            # Sau block cuối cùng đến hết horizon
+            if prev_end < horizon:
+                gap_iv = self.model.NewIntervalVar(
+                    self.model.NewConstant(prev_end),
+                    horizon - prev_end,
+                    self.model.NewConstant(horizon),
+                    f"gap_block_{prev_end}_{horizon}"
+                )
+                knitting_intervals.append(gap_iv)
+                demands.append(max_block_demand)
+                gap_count += 1
+
         if knitting_intervals:
+            _total_block_demand = sum(d for t, d in zip(knitting_intervals, demands) if d > 1)
+            logger.info(
+                f"📊 AddCumulative: {len(knitting_intervals)} intervals total "
+                f"(capacity_block demand sum={_total_block_demand}, "
+                f"gap_blocks_added={gap_count}), "
+                f"capacity={MAX_FACTORY_MACHINES}"
+            )
             self.model.AddCumulative(knitting_intervals, demands, MAX_FACTORY_MACHINES)
 
     def _build_workforce_boolean(self, MAX_FACTORY_MACHINES: int) -> None:
@@ -1102,6 +1191,34 @@ class TaskModelBuilder:
         logger.info(f"✅ Feasible! Objective value: {solver.ObjectiveValue()}")
         assignments = []
         overloads = []
+
+        # ── POST-SOLVE CONCURRENCY DIAGNOSTIC ───────────────────────────────
+        # Scan all knitting tasks grouped by their start time.
+        # Flags any time point where concurrent active knitting tasks + blocked slots > max.
+        _config_max = int(self.config.get("max_factory_machines", 100))
+        _kt_times: Dict[str, tuple] = {}  # t_id -> (start, end)
+        _block_times: list = []           # (start, end, demand)
+        for t_id_d, tv_d in self.task_vars.items():
+            task_info_d = next((t for t in self.tasks if t["task_id"] == t_id_d), {})
+            op_d = task_info_d.get("operation", "").lower()
+            s_d, e_d = solver.Value(tv_d["start"]), solver.Value(tv_d["end"])
+            if op_d == "knitting":
+                _kt_times[t_id_d] = (s_d, e_d)
+            elif op_d == "capacity_block":
+                _block_times.append((s_d, e_d, int(task_info_d.get("demand", 0))))
+        # Check unique start times of knitting tasks
+        _checked = set()
+        for t_id_d, (s_d, e_d) in _kt_times.items():
+            if s_d in _checked:
+                continue
+            _checked.add(s_d)
+            concurrent = sum(1 for (s2, e2) in _kt_times.values() if s2 <= s_d < e2)
+            blocked = sum(dem for (bs, be, dem) in _block_times if bs <= s_d < be)
+            if concurrent + blocked > _config_max:
+                logger.warning(
+                    f"⚠️ CAPACITY VIOLATION at t={s_d}: {concurrent} knitting tasks + "
+                    f"{blocked} blocked demand = {concurrent+blocked} > {_config_max} max"
+                )
 
         for t_id, tv in self.task_vars.items():
             start_val = solver.Value(tv["start"])
