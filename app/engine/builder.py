@@ -1218,6 +1218,52 @@ class TaskModelBuilder:
             # At most one group per slot
             self.model.Add(sum(group_uses_slot) <= 1)
 
+        # Co-location: tasks in the same group that fit in one slot MUST share that slot.
+        # Without this, the solver may spread W1→slot0 (start=100), W2→slot1 (start=150),
+        # W3→slot2 (start=200) — three separate washes instead of one batch.
+        # Correct: all same-group tasks go to the same slot, start = max(dep_ends).
+        #
+        # Guard: only enforce on batch machines (capacity > 1).
+        # Serial machines (capacity=1) cannot run concurrent tasks — co-location at the same
+        # start time would conflict with AddNoOverlap and cause infeasibility.
+        for group_key, group_task_ids in task_groups.items():
+            if len(group_task_ids) < 2:
+                continue
+
+            # Find max resource capacity available to this group's tasks
+            group_resources: set = set()
+            for t_id in group_task_ids:
+                task_info = next((t for t in self.tasks if t["task_id"] == t_id), {})
+                group_resources.update(task_info.get("compatible_resource_ids", []))
+            max_res_cap = max(
+                (int(self.resource_map.get(r_id, {}).get("capacity", 1))
+                 for r_id in group_resources if r_id in self.resource_map),
+                default=1,
+            )
+
+            group_qty = sum(task_qtys.get(t_id, 1) for t_id in group_task_ids)
+
+            if group_qty <= capacity and max_res_cap > 1:
+                # Batch machine + fits in one slot → force co-location
+                t0 = group_task_ids[0]
+                for t_other in group_task_ids[1:]:
+                    for k in range(K):
+                        self.model.Add(x[t0][k] == x[t_other][k])
+                logger.info(
+                    f"   🔒 Group {group_key}: {len(group_task_ids)} tasks co-located "
+                    f"(qty={group_qty} ≤ capacity={capacity}, machine_cap={max_res_cap})"
+                )
+            elif max_res_cap == 1:
+                logger.info(
+                    f"   ⚡ Group {group_key}: serial machine (cap=1) — co-location skipped "
+                    f"(tasks sẽ chạy nối tiếp)"
+                )
+            else:
+                logger.info(
+                    f"   ⚖️  Group {group_key}: qty={group_qty} > capacity={capacity} "
+                    f"— cần nhiều slots, không ép co-location"
+                )
+
         # Constraint: synchronization — tasks in same slot MUST share start time
         for t_id in washing_task_ids:
             tv = self.task_vars[t_id]
