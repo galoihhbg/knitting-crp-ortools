@@ -117,6 +117,7 @@ class Engine:
             .apply_routing_constraints()
             .apply_dependency_constraints()
             .apply_batch_offset_constraints()
+            .apply_smart_batching_constraints()
             .define_objective()
         )
 

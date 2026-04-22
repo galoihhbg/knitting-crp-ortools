@@ -57,6 +57,8 @@ class SolverTask(BaseModel):
     sub_tasks: Optional[List["SolverTask"]] = Field(default=None, alias="sub_tasks")
     design_item_id: str = Field(alias="design_item_id")
     color_config: str = Field(alias="color_config")
+    color: str = Field(default="", alias="color")
+    substance: str = Field(default="", alias="substance")
     compatible_resource_ids: List[str] = Field(default=[], alias="compatible_resource_ids")
     sub_task_completion_offsets: Optional[Dict[str, int]] = Field(
         default=None, alias="sub_task_completion_offsets"
@@ -83,6 +85,8 @@ class SolverConfig(BaseModel):
     max_factory_machines: int = 40
     random_seed: int = 42       # Fixed seed for deterministic output across runs
     num_search_workers: int = 8  # Set to 1 for byte-identical replay; 8 for production speed
+    washing_batch_capacity: int = 10
+    max_washing_batches: Optional[int] = None
 
 
 class SolverPayload(BaseModel):

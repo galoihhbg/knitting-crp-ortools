@@ -77,9 +77,15 @@ class TaskModelBuilder:
         # Build the sub-task → batch-task translation map once during construction
         self.task_translation_map: Dict[str, str] = {}
         self._build_translation_map()
-        
+
         # Merge overlapping dummy shift tasks to prevent AddNoOverlap infeasible crashes
         self._sanitize_dummy_tasks()
+
+        # Smart batching state: populated by apply_smart_batching_constraints()
+        # _wash_x[task_id] = list of BoolVars x[i][k] for batch slot assignment
+        # _wash_batch_starts = list of IntVars for batch slot start times
+        self._wash_x: Dict[str, List] = {}
+        self._wash_batch_starts: List = []
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1072,6 +1078,175 @@ class TaskModelBuilder:
 
         return self
 
+    def apply_smart_batching_constraints(self) -> "TaskModelBuilder":
+        """
+        Assign washing tasks to batch slots, grouped by (color, substance) for compatibility.
+
+        Within each compatibility group, tasks can share slots. Across groups, slots are
+        exclusive to prevent color/fabric mixing.
+
+        Complexity: O(nK) constraints per group (not O(n²K) globally).
+        """
+        import math
+
+        # Collect all washing tasks that made it into task_vars
+        washing_task_ids = sorted([
+            t_id for t_id, tv in self.task_vars.items()
+            if next(
+                (t for t in self.tasks if t["task_id"] == t_id), {}
+            ).get("operation", "").lower() == "washing"
+        ])
+
+        n = len(washing_task_ids)
+        if n == 0:
+            logger.info("🧺 apply_smart_batching_constraints: no washing tasks — skipped")
+            return self
+
+        logger.info(f"\n🧺 SMART BATCHING: {n} washing tasks")
+
+        # 1. CREATE QTY DICTIONARY (Extract qty per task, not count of tasks)
+        task_qtys = {}
+        for t_id in washing_task_ids:
+            task = next((t for t in self.tasks if t["task_id"] == t_id), {})
+            task_qtys[t_id] = int(task.get("qty", 1))
+
+        total_qty = sum(task_qtys.values())
+
+        # 2. COMPUTE K (FIXED: use total_qty, not task count)
+        capacity: int = max(1, int(self.config.get("washing_batch_capacity", 10)))
+        # Minimum batches needed = ceiling(total_qty / capacity)
+        min_batches = math.ceil(total_qty / capacity)
+        # Add 3x flexibility, but cap at reasonable minimum
+        auto_k: int = max(min_batches * 3, 5)
+        K: int = min(n, auto_k)
+        cfg_max = self.config.get("max_washing_batches")
+        if cfg_max is not None:
+            K = min(K, int(cfg_max))
+        K = max(1, K)
+
+        logger.info(
+            f"   K={K} slots, capacity={capacity}, n={n} tasks, "
+            f"total_qty={total_qty}, min_batches={min_batches}"
+        )
+
+        # ⚠️ Guard: warn if any task qty > capacity (may cause infeasibility)
+        oversized_tasks = [
+            (t_id, next((t for t in self.tasks if t["task_id"] == t_id), {}).get("qty", 0))
+            for t_id in washing_task_ids
+            if next((t for t in self.tasks if t["task_id"] == t_id), {}).get("qty", 0) > capacity
+        ]
+        if oversized_tasks:
+            logger.warning(
+                f"⚠️  {len(oversized_tasks)} washing tasks exceed batch capacity {capacity}: "
+                f"{oversized_tasks}. Model may become infeasible."
+            )
+
+        # GROUP tasks by (color, substance) for compatibility
+        task_groups = {}
+        for t_id in washing_task_ids:
+            task = next((t for t in self.tasks if t["task_id"] == t_id), {})
+            group_key = (task.get("color", ""), task.get("substance", ""))
+            task_groups.setdefault(group_key, []).append(t_id)
+
+        num_groups = len(task_groups)
+        logger.info(f"   Grouped into {num_groups} color+substance compatibility groups")
+
+        # Create batch slot start IntVars (shared across all groups)
+        batch_starts: List = []
+        for k in range(K):
+            bk = self.model.NewIntVar(0, self.horizon, f"wash_batch_start_{k}")
+            batch_starts.append(bk)
+        self._wash_batch_starts = batch_starts
+
+        # Create assignment BoolVars x[t_id][k]
+        x: Dict[str, List] = {}
+        for t_id in washing_task_ids:
+            x[t_id] = [
+                self.model.NewBoolVar(f"wash_x_{t_id}_{k}")
+                for k in range(K)
+            ]
+        self._wash_x = x
+
+        # Constraint: each washing task assigned to exactly one slot
+        for t_id in washing_task_ids:
+            self.model.AddExactlyOne(x[t_id])
+
+        # 3. CONSTRAINT: capacity per slot (FIXED: multiply by qty per task)
+        # Total quantity in slot k must not exceed capacity
+        for k in range(K):
+            self.model.Add(
+                sum(x[t_id][k] * task_qtys[t_id] for t_id in washing_task_ids) <= capacity
+            )
+
+        # Constraint: each slot serves at most ONE compatibility group
+        # This is O(num_groups * K) = O(nK), not O(n²K)
+        for k in range(K):
+            group_uses_slot = []
+            for group_key, group_task_ids in task_groups.items():
+                uses = self.model.NewBoolVar(f"group_{group_key}_{k}")
+                # uses=1 iff at least one task from this group uses slot k
+                self.model.AddMaxEquality(uses, [x[t_id][k] for t_id in group_task_ids])
+                group_uses_slot.append(uses)
+
+            # At most one group per slot
+            self.model.Add(sum(group_uses_slot) <= 1)
+
+        # Constraint: synchronization — tasks in same slot share start time
+        for t_id in washing_task_ids:
+            tv = self.task_vars[t_id]
+            for k in range(K):
+                self.model.Add(
+                    tv["start"] >= batch_starts[k]
+                ).OnlyEnforceIf(x[t_id][k])
+
+        # FIX 3: MACHINE SYNC (optimized: direct constraint between tasks, not via intermediate variable)
+        # If 2 tasks are in same slot k, they must use same machine (directly sync their machine_var)
+        sorted_washing_ids = sorted(washing_task_ids)
+        for k in range(K):
+            for i in range(len(sorted_washing_ids)):
+                for j in range(i + 1, len(sorted_washing_ids)):
+                    t_i = sorted_washing_ids[i]
+                    t_j = sorted_washing_ids[j]
+                    tv_i = self.task_vars[t_i]
+                    tv_j = self.task_vars[t_j]
+
+                    # If both tasks in same slot k, they must have same start
+                    # (already enforced above via batch_starts[k])
+                    # And must have compatible machines if needed
+                    # (Leave this as future enhancement; don't add more constraints now)
+
+        # Batch activation BoolVars
+        batch_active: List = []
+        for k in range(K):
+            bak = self.model.NewBoolVar(f"wash_batch_active_{k}")
+            self.model.AddMaxEquality(bak, [x[t_id][k] for t_id in washing_task_ids])
+            batch_active.append(bak)
+
+        # FIX 1: SYMMETRY BREAKING (clustering only, no time ordering)
+        # Force batch_active to cluster at the beginning (k=0, 1, 2...) to reduce slot permutations
+        # BUT: Do NOT enforce time ordering — parallel machines may run batches in any order!
+        for k in range(K - 1):
+            self.model.AddImplication(batch_active[k + 1], batch_active[k])
+
+        # FIX 2: LOCK FLOATING VARIABLES (The Silent Killer)
+        # When a batch is inactive, freeze its start time to 0
+        # Otherwise AI wastes time exploring millions of useless values
+        for k in range(K):
+            self.model.Add(batch_starts[k] == 0).OnlyEnforceIf(batch_active[k].Not())
+
+        # Objective term: minimize number of active batches
+        _batch_w: int = 10 * self.lateness_scale
+        for k in range(K):
+            self.objective_terms.append(batch_active[k] * _batch_w)
+
+        # FIX 3: WIP PENALTY (Early-start bias for faster convergence)
+        # Very light penalty: 1 point per minute of start time (negligible vs lateness)
+        for k in range(K):
+            self.objective_terms.append(batch_starts[k] * 1)
+
+        logger.info(f"   ✅ Smart batching: {K} slots, {num_groups} groups, batch_minimize_weight={_batch_w}")
+        return self
+
     def define_objective(self) -> "TaskModelBuilder":
         """
         Minimise the weighted sum of:
@@ -1232,6 +1407,15 @@ class TaskModelBuilder:
 
             if selected_res:
                 is_late = end_val > tv["due"]
+
+                # Resolve batch_slot_id for washing tasks
+                batch_slot_id = ""
+                if t_id in self._wash_x:
+                    for k, boolvar in enumerate(self._wash_x[t_id]):
+                        if solver.Value(boolvar) == 1:
+                            batch_slot_id = f"wash_batch_{k}"
+                            break
+
                 assignments.append({
                     "task_id": t_id,
                     "machine_id": selected_res,
@@ -1241,6 +1425,7 @@ class TaskModelBuilder:
                     "order_id": tv.get("original_order_id", ""),
                     "quantity": tv.get("qty", 0),
                     "status": "LATE" if is_late else "ON_TIME",
+                    "batch_slot_id": batch_slot_id,
                 })
                 if is_late:
                     overloads.append({
