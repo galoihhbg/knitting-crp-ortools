@@ -118,6 +118,7 @@ class Engine:
             .apply_dependency_constraints()
             .apply_batch_offset_constraints()
             .apply_smart_batching_constraints()
+            .apply_shift_boundary_constraints()
             .define_objective()
         )
 

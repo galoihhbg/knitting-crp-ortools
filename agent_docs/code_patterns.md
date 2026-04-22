@@ -247,3 +247,36 @@ objective_terms.append(batch_starts[k] * 1)
 - `color` + `substance` on `SolverTask` determine washing compatibility (NOT `color_config`)
 - `color_config` is for knitting machine thread/design — unrelated to washing batching
 - Tasks with identical `(color, substance)` tuple can share a batch slot
+
+## Shift Boundary Constraint Pattern
+
+Washing tasks cannot be interrupted mid-cycle. The backend sends a virtual time axis with breaks removed, so shift transitions appear as single boundary points. Tasks must not straddle them.
+
+### Why It's Needed
+Virtual time is continuous — the solver has no concept of "break at minute 480". A washing task starting at virtual 450 with duration 90 would span virtual 480 (real shift end), requiring the machine to stop mid-cycle. Infeasible in practice.
+
+### Disjunctive Constraint
+```python
+# For each washing task t and each shift boundary S:
+b = model.NewBoolVar(f"before_shift_{t_id}_{S}")
+model.Add(tv["end"] <= S).OnlyEnforceIf(b)       # finish before boundary
+model.Add(tv["start"] >= S).OnlyEnforceIf(b.Not())  # or start after boundary
+
+# Solver picks b=True (fits in current shift) or b=False (pushed to next shift).
+# If duration > (S - start_after_min): b=True infeasible → solver forces b=False.
+```
+
+### Rules
+- Apply only to `operation == "washing"` tasks (non-interruptible)
+- Skip `is_pinned=True` tasks (Go already placed them correctly)
+- `shift_ends_min=[]` (default) → method is a no-op, no regression for old payloads
+- Log `WARNING` when task duration exceeds remaining shift time (will be pushed to next shift)
+- Method position in chain: after `apply_smart_batching_constraints()`, before `define_objective()`
+
+### Go Wire Contract
+```json
+"config": {
+  "shift_ends_min": [480, 960, 1440, 1920]
+}
+```
+Values are **virtual minutes** (after break removal), not real-clock minutes.

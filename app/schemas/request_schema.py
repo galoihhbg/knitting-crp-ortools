@@ -87,6 +87,10 @@ class SolverConfig(BaseModel):
     num_search_workers: int = 8  # Set to 1 for byte-identical replay; 8 for production speed
     washing_batch_capacity: int = 10
     max_washing_batches: Optional[int] = None
+    # Virtual-time points (minutes) where each work shift ends.
+    # Washing tasks must complete before, or start at/after, each boundary
+    # because the backend strips breaks from the timeline and washing cannot be interrupted.
+    shift_ends_min: List[int] = Field(default_factory=list)
 
 
 class SolverPayload(BaseModel):

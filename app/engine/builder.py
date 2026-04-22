@@ -1271,6 +1271,61 @@ class TaskModelBuilder:
         logger.info(f"   ✅ Smart batching: {K} slots, {num_groups} groups, batch_minimize_weight={_batch_w}")
         return self
 
+    def apply_shift_boundary_constraints(self) -> "TaskModelBuilder":
+        """
+        Ngăn task giặt (washing) bắc qua ranh giới ca làm việc (shift boundary).
+
+        Backend truyền trục thời gian ảo đã loại bỏ giờ nghỉ, nên ranh giới ca
+        là một điểm đơn trong virtual timeline. Máy giặt không thể dừng giữa
+        chừng, nên mỗi task phải kết thúc TRƯỚC ranh giới HOẶC bắt đầu SAU.
+
+        Constraint cho mỗi task t và mỗi ranh giới S:
+            task.end <= S  (kết thúc trong ca hiện tại)
+            OR
+            task.start >= S  (bắt đầu trong ca tiếp theo)
+        """
+        shift_ends: List[int] = [int(s) for s in self.config.get("shift_ends_min", [])]
+        if not shift_ends:
+            return self
+
+        washing_ids = [
+            t_id for t_id, tv in self.task_vars.items()
+            if not tv.get("is_pinned", False)
+            and next(
+                (t for t in self.tasks if t["task_id"] == t_id), {}
+            ).get("operation", "").lower() == "washing"
+        ]
+
+        if not washing_ids:
+            logger.info("⏰ SHIFT BOUNDARY: no washing tasks — skipping")
+            return self
+
+        logger.info(
+            f"⏰ SHIFT BOUNDARY: {len(washing_ids)} washing tasks × "
+            f"{len(shift_ends)} boundaries: {shift_ends}"
+        )
+
+        for t_id in washing_ids:
+            tv = self.task_vars[t_id]
+            task = next((t for t in self.tasks if t["task_id"] == t_id), {})
+            duration = int(task.get("duration", 0))
+            start_after = int(task.get("start_after_min", 0))
+
+            for S in shift_ends:
+                # Cảnh báo nếu task dài hơn khoảng còn lại trong ca hiện tại
+                if start_after < S and (S - start_after) < duration:
+                    logger.warning(
+                        f"   ⚠️  '{t_id}' (duration={duration}min) không vừa trước "
+                        f"ranh giới {S}min — sẽ bị đẩy sang ca tiếp theo"
+                    )
+
+                b = self.model.NewBoolVar(f"before_shift_{t_id}_{S}")
+                self.model.Add(tv["end"] <= S).OnlyEnforceIf(b)
+                self.model.Add(tv["start"] >= S).OnlyEnforceIf(b.Not())
+
+        logger.info(f"   ✅ Shift boundary constraints applied: {len(washing_ids)} tasks × {len(shift_ends)} boundaries")
+        return self
+
     def define_objective(self) -> "TaskModelBuilder":
         """
         Minimise the weighted sum of:

@@ -126,6 +126,26 @@ Fixture helpers in `test_smart_batching.py`:
 
 For machine sync tests, set resource `capacity > 1` so `AddCumulative` is used instead of `AddNoOverlap`.
 
+### Priority 6: Shift Boundary
+
+Also in `tests/test_smart_batching.py`.
+
+Key checks:
+- **No straddling**: `end_time <= S OR start_time >= S` for every washing task and boundary S
+- **Pushed past boundary**: task duration > S → `start_time >= S` (forced into next shift)
+- **No-op when empty**: `shift_ends_min=[]` → schedule unchanged
+
+```python
+# Pattern: assert task does not straddle boundary S
+a = result["assignments"][0]
+assert a["end_time"] <= S or a["start_time"] >= S
+
+# Pattern: assert task pushed past boundary when it cannot fit before it
+assert a["start_time"] >= S
+```
+
+Config override to use in fixtures: `_make_config(shift_ends_min=[480, 960])`
+
 ## Test Fixtures
 
 ```

@@ -33,6 +33,7 @@
 - Ghost-task count guard + warning at > 200 capacity_block tasks
 - Overload-ratio diagnostic log at > 85% factory load
 - **Smart Batching (COMPLETE v1.1):** Auto-merge washing tasks by `(color, substance)` into shared slots — saves water/soap/energy. Features: qty-based K, grouped O(nK) compatibility, exact start-time sync, symmetry breaking, batch machine routing via `AddCumulative`. Requires Go to send washing resources with `capacity > 1` for machine sync.
+- **Shift Boundary Constraints (COMPLETE):** Washing tasks must not straddle virtual-time shift boundaries. Disjunctive constraint `end <= S OR start >= S` per task per boundary. Requires Go to send `shift_ends_min` in `SolverConfig`.
 
 ## Out of Scope (Won't Have for MVP)
 

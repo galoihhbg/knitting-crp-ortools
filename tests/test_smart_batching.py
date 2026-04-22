@@ -205,6 +205,72 @@ def test_no_washing_tasks_is_noop():
     assert result["assignments"][0]["batch_slot_id"] == ""
 
 
+def test_washing_task_does_not_cross_shift_boundary():
+    """
+    Test: 1 washing task, duration=80, shift_ends_min=[100].
+    Task starting at 0 ends at 80 ≤ 100 → fits in shift 1.
+    If started late (e.g. start=50), end=130 > 100 → must be pushed to start ≥ 100.
+    Expectation: end_time ≤ 100 OR start_time ≥ 100 (never straddling boundary).
+    """
+    payload = {
+        "job_id": "test_shift_boundary_single",
+        "config": _make_config(shift_ends_min=[100]),
+        "machines": [_make_machine("WM_00")],
+        "resources": [_make_resource("WM_00")],
+        "tasks": [
+            _make_washing_task("W1", "ORD_1", 80, 2000, ["WM_00"]),
+        ],
+    }
+    result = Engine(payload).solve()
+    assert result["status"] in ("feasible", "optimal")
+    a = result["assignments"][0]
+    assert a["end_time"] <= 100 or a["start_time"] >= 100, (
+        f"Task spans shift boundary 100min: start={a['start_time']}, end={a['end_time']}"
+    )
+
+
+def test_washing_task_pushed_past_boundary_when_too_long_for_remaining_shift():
+    """
+    Test: 1 washing task, duration=150, shift_ends_min=[100].
+    Duration > boundary → impossible to end before 100 → must start ≥ 100.
+    Expectation: start_time ≥ 100.
+    """
+    payload = {
+        "job_id": "test_shift_boundary_pushed",
+        "config": _make_config(shift_ends_min=[100]),
+        "machines": [_make_machine("WM_00")],
+        "resources": [_make_resource("WM_00")],
+        "tasks": [
+            _make_washing_task("W1", "ORD_1", 150, 2000, ["WM_00"]),
+        ],
+    }
+    result = Engine(payload).solve()
+    assert result["status"] in ("feasible", "optimal")
+    a = result["assignments"][0]
+    assert a["start_time"] >= 100, (
+        f"Task duration=150 cannot end before boundary 100 — expected start≥100, got {a['start_time']}"
+    )
+
+
+def test_no_shift_ends_is_noop():
+    """
+    Test: shift_ends_min not set (empty list).
+    Expectation: apply_shift_boundary_constraints() is a no-op; schedule unchanged.
+    """
+    payload = {
+        "job_id": "test_shift_boundary_noop",
+        "config": _make_config(),  # no shift_ends_min
+        "machines": [_make_machine("WM_00")],
+        "resources": [_make_resource("WM_00")],
+        "tasks": [
+            _make_washing_task("W1", "ORD_1", 60, 2000, ["WM_00"]),
+        ],
+    }
+    result = Engine(payload).solve()
+    assert result["status"] in ("feasible", "optimal")
+    assert len(result["assignments"]) == 1
+
+
 def test_batched_tasks_share_start_time():
     """
     Test: 2 washing tasks, capacity=2 (may be grouped).

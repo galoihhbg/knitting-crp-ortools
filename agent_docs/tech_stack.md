@@ -98,6 +98,21 @@ model.AddImplication(batch_active[k + 1], batch_active[k])
 | `batch_starts[k]` | `IntVar(0, horizon)` | Start time of batch slot `k` |
 | `batch_active[k]` | `BoolVar` | Slot `k` has at least one task |
 | `group_uses_slot[k]` | `BoolVar` | A compatibility group occupies slot `k` |
+| `before_shift_{t_id}_{S}` | `BoolVar` | Task ends before boundary S (vs. starts after) |
+
+## Virtual Time Axis & Shift Boundaries
+
+The Go backend strips break periods from the timeline before sending to the solver. This means:
+- Solver sees a **continuous** integer axis — no gaps for breaks
+- Shift transitions are single **boundary points** (not ranges) in virtual time
+- E.g. real 08:00–12:00 + 13:00–17:00 → virtual 0–240 + 240–480 (boundary at 240)
+
+**Implication:** Tasks that cannot be interrupted (washing) must not straddle these points. The solver needs `shift_ends_min` to know where they are.
+
+### SolverConfig fields for virtual time
+| Field | Type | Default | Purpose |
+|-------|------|---------|---------|
+| `shift_ends_min` | `List[int]` | `[]` | Virtual-minute points where each shift ends |
 
 ### Objective
 ```python
