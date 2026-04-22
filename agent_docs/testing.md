@@ -94,6 +94,38 @@ def test_infeasible_returns_structured_dict(impossible_payload):
     assert result["overloads"] == []
 ```
 
+### Priority 5: Smart Batching
+
+File: `tests/test_smart_batching.py`
+
+Key checks:
+- **Capacity respected**: No batch slot has `sum(qty) > washing_batch_capacity`
+- **Multiple batches formed**: 6 tasks with capacity=2 → ≥ 3 distinct `batch_slot_id` values
+- **Start-time sync**: If two tasks share `batch_slot_id`, their `start_time` must be identical
+- **Urgent order override**: Tight-deadline task may get its own slot rather than waiting for others
+- **No-op case**: Non-washing tasks produce `batch_slot_id == ""`
+
+```python
+# Pattern: verify slot capacity from response assignments
+from collections import Counter
+slot_counts = Counter(a["batch_slot_id"] for a in result["assignments"] if a["batch_slot_id"])
+for slot_id, count in slot_counts.items():
+    assert count <= capacity, f"Slot {slot_id} exceeded capacity"
+
+# Pattern: verify start-time sync
+by_id = {a["task_id"]: a for a in result["assignments"]}
+wa, wb = by_id["WA"], by_id["WB"]
+if wa["batch_slot_id"] and wa["batch_slot_id"] == wb["batch_slot_id"]:
+    assert wa["start_time"] == wb["start_time"]
+```
+
+Fixture helpers in `test_smart_batching.py`:
+- `_make_washing_task(task_id, order_id, duration, due, resource_ids)` — sets `color="red"`, `substance="cotton"` by default
+- `_make_config(**overrides)` — sets `washing_batch_capacity=3` by default
+- `_make_resource(r_id, op="washing")` — creates resource dict with `capacity=1`
+
+For machine sync tests, set resource `capacity > 1` so `AddCumulative` is used instead of `AddNoOverlap`.
+
 ## Test Fixtures
 
 ```

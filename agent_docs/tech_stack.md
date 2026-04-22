@@ -65,8 +65,12 @@ unavail = model.NewFixedSizeIntervalVar(w_start, w_end - w_start, name)
 # Exactly one machine per task
 model.AddExactlyOne(literals)
 
-# No two tasks overlap on the same machine
+# No two tasks overlap on the same machine (serial resource, capacity=1)
 model.AddNoOverlap(intervals_on_machine)
+
+# Batch machine: allow concurrent tasks up to capacity (capacity > 1)
+demands = [1] * len(intervals)
+model.AddCumulative(intervals, demands, capacity)
 
 # Workforce cap (knitting + capacity_block demands)
 model.AddCumulative(knitting_intervals, demands, MAX_FACTORY_MACHINES)
@@ -79,7 +83,21 @@ model.Add(task_b_start >= task_a_start + offset)
 
 # Conditional constraint (only enforced when boolean is True)
 model.Add(start >= available_at).OnlyEnforceIf(is_selected)
+
+# MaxEquality: Boolean is True iff any of the list is True
+model.AddMaxEquality(any_bool, [bool_a, bool_b, bool_c])
+
+# Implication: if A then B (used for symmetry breaking)
+model.AddImplication(batch_active[k + 1], batch_active[k])
 ```
+
+### Smart Batching Variables
+| Variable | Type | Purpose |
+|----------|------|---------|
+| `x[t_id][k]` | `BoolVar` | Task `t_id` assigned to batch slot `k` |
+| `batch_starts[k]` | `IntVar(0, horizon)` | Start time of batch slot `k` |
+| `batch_active[k]` | `BoolVar` | Slot `k` has at least one task |
+| `group_uses_slot[k]` | `BoolVar` | A compatibility group occupies slot `k` |
 
 ### Objective
 ```python

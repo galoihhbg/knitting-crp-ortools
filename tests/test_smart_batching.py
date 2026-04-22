@@ -63,6 +63,8 @@ def _make_washing_task(
         "sub_tasks": None,
         "design_item_id": "",
         "color_config": "",
+        "color": "red",
+        "substance": "cotton",
         "compatible_resource_ids": resource_ids,
         "sub_task_completion_offsets": None,
         "WaitOffsets": None,

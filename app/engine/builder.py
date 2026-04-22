@@ -871,11 +871,15 @@ class TaskModelBuilder:
 
     def apply_routing_constraints(self) -> "TaskModelBuilder":
         """
-        Enforce that no two tasks overlap on the same resource, and that tasks
-        cannot be placed inside declared unavailability windows.
+        Enforce scheduling constraints per resource:
+        - Serial (capacity=1): AddNoOverlap — no two tasks at the same time
+        - Batch  (capacity>1): AddCumulative — concurrent tasks allowed up to capacity
+          Used for washing machines so batched tasks can run simultaneously.
         """
         for r_id, resource in self.resource_map.items():
             intervals = resource.get("intervals", [])
+            cap = int(resource.get("capacity", 1))
+
             for window in resource.get("unavailability", []):
                 w_start, w_end = int(window["start"]), int(window["end"])
                 if w_end > w_start:
@@ -883,7 +887,18 @@ class TaskModelBuilder:
                         w_start, w_end - w_start, f"unavail_{r_id}"
                     )
                     intervals.append(unavail)
-            if intervals:
+
+            if not intervals:
+                continue
+
+            if cap > 1:
+                # Batch machine: allow concurrent tasks up to capacity
+                # Each task demands 1 unit; total concurrent demand <= capacity
+                demands = [1] * len(intervals)
+                self.model.AddCumulative(intervals, demands, cap)
+                logger.info(f"   🔄 '{r_id}': AddCumulative (batch, capacity={cap}, {len(intervals)} intervals)")
+            else:
+                # Serial machine: no overlap
                 self.model.AddNoOverlap(intervals)
 
         return self
@@ -1129,6 +1144,18 @@ class TaskModelBuilder:
             f"total_qty={total_qty}, min_batches={min_batches}"
         )
 
+        # INFO: Log washing task details (helps detect user config errors vs solver errors)
+        for t_id in washing_task_ids[:5]:  # First 5 to avoid spam on large payloads
+            task = next((t for t in self.tasks if t["task_id"] == t_id), {})
+            logger.info(
+                f"   🔍 {t_id}: qty={task.get('qty', 0)}, "
+                f"color={task.get('color', 'N/A')!r}, "
+                f"substance={task.get('substance', 'N/A')!r}, "
+                f"resources={task.get('compatible_resource_ids', [])}"
+            )
+        if n > 5:
+            logger.info(f"   🔍 ... and {n - 5} more tasks")
+
         # ⚠️ Guard: warn if any task qty > capacity (may cause infeasibility)
         oversized_tasks = [
             (t_id, next((t for t in self.tasks if t["task_id"] == t_id), {}).get("qty", 0))
@@ -1191,29 +1218,24 @@ class TaskModelBuilder:
             # At most one group per slot
             self.model.Add(sum(group_uses_slot) <= 1)
 
-        # Constraint: synchronization — tasks in same slot share start time
+        # Constraint: synchronization — tasks in same slot MUST share start time
         for t_id in washing_task_ids:
             tv = self.task_vars[t_id]
             for k in range(K):
                 self.model.Add(
-                    tv["start"] >= batch_starts[k]
+                    tv["start"] == batch_starts[k]
                 ).OnlyEnforceIf(x[t_id][k])
 
-        # FIX 3: MACHINE SYNC (optimized: direct constraint between tasks, not via intermediate variable)
-        # If 2 tasks are in same slot k, they must use same machine (directly sync their machine_var)
-        sorted_washing_ids = sorted(washing_task_ids)
-        for k in range(K):
-            for i in range(len(sorted_washing_ids)):
-                for j in range(i + 1, len(sorted_washing_ids)):
-                    t_i = sorted_washing_ids[i]
-                    t_j = sorted_washing_ids[j]
-                    tv_i = self.task_vars[t_i]
-                    tv_j = self.task_vars[t_j]
-
-                    # If both tasks in same slot k, they must have same start
-                    # (already enforced above via batch_starts[k])
-                    # And must have compatible machines if needed
-                    # (Leave this as future enhancement; don't add more constraints now)
+        # NOTE: Machine sync (same slot → same machine) cannot be enforced as a hard
+        # constraint because washing machines use AddNoOverlap (serial/capacity=1).
+        # Concurrent tasks on the same machine at the same time violates AddNoOverlap.
+        #
+        # The real fix is for Go to mark washing machines as type=batch (capacity>1)
+        # so Python can use AddCumulative instead of AddNoOverlap for them.
+        #
+        # Current behaviour: tasks in same slot share start time (via batch_starts[k])
+        # and are assigned to different machines running in parallel — which is still
+        # a valid and practical schedule (both machines start simultaneously).
 
         # Batch activation BoolVars
         batch_active: List = []
@@ -1235,7 +1257,9 @@ class TaskModelBuilder:
             self.model.Add(batch_starts[k] == 0).OnlyEnforceIf(batch_active[k].Not())
 
         # Objective term: minimize number of active batches
-        _batch_w: int = 10 * self.lateness_scale
+        # Increased from 10 to 50 to strongly incentivize merging small batches
+        # When deadline allows, AI will prefer fewer larger batches over many small ones
+        _batch_w: int = 50 * self.lateness_scale
         for k in range(K):
             self.objective_terms.append(batch_active[k] * _batch_w)
 
