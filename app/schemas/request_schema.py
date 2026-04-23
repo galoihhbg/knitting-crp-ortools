@@ -87,6 +87,10 @@ class SolverConfig(BaseModel):
     num_search_workers: int = 8  # Set to 1 for byte-identical replay; 8 for production speed
     washing_batch_capacity: int = 10
     max_washing_batches: Optional[int] = None
+    # Số slot (K) tối đa cho washing batching.
+    # Nếu set: ghi đè hoàn toàn auto-calculation (K = min(n_tasks, giá trị này)).
+    # Nếu None: tự tính từ ceil(total_qty / capacity) × 3, tối thiểu 5.
+    washing_num_slots: Optional[int] = None
     # Virtual-time points (minutes) where each work shift ends.
     # Washing tasks must complete before, or start at/after, each boundary
     # because the backend strips breaks from the timeline and washing cannot be interrupted.

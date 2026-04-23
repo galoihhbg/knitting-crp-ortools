@@ -1127,20 +1127,27 @@ class TaskModelBuilder:
 
         total_qty = sum(task_qtys.values())
 
-        # 2. COMPUTE K (FIXED: use total_qty, not task count)
+        # 2. COMPUTE K
         capacity: int = max(1, int(self.config.get("washing_batch_capacity", 10)))
-        # Minimum batches needed = ceiling(total_qty / capacity)
         min_batches = math.ceil(total_qty / capacity)
-        # Add 3x flexibility, but cap at reasonable minimum
-        auto_k: int = max(min_batches * 3, 5)
-        K: int = min(n, auto_k)
-        cfg_max = self.config.get("max_washing_batches")
-        if cfg_max is not None:
-            K = min(K, int(cfg_max))
-        K = max(1, K)
+
+        cfg_slots = self.config.get("washing_num_slots")
+        if cfg_slots is not None:
+            # Backend override: dùng K do human chỉ định
+            K = max(1, min(n, int(cfg_slots)))
+            k_source = f"manual (washing_num_slots={cfg_slots})"
+        else:
+            # Auto-calculate: 3× flexibility, tối thiểu 5
+            auto_k: int = max(min_batches * 3, 5)
+            K = min(n, auto_k)
+            cfg_max = self.config.get("max_washing_batches")
+            if cfg_max is not None:
+                K = min(K, int(cfg_max))
+            K = max(1, K)
+            k_source = "auto"
 
         logger.info(
-            f"   K={K} slots, capacity={capacity}, n={n} tasks, "
+            f"   K={K} slots [{k_source}], capacity={capacity}, n={n} tasks, "
             f"total_qty={total_qty}, min_batches={min_batches}"
         )
 
