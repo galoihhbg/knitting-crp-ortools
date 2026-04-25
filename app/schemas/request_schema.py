@@ -19,19 +19,8 @@ class SolverResource(BaseModel):
     available_at_min: Optional[int] = 0
 
 
-class MachineRoute(BaseModel):
-    operation: str
-    design_item_id: str
-    duration: float
-    setup_time: float = 0.0
-
-
 class Machine(BaseModel):
     id: str
-    capacity: Optional[int] = None
-    type: Optional[str] = None
-    worker_req: int = 1
-    routing: List[MachineRoute]
     design_item_id: str
     color_config: str
 
@@ -44,15 +33,10 @@ class SolverTask(BaseModel):
     qty: float = Field(alias="qty")
     total_qty: float = Field(alias="total_qty")
     priority: int = Field(alias="priority")
-    original_depends_on: List[str] = Field(default=[], alias="original_depends_on")
     final_depends_on: List[str] = Field(default=[], alias="final_depends_on")
     start_after_min: int = Field(default=0, alias="start_after_min")
     due_at_min: int = Field(default=0, alias="due_at_min")
     duration: int = Field(alias="duration")
-    is_slice: bool = Field(default=False, alias="is_slice")
-    parent_task_id: str = Field(default="", alias="parent_task_id")
-    internal_dep: str = Field(default="", alias="internal_dep")
-    slice_index: int = Field(default=0, alias="slice_index")
     is_batch: bool = Field(default=False, alias="is_batch")
     sub_tasks: Optional[List["SolverTask"]] = Field(default=None, alias="sub_tasks")
     design_item_id: str = Field(alias="design_item_id")
@@ -60,11 +44,6 @@ class SolverTask(BaseModel):
     color: str = Field(default="", alias="color")
     substance: str = Field(default="", alias="substance")
     compatible_resource_ids: List[str] = Field(default=[], alias="compatible_resource_ids")
-    sub_task_completion_offsets: Optional[Dict[str, int]] = Field(
-        default=None, alias="sub_task_completion_offsets"
-    )
-    # wait_for_batch_task_id: Optional[str] = Field(default=None, alias="wait_for_batch_task_id")
-    # wait_for_offset: Optional[int] = Field(default=None, alias="wait_for_offset")
     wait_offsets: Optional[Dict[str, int]] = Field(default=None, alias="WaitOffsets")
 
     is_pinned: bool = Field(default=False, alias="is_pinned")
@@ -81,7 +60,6 @@ class SolverTask(BaseModel):
 class SolverConfig(BaseModel):
     horizon_minutes: int = 57600
     max_search_time: int = 300
-    setup_time_minutes: int = 60
     max_factory_machines: int = 40
     random_seed: int = 42       # Fixed seed for deterministic output across runs
     num_search_workers: int = 8  # Set to 1 for byte-identical replay; 8 for production speed

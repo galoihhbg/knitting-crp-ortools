@@ -158,16 +158,63 @@ class Engine:
         solver.parameters.num_search_workers = int(self.config.get("num_search_workers", 8))
         solver.parameters.random_seed = int(self.config.get("random_seed", 42))
 
+        # ── PRE-SOLVE DIAGNOSTICS ──────────────────────────────────────────────
+        _proto = builder.model.Proto()
+        logger.info(
+            f"📐 Model size: {len(_proto.variables)} vars, "
+            f"{len(_proto.constraints)} constraints, "
+            f"horizon={builder.horizon}min"
+        )
+
+        # Per-operation machine load — flag trước khi solver chạy
+        # Load > 1.0 = guaranteed infeasible (không đủ máy); > 0.85 = cảnh báo
+        _ops_duration: Dict[str, int] = {}
+        for t in self.tasks:
+            op = t.get("operation", "").lower()
+            _ops_duration[op] = _ops_duration.get(op, 0) + int(t.get("duration", 0))
+
+        _max_machines = int(self.config.get("max_factory_machines", 100))
+        _op_machine_count: Dict[str, int] = {"knitting": _max_machines}
+        for r in self.resources:
+            op = (r.get("operation") or "").lower()
+            if op and op != "knitting":
+                _op_machine_count[op] = _op_machine_count.get(op, 0) + 1
+
+        for op, total_dur in sorted(_ops_duration.items()):
+            n_machines = _op_machine_count.get(op, 1)
+            avail = n_machines * builder.horizon
+            load = total_dur / avail if avail > 0 else float("inf")
+            icon = "🔴" if load > 1.0 else ("🟡" if load > 0.85 else "🟢")
+            logger.info(
+                f"   {icon} [{op}] load={load:.1%}  "
+                f"({total_dur}min demand / {n_machines} machines × {builder.horizon}min horizon)"
+            )
+            if load > 1.0:
+                logger.error(
+                    f"   ❌ GUARANTEED INFEASIBLE: [{op}] cần {total_dur}min "
+                    f"nhưng chỉ có {avail}min ({n_machines} machines). "
+                    "Tăng horizon, thêm máy, hoặc giảm số đơn."
+                )
+
+        validation_err = builder.model.Validate()
+        if validation_err:
+            logger.error(
+                f"❌ MODEL_INVALID (Validate):\n{validation_err}\n"
+                "Nguyên nhân thường gặp: duration âm, bound min > max, "
+                "objective overflow (horizon quá lớn), mảng rỗng trong AddMaxEquality."
+            )
+            return {
+                "status": "model_invalid",
+                "assignments": [],
+                "overloads": [],
+                "objective_value": None,
+                "solve_time_seconds": 0.0,
+            }
+
         status = solver.Solve(builder.model)
 
-        # Overload-ratio diagnostic: warn ops when total knitting demand exceeds 85 %
-        # of available machine-capacity so they can add shifts before lateness compounds.
-        _total_knitting = sum(
-            int(t.get("duration", 0))
-            for t in self.tasks
-            if t.get("operation", "").lower() == "knitting"
-        )
-        _max_machines = int(self.config.get("max_factory_machines", 100))
+        # Overload-ratio diagnostic (knitting-specific, post-solve)
+        _total_knitting = _ops_duration.get("knitting", 0)
         _capacity = _max_machines * builder.horizon
         if _capacity > 0:
             _load = _total_knitting / _capacity

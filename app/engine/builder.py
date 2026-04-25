@@ -54,15 +54,36 @@ class TaskModelBuilder:
         # Accumulated terms for the minimization objective
         self.objective_terms: List[Any] = []
 
-        # Use config horizon, but guarantee it is large enough for all task durations
-        total_duration = sum(int(t.get("duration", 0)) for t in self.tasks)
+        import math as _math
         config_horizon = int(self.config.get("horizon_minutes", 40320))
-        self.horizon: int = max(config_horizon, total_duration + 5000)
+        total_duration = sum(int(t.get("duration", 0)) for t in self.tasks)
 
-        # Dynamic weight calibration — keeps LATENESS : AFFINITY : ACTIVATION ≈ 1000 : 10 : 2
-        # regardless of horizon size. Larger horizons need a bigger absolute coefficient so that
-        # a 1-minute delay doesn't appear negligible relative to the huge time scale.
-        self.lateness_scale: int = max(1, self.horizon // 1000)
+        # Auto-expand so every task fits, but cap at an int64-safe limit.
+        # Worst-case objective term per task: horizon² × MAX_WEIGHT (10⁵).
+        # For n tasks to stay within int64 (9.2 × 10¹⁸):
+        #   horizon < sqrt(INT64_MAX / (n × MAX_WEIGHT × 2))   ← ×2 safety margin
+        _n = max(len(self.tasks), 1)
+        _INT64_MAX = 9_223_372_036_854_775_807
+        _safe_horizon = int(_math.isqrt(_INT64_MAX // (_n * 100_000 * 2)))
+        _safe_horizon = max(_safe_horizon, config_horizon)  # never below what user asked
+
+        self.horizon: int = min(max(config_horizon, total_duration + 5000), _safe_horizon)
+
+        if total_duration > config_horizon:
+            logger.warning(
+                f"⚠️ Tổng duration tasks ({total_duration}min) vượt horizon config ({config_horizon}min) "
+                f"— horizon tự mở rộng lên {self.horizon}min. "
+                "Tăng horizon_minutes nếu muốn kiểm soát rõ hơn."
+            )
+        if self.horizon < total_duration + 5000:
+            logger.warning(
+                f"⚠️ Horizon bị giới hạn ở {self.horizon}min (int64-safe cap) dù total_duration={total_duration}min. "
+                "Một số task có thể không lên lịch được — giảm số đơn hoặc giảm priority weight."
+            )
+
+        # Cap lateness_scale to prevent objective overflow on large payloads.
+        # At safe_horizon with n tasks, scale = horizon//1000 keeps sum within int64.
+        self.lateness_scale: int = min(max(1, self.horizon // 1000), 50)
 
         # Tasks that were skipped because no compatible resource exists.
         # Populated by build_time_variables() and build_resource_allocations().
@@ -314,7 +335,9 @@ class TaskModelBuilder:
                 end_var = self.model.NewIntVar(0, self.horizon, f"end_{t_id}")
                 if operation != "capacity_block":
                     # Ép duration rõ ràng: end == start + duration
-                    duration_val = int(t.get("duration", 0))
+                    duration_val = max(0, int(t.get("duration", 0)))
+                    if duration_val == 0:
+                        logger.warning(f"⚠️ Task '{t_id}' có duration=0 — có thể là lỗi data.")
                     self.model.Add(end_var == start_var + duration_val)
                     if start_after > 0 and not is_pinned:
                         self.model.Add(start_var >= start_after)
@@ -323,23 +346,25 @@ class TaskModelBuilder:
             is_dummy = is_pinned and (t.get("qty", 0) == 0 or operation == "capacity_block")
             if not is_dummy:
                 weight = 10 ** (6 - priority)
-                lateness = self.model.NewIntVar(0, self.horizon, f"lat_{t_id}")
+                # Tighten lateness variable domain: max meaningful lateness = horizon - due_at
+                # Reduces OR-Tools worst-case objective sum check (prevents MODEL_INVALID on
+                # large payloads where n × horizon × weight would approach int64 limit).
+                max_lateness = max(0, self.horizon - due_at)
+                lateness = self.model.NewIntVar(0, max_lateness, f"lat_{t_id}")
                 self.model.Add(lateness >= end_var - due_at)
-                self.objective_terms.append(lateness * weight * 1000 * self.lateness_scale)
+                # Coefficient: weight × 100 (not × 1000 × lateness_scale).
+                # Ratios maintained: priority-1:priority-5 = 10000:1 ✓
+                #                    lateness:affinity      ≥ 2:1 (priority-5 vs 500pts) ✓
+                # Max term: 10^5 × 100 × horizon = 5×10^11 per task → 6.25×10^15 for 12500 tasks
+                # (vs 6.25×10^17 with old ×1000×scale — 100× safer margin from int64 limit)
+                self.objective_terms.append(lateness * weight * 100)
 
-            # Early-start preference: push every free task to start as early as
-            # its constraints allow.  Without this, the solver accepts lazy
-            # schedules where tasks sit idle for no reason (because lateness is
-            # only penalised when end_var > due_at, not when there's slack).
-            #
-            # Weight = priority_weight × lateness_scale (1/1000 of lateness
-            # per minute).  This is strong enough to outweigh the machine
-            # activation cost (2 × lateness_scale) for any delay > ~1 minute,
-            # so the solver will prefer assigning batches to separate machines
-            # (parallelism) over serialising them on one machine to save
-            # activation — which is the root cause of delayed linking.
+            # Early-start preference: tie-breaker so the solver avoids lazy idle schedules.
+            # Coefficient = max(1, weight // 100) — 10000× less than lateness per minute,
+            # so the solver always prefers being on time over starting earlier.
             if not is_pinned and operation != "capacity_block":
-                self.objective_terms.append(start_var * weight * self.lateness_scale)
+                start_coeff = max(1, weight // 100)
+                self.objective_terms.append(start_var * start_coeff)
 
             self.task_vars[t_id] = {
                 "start": start_var,
@@ -1146,9 +1171,18 @@ class TaskModelBuilder:
             K = max(1, K)
             k_source = "auto"
 
+        boolvars_count = n * K
+        if boolvars_count > 50_000:
+            logger.warning(
+                f"   ⚠️  BoolVar matrix lớn: {n} tasks × {K} slots = {boolvars_count:,} BoolVars. "
+                "Solver có thể chậm hoặc timeout. "
+                "Gợi ý: dùng washing_num_slots nhỏ hơn hoặc chia nhỏ payload theo từng màu/chất liệu."
+            )
+
         logger.info(
             f"   K={K} slots [{k_source}], capacity={capacity}, n={n} tasks, "
-            f"total_qty={total_qty}, min_batches={min_batches}"
+            f"total_qty={total_qty}, min_batches={min_batches}, "
+            f"boolvars={boolvars_count:,}"
         )
 
         # INFO: Log washing task details (helps detect user config errors vs solver errors)
@@ -1486,7 +1520,35 @@ class TaskModelBuilder:
     ) -> Dict[str, Any]:
         """Extract assignments and overloads from the solved model."""
         if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-            logger.warning("❌ Infeasible solution")
+            if status == cp_model.UNKNOWN:
+                logger.warning(
+                    f"⏱ TIMEOUT — solver ran {solver.WallTime():.1f}s without a feasible solution. "
+                    "Model có thể quá lớn hoặc cần tăng max_search_time. "
+                    "Gợi ý: giảm washing_num_slots, giảm n tasks, hoặc tăng thời gian."
+                )
+                return {
+                    "status": "timeout",
+                    "assignments": [],
+                    "overloads": [],
+                    "objective_value": None,
+                    "solve_time_seconds": solver.WallTime(),
+                }
+            if status == cp_model.MODEL_INVALID:
+                logger.error(
+                    "❌ MODEL_INVALID — model bị lỗi cấu trúc (biến trùng tên, bound âm, v.v.). "
+                    "Đây là bug trong builder, không phải do dữ liệu đầu vào."
+                )
+                return {
+                    "status": "model_invalid",
+                    "assignments": [],
+                    "overloads": [],
+                    "objective_value": None,
+                    "solve_time_seconds": solver.WallTime(),
+                }
+            logger.warning(
+                "❌ INFEASIBLE (proven) — không tồn tại lịch hợp lệ. "
+                "Kiểm tra: machine overload, dependency cycle, horizon quá nhỏ."
+            )
             return {
                 "status": "infeasible",
                 "assignments": [],
