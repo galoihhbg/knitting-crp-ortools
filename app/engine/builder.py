@@ -721,58 +721,51 @@ class TaskModelBuilder:
                 self.objective_terms.append(is_resource_activated * _w_activate)
 
         # ------------------------------------------------------------------
-        # NEW: CONTIGUOUS ON SAME MACHINE, PARALLEL ACROSS MACHINES
+        # PO CO-LOCATION: nhóm task cùng PO trên cùng máy (bounding box mềm)
         # ------------------------------------------------------------------
-        # 1. Gom nhóm task Knitting theo PO
+        # Chỉ xử lý task KHÔNG bị pin (is_pinned=False).
+        # Task đang chạy (is_pinned=True) có thể có pinned_start_time < 0 (âm),
+        # khi đó ràng buộc po_start ≤ start_pinned với po_start ∈ [0, horizon]
+        # tạo ra domain rỗng → INFEASIBLE ngay lập tức.
+        # Không thêm po_end - po_start == total_dur (zero-gap): ràng buộc này
+        # cũng INFEASIBLE khi shift break nằm giữa các task của PO.
+        # Co-location được khuyến khích qua affinity scoring trong objective.
         po_knitting_groups = {}
         for t in self.tasks:
-            if t.get("operation", "").lower() == "knitting":
+            if t.get("operation", "").lower() == "knitting" and not t.get("is_pinned", False):
                 po_id = t.get("original_order_id")
                 if po_id:
                     po_knitting_groups.setdefault(po_id, []).append(t)
 
-        # 2. Tạo "Bounding Box" cục bộ trên từng máy
         for po_id, tasks_in_po in po_knitting_groups.items():
             if len(tasks_in_po) <= 1:
                 continue
 
             for r_id in self.resource_map.keys():
                 task_lits = []
-                task_durations = []
                 task_starts = []
                 task_ends = []
-                
-                # Lọc các biến (variables) của PO này trên máy r_id
+
                 for t in tasks_in_po:
                     tid = t["task_id"]
                     if tid not in self.task_vars:
-                        # Task was skipped (no compatible resources) — do not crash
                         continue
                     tv = self.task_vars[tid]
                     lit = next((l for l in tv["literals"] if l.Name().endswith(f"_on_{r_id}")), None)
                     if lit is not None:
                         task_lits.append(lit)
-                        task_durations.append(int(t["duration"]))
                         task_starts.append(tv["start"])
                         task_ends.append(tv["end"])
 
                 if len(task_lits) > 1:
-                    # Tạo biến bao trùm cục bộ
                     po_start = self.model.NewIntVar(0, self.horizon, f"po_{po_id}_{r_id}_start")
                     po_end = self.model.NewIntVar(0, self.horizon, f"po_{po_id}_{r_id}_end")
                     po_active = self.model.NewBoolVar(f"po_{po_id}_{r_id}_active")
-                    
-                    # Nếu máy này nhận ít nhất 1 task của PO -> po_active = 1
                     self.model.AddMaxEquality(po_active, task_lits)
-                    
-                    # Ép Start/End của các task được chọn không vượt ra ngoài Bounding Box
+
                     for lit, st, en in zip(task_lits, task_starts, task_ends):
                         self.model.Add(st >= po_start).OnlyEnforceIf(lit)
                         self.model.Add(en <= po_end).OnlyEnforceIf(lit)
-                    
-                    # Ràng buộc thép: Khoảng cách Box = Tổng thời gian chạy thực tế của các task trên máy này
-                    total_dur_expr = sum(lit * dur for lit, dur in zip(task_lits, task_durations))
-                    self.model.Add(po_end - po_start == total_dur_expr).OnlyEnforceIf(po_active)
         
         self.build_workforce_constraints()
         return self
