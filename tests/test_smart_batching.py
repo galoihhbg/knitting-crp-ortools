@@ -297,3 +297,132 @@ def test_batched_tasks_share_start_time():
             f"WA and WB share slot {wa['batch_slot_id']} "
             f"but start at different times: {wa['start_time']} vs {wb['start_time']}"
         )
+
+
+def test_two_washing_machines_run_parallel():
+    """
+    Test: Option A — Go lists both WASH_A and WASH_B in compatible_resource_ids.
+    Each task has qty=5, capacity=5 per machine → one task fills a machine completely.
+
+    With 2 tasks (qty=5 each):
+    - They CANNOT share the same slot (5+5=10 > capacity=5).
+    - They CANNOT both start at T=0 on the same machine (AddCumulative demand=10 > 5).
+    - With tight deadline=65 (duration=60), sequential on one machine → W2 ends at 120
+      (misses deadline by 55 min). Parallel on two machines → both end at 60 ≤ 65.
+    - Therefore: solver MUST assign them to different machines to meet the deadline.
+
+    Without Option A (only one machine listed per task), this would be infeasible or
+    the second task would be forced to wait and miss its deadline.
+    """
+    payload = {
+        "job_id": "test_two_machines_parallel",
+        "config": _make_config(washing_batch_capacity=5, max_search_time=30),
+        "machines": [_make_machine("WASH_A"), _make_machine("WASH_B")],
+        "resources": [_make_resource("WASH_A"), _make_resource("WASH_B")],
+        "tasks": [
+            {**_make_washing_task("W1", "ORD_1", 60, 65, ["WASH_A", "WASH_B"]), "qty": 5.0},
+            {**_make_washing_task("W2", "ORD_2", 60, 65, ["WASH_A", "WASH_B"]), "qty": 5.0},
+        ],
+    }
+    result = Engine(payload).solve()
+    assert result["status"] in ("feasible", "optimal")
+
+    by_id = {a["task_id"]: a for a in result["assignments"]}
+    w1, w2 = by_id["W1"], by_id["W2"]
+
+    assert w1["machine_id"] != w2["machine_id"], (
+        f"W1 ({w1['machine_id']}) and W2 ({w2['machine_id']}) are on the same machine. "
+        "With qty=capacity=5, each task fills a machine — they must be on different machines."
+    )
+    assert w1["end_time"] <= 65, f"W1 missed deadline: end={w1['end_time']}"
+    assert w2["end_time"] <= 65, f"W2 missed deadline: end={w2['end_time']}"
+
+
+def test_pinned_task_does_not_consume_washing_slot():
+    """
+    Bug: Pinned washing tasks consumed batch slots → infeasible when
+    washing_num_slots was sized only for free tasks.
+
+    Setup: 1 pinned task (already scheduled) + 2 free tasks, washing_num_slots=2.
+    Before fix: K=min(3,2)=2 slots; pinned task takes slot 0, only 1 slot left
+                for 2 free tasks → infeasible.
+    After fix:  K computed from free tasks only → K=2 slots for 2 free tasks → feasible.
+    """
+    pinned = {
+        **_make_washing_task("W_pinned", "ORD_P", 60, 2000, ["WM_00"]),
+        "is_pinned": True,
+        "pinned_machine_id": "WM_00",
+        "pinned_start_time": 0,
+        "pinned_end_time": 60,
+    }
+    payload = {
+        "job_id": "test_pinned_no_slot_consumption",
+        "config": _make_config(washing_batch_capacity=5, washing_num_slots=2),
+        "machines": [_make_machine("WM_00")],
+        "resources": [_make_resource("WM_00")],
+        "tasks": [
+            pinned,
+            _make_washing_task("W1", "ORD_1", 60, 2000, ["WM_00"]),
+            _make_washing_task("W2", "ORD_2", 60, 2000, ["WM_00"]),
+        ],
+    }
+    result = Engine(payload).solve()
+    assert result["status"] in ("feasible", "optimal"), (
+        "Model infeasible — pinned task is likely consuming a washing slot"
+    )
+    task_ids = {a["task_id"] for a in result["assignments"]}
+    assert "W1" in task_ids, "W1 (free task) not scheduled"
+    assert "W2" in task_ids, "W2 (free task) not scheduled"
+
+
+def test_two_group_downstream_gets_correct_start_lb():
+    """
+    Bug: When 2 washing groups exist and one group has no schedulable tasks
+    (e.g., all pinned), the other group's downstream tasks incorrectly
+    started at T=0 because end_times were missing for the empty group.
+
+    Setup:
+    - Group A (red, cotton): 1 free washing task W_A (duration=60)
+    - Group B (blue, poly):  1 pinned washing task W_B (start=0, end=60)
+    - Downstream task D_B depends on W_B (final_depends_on=["W_B"])
+
+    After fix: W_B's pinned end_time (60) is in end_times even though
+               it bypasses slot assignment → D_B gets start_lb=60.
+    """
+    from app.engine.phases.phase3_batching import solve_washing
+
+    w_a = {
+        **_make_washing_task("W_A", "ORD_A", 60, 2000, ["WM_00"]),
+        "color": "red",
+        "substance": "cotton",
+    }
+    w_b = {
+        **_make_washing_task("W_B", "ORD_B", 60, 2000, ["WM_00"]),
+        "color": "blue",
+        "substance": "poly",
+        "is_pinned": True,
+        "pinned_machine_id": "WM_00",
+        "pinned_start_time": 0,
+        "pinned_end_time": 60,
+    }
+    config = _make_config(washing_batch_capacity=5)
+    resources = [_make_resource("WM_00")]
+
+    result = solve_washing(
+        tasks=[w_a, w_b],
+        resources=resources,
+        config=config,
+        p2_end_times={},
+        shift_ends=[],
+        horizon=5000,
+    )
+
+    assert result.status in ("feasible", "empty")
+    # W_B must be in end_times so downstream tasks can use it as start_lb
+    assert "W_B" in result.end_times, (
+        f"W_B (pinned) missing from end_times={result.end_times}. "
+        "Downstream tasks depending on W_B would start at T=0."
+    )
+    assert result.end_times["W_B"] == 60, (
+        f"Expected W_B end_time=60 (pinned_end_time), got {result.end_times['W_B']}"
+    )
