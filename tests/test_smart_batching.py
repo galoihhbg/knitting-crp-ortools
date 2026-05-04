@@ -338,6 +338,83 @@ def test_two_washing_machines_run_parallel():
     assert w2["end_time"] <= 65, f"W2 missed deadline: end={w2['end_time']}"
 
 
+def test_same_batch_slot_same_start_and_end_time():
+    """
+    Condition 1: tasks in the same washing batch must have identical start AND
+    end time — they enter and leave the machine together.
+
+    Setup: W1 (duration=60) and W2 (duration=120) forced into one slot
+    (washing_num_slots=1, total qty=2 ≤ capacity=4).
+    Expected: both share start_time AND end_time = start + 120 (longer task).
+    """
+    from app.engine.phases.phase3_batching import solve_washing
+
+    tasks = [
+        {**_make_washing_task("W1", "O1", 60,  5000, ["WM"]), "qty": 2.0},
+        {**_make_washing_task("W2", "O2", 120, 5000, ["WM"]), "qty": 2.0},
+    ]
+    r = solve_washing(
+        tasks=tasks,
+        resources=[_make_resource("WM")],
+        config=_make_config(washing_batch_capacity=4, washing_num_slots=1),
+        p2_end_times={}, shift_ends=[], horizon=5000,
+    )
+    assert r.status in ("feasible", "optimal")
+    by_id = {a["task_id"]: a for a in r.assignments}
+    w1, w2 = by_id["W1"], by_id["W2"]
+
+    assert w1["batch_slot_id"] == w2["batch_slot_id"], "W1 and W2 not in same slot"
+    assert w1["start_time"] == w2["start_time"], (
+        f"Same-slot tasks have different start: W1={w1['start_time']}, W2={w2['start_time']}"
+    )
+    assert w1["end_time"] == w2["end_time"], (
+        f"Same-slot tasks have different end: W1={w1['end_time']} (dur=60) "
+        f"W2={w2['end_time']} (dur=120) — should both be start+120"
+    )
+    assert w2["end_time"] == w2["start_time"] + 120, (
+        f"Batch end should be start+max_duration=start+120, got {w2['end_time']}"
+    )
+
+
+def test_different_slots_no_time_overlap_on_same_machine():
+    """
+    Condition 2: tasks in different batch slots must NOT have overlapping
+    time windows on the same machine — one cycle must finish before the next starts.
+
+    Setup: 4 tasks, capacity=4 per slot (so 2 slots of 2 tasks each), single machine.
+    W1+W2 in slot 0, W3+W4 in slot 1.
+    Expected: slot 1 starts after slot 0 ends (no overlap on WM).
+    """
+    from app.engine.phases.phase3_batching import solve_washing
+
+    tasks = [
+        {**_make_washing_task(f"W{i}", f"O{i}", 60, 5000, ["WM"]), "qty": 2.0}
+        for i in range(4)
+    ]
+    r = solve_washing(
+        tasks=tasks,
+        resources=[_make_resource("WM")],
+        config=_make_config(washing_batch_capacity=4, washing_num_slots=2),
+        p2_end_times={}, shift_ends=[], horizon=5000,
+    )
+    assert r.status in ("feasible", "optimal")
+
+    by_slot: dict = {}
+    for a in r.assignments:
+        by_slot.setdefault(a["batch_slot_id"], []).append(a)
+
+    assert len(by_slot) == 2, f"Expected 2 slots, got {len(by_slot)}: {list(by_slot)}"
+
+    slots = sorted(by_slot.values(), key=lambda ts: ts[0]["start_time"])
+    slot0_end   = slots[0][0]["end_time"]
+    slot1_start = slots[1][0]["start_time"]
+
+    assert slot1_start >= slot0_end, (
+        f"Slots overlap on same machine: slot0 ends at {slot0_end} "
+        f"but slot1 starts at {slot1_start}"
+    )
+
+
 def test_pinned_task_does_not_consume_washing_slot():
     """
     Bug: Pinned washing tasks consumed batch slots → infeasible when
@@ -426,3 +503,76 @@ def test_two_group_downstream_gets_correct_start_lb():
     assert result.end_times["W_B"] == 60, (
         f"Expected W_B end_time=60 (pinned_end_time), got {result.end_times['W_B']}"
     )
+
+
+def test_large_group_triggers_chunking_no_machine_conflict():
+    """
+    Regression: a single (color, substance) group with many tasks used to
+    create hundreds of thousands of BoolVars, causing solver timeout.
+
+    After the chunking fix:
+    - K auto-cap + chunked solving keep BoolVars <= _BOOLVAR_BUDGET per model.
+    - Machine handoff (virtual pinned tasks) prevents cross-chunk conflicts:
+      no two chunks can double-book the same machine at the same time.
+
+    Setup: 60 tasks, capacity=3 → min_batches=20, K=22, BoolVars=60×22=1,320.
+    With _BOOLVAR_BUDGET=5,000 this fits in one model — but we set budget to
+    a tiny value via monkeypatching to force the chunking path.
+    """
+    import app.engine.phases.phase3_batching as p3mod
+    from app.engine.phases.phase3_batching import solve_washing
+
+    original_budget = p3mod._BOOLVAR_BUDGET
+    try:
+        p3mod._BOOLVAR_BUDGET = 200  # force chunking at tiny group sizes
+
+        tasks = [
+            {
+                **_make_washing_task(f"W{i}", f"ORD_{i}", 60, 5000, ["WM_00"]),
+                "qty": 1.0,
+                "color": "red",
+                "substance": "cotton",
+            }
+            for i in range(30)
+        ]
+        result = solve_washing(
+            tasks=tasks,
+            resources=[_make_resource("WM_00")],
+            config=_make_config(washing_batch_capacity=3, max_search_time=30),
+            p2_end_times={},
+            shift_ends=[],
+            horizon=5000,
+        )
+    finally:
+        p3mod._BOOLVAR_BUDGET = original_budget
+
+    assert result.status in ("feasible", "empty"), f"Unexpected status: {result.status}"
+
+    # All tasks must appear in assignments or end_times (none silently dropped)
+    scheduled_ids = {a["task_id"] for a in result.assignments}
+    et_ids = set(result.end_times.keys())
+    task_ids = {t["task_id"] for t in tasks}
+    assert task_ids <= (scheduled_ids | et_ids), (
+        f"Tasks missing from output: {task_ids - scheduled_ids - et_ids}"
+    )
+
+    # No machine capacity violation: concurrent demand on each machine must not
+    # exceed washing_batch_capacity=3. (Overlap is expected and correct for batch
+    # machines — we only fail if demand exceeds the physical capacity limit.)
+    from collections import defaultdict
+    batch_cap = 3
+    by_machine = defaultdict(list)
+    for a in result.assignments:
+        by_machine[a["machine_id"]].append(
+            (a["start_time"], a["end_time"], a["task_id"])
+        )
+
+    for m_id, intervals in by_machine.items():
+        # Check demand at every start/end event point
+        time_points = sorted({t for s, e, _ in intervals for t in (s, e)})
+        for tp in time_points:
+            demand = sum(1 for s, e, _ in intervals if s <= tp < e)
+            assert demand <= batch_cap, (
+                f"Machine {m_id} at t={tp}: demand={demand} > capacity={batch_cap} — "
+                "cross-chunk machine conflict (handoff not working)"
+            )

@@ -344,6 +344,23 @@ def build_resource_model(
             else max(0, int(t.get("duration", 0)))
         )
 
+        # Fully pinned: machine and time are already decided — use a fixed interval
+        # var instead of NewBoolVar + model.Add(is_selected==1) + NewOptionalIntervalVar
+        # + AddExactlyOne.  This eliminates all solver branching overhead for pinned tasks.
+        # extract_results falls back to tv["r_ids"][0] when literals is empty and
+        # is_pinned is True, so assignments are still captured correctly.
+        if is_fully_pinned:
+            effective_id = tv["r_ids"][0]  # already narrowed above
+            if effective_id in resource_map and actual_duration > 0:
+                fixed_iv = model.NewFixedSizeIntervalVar(
+                    int(pinned_start), actual_duration, f"int_fixed_{t_id}"
+                )
+                task_demand = max(1, int(t.get("qty") or 1))
+                resource_intervals.setdefault(effective_id, []).append((fixed_iv, task_demand))
+            tv["literals"] = []
+            tv["r_ids"] = [effective_id]
+            continue  # skip BoolVar / AddExactlyOne entirely
+
         literals: List[Any] = []
         actual_r_ids: List[str] = []
 
@@ -354,11 +371,8 @@ def build_resource_model(
             literals.append(is_selected)
             actual_r_ids.append(r_id)
 
-            if is_pinned:
-                model.Add(is_selected == 1)
-
             available_at = int(resource_map[r_id].get("available_at_min", 0))
-            if available_at > 0 and not is_pinned:
+            if available_at > 0:
                 model.Add(tv["start"] >= available_at).OnlyEnforceIf(is_selected)
 
             if use_affinity:
