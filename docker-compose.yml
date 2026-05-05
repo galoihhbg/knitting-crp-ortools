@@ -9,6 +9,8 @@ services:
       - "${PORT:-8083}:${PORT:-8083}"
     env_file:
       - .env
+    volumes:
+      - ./logs:/app/logs
     environment:
       - REDIS_URL=redis://redis:6379/0
     networks:
@@ -23,6 +25,8 @@ services:
     command: celery -A app.core.celery_app worker --loglevel=info --concurrency=2
     env_file:
       - .env
+    volumes:
+      - ./logs:/app/logs
     environment:
       - REDIS_URL=redis://redis:6379/0
       - WEBHOOK_URL=http://api:8082/capacity-planning/complete

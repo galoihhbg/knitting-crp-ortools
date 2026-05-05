@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -68,6 +69,14 @@ def optimize_schedule(self, payload: dict):
         job_id = payload.get("job_id")
         logger.info(f"[Task {self.request.id}] Starting job_id={job_id}")
 
+        try:
+            os.makedirs("/app/logs", exist_ok=True)
+            with open(f"/app/logs/solver_input_{job_id}.json", "w") as f:
+                json.dump(payload, f, indent=2)
+            logger.info(f"[Task {self.request.id}] Dumped input payload to /app/logs/solver_input_{job_id}.json")
+        except Exception as e:
+            logger.error(f"[Task {self.request.id}] Failed to dump input payload: {e}")
+
         result = Engine(payload).solve()
 
         raw_assignments = result.get("assignments", [])
@@ -98,6 +107,14 @@ def optimize_schedule(self, payload: dict):
             "assignments": clean_assignments,
             "overloads": clean_overloads,
         }
+
+        try:
+            os.makedirs("/app/logs", exist_ok=True)
+            with open(f"/app/logs/solver_output_{job_id}.json", "w") as f:
+                json.dump(response_data, f, indent=2)
+            logger.info(f"[Task {self.request.id}] Dumped output payload to /app/logs/solver_output_{job_id}.json")
+        except Exception as e:
+            logger.error(f"[Task {self.request.id}] Failed to dump output payload: {e}")
 
         success = _post_webhook(response_data, self.request.id)
         return "Callback Successful" if success else "Callback Failed"

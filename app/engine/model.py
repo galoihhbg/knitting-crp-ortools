@@ -60,6 +60,19 @@ class Engine:
 
         self.resources = payload.get("resources", [])
         self.tasks = payload.get("tasks", [])
+
+        # Fallback for empty task operations (defensive programming against Go backend bugs)
+        resource_ops = {r.get("id"): r.get("operation") for r in self.resources if r.get("id")}
+        for t in self.tasks:
+            if not t.get("operation"):
+                m_id = t.get("pinned_machine_id") or (t.get("compatible_resource_ids", [None])[0] if t.get("compatible_resource_ids") else None)
+                if m_id and m_id in resource_ops and resource_ops[m_id]:
+                    t["operation"] = resource_ops[m_id]
+                    logger.warning(f"⚠️ Task {t.get('task_id')} missing operation, inferred as '{t['operation']}' from machine {m_id}")
+                else:
+                    t["operation"] = "knitting"
+                    logger.warning(f"⚠️ Task {t.get('task_id')} missing operation and machine inference failed, defaulting to 'knitting'")
+
         # Top-level material creel capacities: material_code → max concurrent rolls/slots.
         # Empty dict when the Go backend does not send the field (feature disabled).
         self.material_capacities: Dict[str, int] = payload.get("material_capacities") or {}
