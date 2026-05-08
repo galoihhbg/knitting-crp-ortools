@@ -38,7 +38,10 @@ DO NOT delete historical context if it is still relevant. Compress older complet
 - **2026-04-11** — `wait_offsets` constraints remain hard for MVP. Add `overload_ratio` warning log when factory load > 85%. Soft relaxation is Phase 2.
 - **2026-04-11** — `root_cause_code` classification lives in Python (`builder.py`), not Go. Go only sees the final JSON — it lacks access to solver variable states and pinned task metadata.
 - **2026-04-11** — Dynamic objective weight calibration: `LATENESS : AFFINITY : ACTIVATION ≈ 1000 : 10 : 2`. `lateness_scale = max(1, horizon // 1000)`. Ship in Phase 1 Step 7.
-- **2026-04-11** — Determinism strategy: `random_seed=42` default + `num_search_workers=1` for regression tests. Production uses `num_search_workers=8` for speed; replay tests must override to 1.
+- **2026-05-06** — Order Flow Optimization: replaced the simple cross-PO start-time gap penalty with a comprehensive "Order Flow" objective in `shared.py`. For each `group_id`, the solver now minimizes `group_end` and `group_end - group_start` (Makespan + Span). This provides a strong incentive (weighted at ~5% of lateness) to parallelize POs across multiple machines, overcoming setup/affinity biases to ensure downstream phases (Linking, Washing) receive material as early as possible.
+- **2026-05-06** — Multi-PO Parallelism: initial fix using start-gap penalty. Upgraded to Flow Optimization in next step.
+- **2026-04-11** — Determinism strategy: `random_seed=42` default + `num_search_workers=1` for regression tests. Production uses `num_search_workers=8` for speed; replay tests must override to 1. Ensure dict iterations are sorted (e.g. `sorted(dict.items())`) to preserve solver determinism.
+- **2026-05-08** — Temporarily disabled material demand constraints in Phase 1 (Knitting) per user request. Infrastructure remains in place in `phase1_knitting.py` and `builder.py` but the call to `_apply_material_constraints` is commented out.
 
 ## 🐛 Known Issues & Quirks
 

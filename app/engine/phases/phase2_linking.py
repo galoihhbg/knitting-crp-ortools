@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 from ortools.sat.python import cp_model
 
 from app.engine.shared import (
+    apply_order_flow_objective,
     apply_soft_deadlines,
     build_resource_model,
     compute_horizon,
@@ -96,6 +97,7 @@ def solve_linking(
 
     task_map = {t["task_id"]: t for t in linking_tasks}
     obj_terms = apply_soft_deadlines(model, task_vars, task_map, horizon)
+    obj_terms += apply_order_flow_objective(model, task_vars, linking_tasks, horizon)
     model.Minimize(sum(obj_terms) if obj_terms else 0)
 
     validation = model.Validate()

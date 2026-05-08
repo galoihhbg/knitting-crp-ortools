@@ -3,6 +3,7 @@ import logging
 from typing import Dict, Any, List, Optional, Set
 
 from ortools.sat.python import cp_model
+from .shared import apply_order_flow_objective
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +143,7 @@ class TaskModelBuilder:
             grouped_dummies[m_id].append(t)
             
         merged_dummies = []
-        for m_id, tasks_for_machine in grouped_dummies.items():
+        for m_id, tasks_for_machine in sorted(grouped_dummies.items()):
             # Filter and sort intervals
             intervals = []
             for t in tasks_for_machine:
@@ -737,7 +738,7 @@ class TaskModelBuilder:
                 if po_id:
                     po_knitting_groups.setdefault(po_id, []).append(t)
 
-        for po_id, tasks_in_po in po_knitting_groups.items():
+        for po_id, tasks_in_po in sorted(po_knitting_groups.items()):
             if len(tasks_in_po) <= 1:
                 continue
 
@@ -766,6 +767,9 @@ class TaskModelBuilder:
                     for lit, st, en in zip(task_lits, task_starts, task_ends):
                         self.model.Add(st >= po_start).OnlyEnforceIf(lit)
                         self.model.Add(en <= po_end).OnlyEnforceIf(lit)
+        
+        obj_terms = apply_order_flow_objective(self.model, self.task_vars, self.tasks, self.horizon)
+        self.objective_terms.extend(obj_terms)
         
         self.build_workforce_constraints()
         return self
@@ -866,7 +870,7 @@ class TaskModelBuilder:
         )
 
         # Step 3: Apply AddCumulative per material
-        for mat_code, capacity in self.material_capacities.items():
+        for mat_code, capacity in sorted(self.material_capacities.items()):
             intervals = mat_intervals.get(mat_code, [])
             demands = mat_demands.get(mat_code, [])
 
@@ -894,7 +898,7 @@ class TaskModelBuilder:
         - Batch  (capacity>1): AddCumulative — concurrent tasks allowed up to capacity
           Used for washing machines so batched tasks can run simultaneously.
         """
-        for r_id, resource in self.resource_map.items():
+        for r_id, resource in sorted(self.resource_map.items()):
             intervals = resource.get("intervals", [])
             cap = int(resource.get("capacity", 1))
 

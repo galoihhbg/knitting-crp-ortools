@@ -188,7 +188,7 @@ def _sanitize_dummy_tasks(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         grouped[m_id].append(t)
 
     merged_dummies: List[Dict[str, Any]] = []
-    for m_id, m_tasks in grouped.items():
+    for m_id, m_tasks in sorted(grouped.items()):
         intervals = [
             (int(t["pinned_start_time"]), int(t["pinned_end_time"]), t)
             for t in m_tasks

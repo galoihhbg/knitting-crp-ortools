@@ -105,7 +105,7 @@ def solve_washing(
     all_end_times: Dict[str, int] = {}
     total_solve_time = 0.0
 
-    for group_key, group_tasks in groups.items():
+    for group_key, group_tasks in sorted(groups.items()):
         result = _solve_group(
             group_key=group_key,
             group_tasks=group_tasks,

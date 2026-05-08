@@ -404,7 +404,7 @@ def build_resource_model(
         tv["r_ids"] = actual_r_ids
 
     # ── Step 3: routing constraints per resource ─────────────────────────────
-    for r_id, iv_demand_pairs in resource_intervals.items():
+    for r_id, iv_demand_pairs in sorted(resource_intervals.items()):
         res = resource_map.get(r_id, {})
         cap = int(res.get("capacity", 1))
 
@@ -445,7 +445,7 @@ def apply_soft_deadlines(
     Returns weighted objective terms to be summed into model.Minimize().
     """
     terms: List[Any] = []
-    for t_id, tv in task_vars.items():
+    for t_id, tv in sorted(task_vars.items()):
         task = task_map.get(t_id, {})
         if task.get("is_pinned", False):
             continue
@@ -465,6 +465,64 @@ def apply_soft_deadlines(
         start_coeff = max(1, weight // 100)
         terms.append(tv["start"] * start_coeff)
 
+    return terms
+
+
+def apply_order_flow_objective(
+    model: cp_model.CpModel,
+    task_vars: Dict[str, Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+    horizon: int,
+) -> List[Any]:
+    """
+    Minimize the completion time (makespan) and duration (span) of each order.
+    
+    This drives the solver to parallelize POs across multiple machines so that
+    downstream operations can begin as early as possible.
+    """
+    terms: List[Any] = []
+    lateness_scale = min(max(1, horizon // 1000), 50)
+    task_map = {t["task_id"]: t for t in tasks}
+    
+    # Group tasks by group_id (the Production Order / Order ID)
+    groups: Dict[str, List[str]] = {}
+    for t in tasks:
+        gid = t.get("group_id")
+        t_id = t["task_id"]
+        if gid and t_id in task_vars and t.get("operation", "").lower() != "capacity_block":
+            groups.setdefault(gid, []).append(t_id)
+            
+    for gid, t_ids in sorted(groups.items()):
+        if not t_ids:
+            continue
+            
+        # Representative priority (use the highest priority in the group)
+        max_priority = min((int(task_map[tid].get("priority", 5)) for tid in t_ids), default=3)
+        weight = 10 ** (6 - max_priority)
+        flow_w = (weight * lateness_scale) // 20
+        
+        if flow_w <= 0:
+            continue
+
+        # group_end = max(all task ends in group)
+        group_end = model.NewIntVar(0, horizon, f"group_end_{gid}")
+        # group_start = min(all task starts in group)
+        group_start = model.NewIntVar(0, horizon, f"group_start_{gid}")
+        
+        for tid in t_ids:
+            tv = task_vars[tid]
+            model.Add(group_end >= tv["end"])
+            model.Add(group_start <= tv["start"])
+            
+        # Penalty 1: Minimize completion time of the group
+        terms.append(group_end * flow_w)
+        
+        # Penalty 2: Minimize span (elapsed time) to drive parallelism
+        # span = end - start
+        span = model.NewIntVar(0, horizon, f"group_span_{gid}")
+        model.Add(span == group_end - group_start)
+        terms.append(span * flow_w)
+        
     return terms
 
 
@@ -574,7 +632,11 @@ def extract_results(
     start_times: Dict[str, int] = {}
     end_times: Dict[str, int] = {}
 
-    for t_id, tv in task_vars.items():
+    for t in tasks:
+        t_id = t["task_id"]
+        if t_id not in task_vars:
+            continue
+        tv = task_vars[t_id]
         start_val = solver.Value(tv["start"])
         end_val = solver.Value(tv["end"])
         start_times[t_id] = start_val

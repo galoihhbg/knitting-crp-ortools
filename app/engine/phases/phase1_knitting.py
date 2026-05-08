@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 from ortools.sat.python import cp_model
 
 from app.engine.shared import (
+    apply_order_flow_objective,
     apply_soft_deadlines,
     build_resource_model,
     compute_horizon,
@@ -163,8 +164,9 @@ def solve_knitting(
     _apply_workforce_constraints(model, task_vars, knitting_tasks, resource_map, config, horizon)
 
     # Per-material creel capacity (AddCumulative per material)
-    if material_capacities:
-        _apply_material_constraints(model, task_vars, knitting_tasks, material_capacities)
+    # Temporarily disabled per user request
+    # if material_capacities:
+    #     _apply_material_constraints(model, task_vars, knitting_tasks, material_capacities)
 
     # PO bounding-box: soft co-location for non-pinned tasks on each machine.
     # Pinned tasks are excluded: their fixed start times may be negative (in-progress)
@@ -172,6 +174,7 @@ def solve_knitting(
     _apply_po_bounding_box(model, task_vars, knitting_tasks, resource_map, horizon)
 
     obj_terms += apply_soft_deadlines(model, task_vars, task_map, horizon)
+    obj_terms += apply_order_flow_objective(model, task_vars, knitting_tasks, horizon)
     model.Minimize(sum(obj_terms) if obj_terms else 0)
 
     validation = model.Validate()
@@ -421,7 +424,7 @@ def _apply_material_constraints(
             mat_intervals[mat_code].append(interval)
             mat_demands[mat_code].append(demand_int)
 
-    for mat_code, capacity in material_capacities.items():
+    for mat_code, capacity in sorted(material_capacities.items()):
         intervals = mat_intervals.get(mat_code, [])
         demands = mat_demands.get(mat_code, [])
         if not intervals:
@@ -450,7 +453,7 @@ def _apply_po_bounding_box(
             if po_id:
                 po_groups.setdefault(po_id, []).append(t)
 
-    for po_id, po_tasks in po_groups.items():
+    for po_id, po_tasks in sorted(po_groups.items()):
         if len(po_tasks) <= 1:
             continue
 
