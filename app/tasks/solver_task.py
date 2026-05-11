@@ -7,6 +7,7 @@ import requests
 
 from ..core.celery_app import celery_app
 from ..engine.model import Engine
+from ..engine.shared import diagnose_infeasibility
 from ..engine.utils import filter_dummy_tasks, filter_dummy_overloads
 
 logger = logging.getLogger(__name__)
@@ -121,6 +122,11 @@ def optimize_schedule(self, payload: dict):
 
     except Exception as exc:
         logger.error(f"[Task {self.request.id}] Error: {exc}", exc_info=True)
+        tasks = payload.get("tasks", [])
+        resources = payload.get("resources", [])
+        config = payload.get("config", {})
+        horizon = int(config.get("horizon_minutes", 40320))
+        exc_overloads = diagnose_infeasibility(tasks, resources, config, horizon, "infeasible")
         # Notify the Go backend so it doesn't wait forever for a callback that
         # will never arrive.  The task is still re-raised so Celery marks it failed.
         _post_webhook(
@@ -128,8 +134,9 @@ def optimize_schedule(self, payload: dict):
                 "job_id": payload.get("job_id"),
                 "task_id": self.request.id,
                 "status": "infeasible",
+                "infeasibility_reason": f"Solver exception: {exc}",
                 "assignments": [],
-                "overloads": [],
+                "overloads": exc_overloads,
             },
             self.request.id,
         )

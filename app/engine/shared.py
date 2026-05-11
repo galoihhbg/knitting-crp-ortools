@@ -527,6 +527,106 @@ def apply_order_flow_objective(
 
 
 # ---------------------------------------------------------------------------
+# Infeasibility diagnosis
+# ---------------------------------------------------------------------------
+
+def diagnose_infeasibility(
+    tasks: List[Dict[str, Any]],
+    resources: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    horizon: int,
+    solver_status: str,
+) -> List[Dict[str, Any]]:
+    """
+    Classify each task with a root-cause code when the solver cannot find a schedule.
+
+    solver_status: "infeasible" | "timeout" | "model_invalid"
+    Returns one overload dict per non-capacity_block task.
+    """
+    real_tasks = [t for t in tasks if t.get("operation", "").lower() != "capacity_block"]
+
+    if solver_status == "timeout":
+        return [
+            {
+                "task_id": t["task_id"],
+                "order_id": t.get("original_order_id", ""),
+                "status": "UNSCHEDULABLE",
+                "delay_minutes": 0,
+                "root_cause_code": "SOLVER_TIMEOUT",
+                "bottleneck_resource_id": None,
+                "quantity": t.get("qty", 0),
+            }
+            for t in real_tasks
+        ]
+
+    resource_ids: Set[str] = {r.get("id") for r in resources if r.get("id")}
+
+    # Detect pinned-task conflicts: pairs on the same machine with overlapping intervals
+    pinned_conflict_ids: Set[str] = set()
+    pinned = [
+        t for t in real_tasks
+        if t.get("is_pinned")
+        and t.get("pinned_start_time") is not None
+        and t.get("pinned_end_time") is not None
+        and t.get("pinned_machine_id")
+    ]
+    for i, ta in enumerate(pinned):
+        for tb in pinned[i + 1:]:
+            if ta.get("pinned_machine_id") != tb.get("pinned_machine_id"):
+                continue
+            if int(ta["pinned_start_time"]) < int(tb["pinned_end_time"]) and \
+               int(tb["pinned_start_time"]) < int(ta["pinned_end_time"]):
+                pinned_conflict_ids.add(ta["task_id"])
+                pinned_conflict_ids.add(tb["task_id"])
+
+    # Total load per resource across all tasks compatible with it
+    resource_load: Dict[str, int] = {}
+    for t in real_tasks:
+        for r_id in t.get("compatible_resource_ids", []):
+            if r_id in resource_ids:
+                resource_load[r_id] = resource_load.get(r_id, 0) + int(t.get("duration", 0))
+    overloaded: Set[str] = {r_id for r_id, load in resource_load.items() if load > horizon}
+
+    overloads: List[Dict[str, Any]] = []
+    for t in real_tasks:
+        t_id = t["task_id"]
+        compatible = [r for r in t.get("compatible_resource_ids", []) if r in resource_ids]
+        duration = int(t.get("duration", 0))
+        start_after = int(t.get("start_after_min", 0))
+
+        if t_id in pinned_conflict_ids:
+            code = "PINNED_TASK_CONFLICT"
+            bottleneck = t.get("pinned_machine_id")
+        elif not t.get("is_pinned") and not t.get("compatible_resource_ids"):
+            code = "NO_COMPATIBLE_RESOURCE"
+            bottleneck = None
+        elif duration > horizon:
+            code = "TASK_TOO_LONG"
+            bottleneck = compatible[0] if compatible else None
+        elif start_after > horizon:
+            code = "START_AFTER_EXCEEDS_HORIZON"
+            bottleneck = None
+        elif compatible and all(r in overloaded for r in compatible):
+            code = "MACHINE_OVERLOAD"
+            bottleneck = compatible[0] if compatible else None
+        else:
+            code = "CAPACITY_FULL"
+            bottleneck = compatible[0] if compatible else None
+
+        overloads.append({
+            "task_id": t_id,
+            "order_id": t.get("original_order_id", ""),
+            "status": "UNSCHEDULABLE",
+            "delay_minutes": 0,
+            "root_cause_code": code,
+            "bottleneck_resource_id": bottleneck,
+            "quantity": t.get("qty", 0),
+        })
+
+    return overloads
+
+
+# ---------------------------------------------------------------------------
 # Result extraction
 # ---------------------------------------------------------------------------
 

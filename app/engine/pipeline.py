@@ -21,7 +21,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from .phases.phase1_knitting import PHASE1_OPS, Phase1Result, solve_knitting
-from .shared import compute_global_horizon
+from .shared import compute_global_horizon, diagnose_infeasibility
 from .phases.phase2_linking import PHASE2_OPS, Phase2Result, solve_linking
 from .phases.phase3_batching import PHASE3_OPS, Phase3Result, solve_washing
 from .phases.phase4_downstream import UPSTREAM_OPS, Phase4Result, solve_downstream
@@ -72,7 +72,7 @@ class Pipeline:
         logger.info(f"✅ Phase 1 complete: {len(p1.assignments)} assignments, status={p1.status}")
 
         if p1.status not in ("feasible", "empty"):
-            return _phase_failure_result(p1.status, p1_tasks)
+            return _phase_failure_result(p1.status, p1_tasks, all_resources, self.config, global_horizon)
 
         # ── Phase 2: Linking ──────────────────────────────────────────────
         p2_tasks = [t for t in self.tasks if t.get("operation", "").lower() in PHASE2_OPS]
@@ -86,7 +86,7 @@ class Pipeline:
         logger.info(f"✅ Phase 2 complete: {len(p2.assignments)} assignments, status={p2.status}")
 
         if p2.status not in ("feasible", "empty"):
-            return _phase_failure_result(p2.status, p2_tasks)
+            return _phase_failure_result(p2.status, p2_tasks, all_resources, self.config, global_horizon)
 
         # ── Phase 3: Washing ──────────────────────────────────────────────
         # Merge Phase 1+2 end times so washing tasks can depend on either
@@ -106,7 +106,7 @@ class Pipeline:
         )
 
         if p3.status not in ("feasible", "empty"):
-            return _phase_failure_result(p3.status, p3_tasks)
+            return _phase_failure_result(p3.status, p3_tasks, all_resources, self.config, global_horizon)
 
         # ── Phase 4: Downstream ───────────────────────────────────────────
         # All end times so downstream can depend on any upstream task
@@ -226,21 +226,28 @@ def _sanitize_dummy_tasks(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _phase_failure_result(
-    status: str, tasks: List[Dict[str, Any]]
+    status: str,
+    tasks: List[Dict[str, Any]],
+    resources: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+    horizon: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build a structured failure response when a phase cannot find a schedule."""
-    overloads = [
-        {
-            "task_id": t["task_id"],
-            "order_id": t.get("original_order_id", ""),
-            "status": "UNSCHEDULABLE",
-            "delay_minutes": 0,
-            "root_cause_code": status.upper(),
-            "bottleneck_resource_id": None,
-            "quantity": t.get("qty", 0),
-        }
-        for t in tasks
-    ]
+    if resources is not None and config is not None and horizon is not None:
+        overloads = diagnose_infeasibility(tasks, resources, config, horizon, status)
+    else:
+        overloads = [
+            {
+                "task_id": t["task_id"],
+                "order_id": t.get("original_order_id", ""),
+                "status": "UNSCHEDULABLE",
+                "delay_minutes": 0,
+                "root_cause_code": status.upper(),
+                "bottleneck_resource_id": None,
+                "quantity": t.get("qty", 0),
+            }
+            for t in tasks
+        ]
     return {
         "status": status,
         "assignments": [],
