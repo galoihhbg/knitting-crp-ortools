@@ -46,6 +46,10 @@ class SolverTask(BaseModel):
     compatible_resource_ids: List[str] = Field(default=[], alias="compatible_resource_ids")
     wait_offsets: Optional[Dict[str, int]] = Field(default=None, alias="WaitOffsets")
 
+    is_slice: bool = Field(default=False, alias="is_slice")
+    slice_index: int = Field(default=0, alias="SliceIndex")
+    parent_task_id: str = Field(default="", alias="parent_task_id")
+
     is_pinned: bool = Field(default=False, alias="is_pinned")
     pinned_machine_id: Optional[str] = Field(default=None, alias="pinned_machine_id")
     pinned_start_time: Optional[int] = Field(default=None, alias="pinned_start_time")

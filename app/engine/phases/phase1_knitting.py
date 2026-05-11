@@ -17,6 +17,7 @@ from ortools.sat.python import cp_model
 
 from app.engine.shared import (
     apply_order_flow_objective,
+    apply_slice_sync_objective,
     apply_soft_deadlines,
     build_resource_model,
     compute_horizon,
@@ -175,6 +176,7 @@ def solve_knitting(
 
     obj_terms += apply_soft_deadlines(model, task_vars, task_map, horizon)
     obj_terms += apply_order_flow_objective(model, task_vars, knitting_tasks, horizon)
+    obj_terms += apply_slice_sync_objective(model, task_vars, knitting_tasks, horizon)
     model.Minimize(sum(obj_terms) if obj_terms else 0)
 
     validation = model.Validate()

@@ -21,6 +21,7 @@ from ortools.sat.python import cp_model
 
 from app.engine.shared import (
     apply_order_flow_objective,
+    apply_slice_sync_objective,
     apply_soft_deadlines,
     build_resource_model,
     compute_horizon,
@@ -102,6 +103,7 @@ def solve_downstream(
     task_map = {t["task_id"]: t for t in downstream_tasks}
     obj_terms = apply_soft_deadlines(model, task_vars, task_map, horizon)
     obj_terms += apply_order_flow_objective(model, task_vars, downstream_tasks, horizon)
+    obj_terms += apply_slice_sync_objective(model, task_vars, downstream_tasks, horizon)
 
     # ── Intra-phase dependency constraints ──────────────────────────────────
     # final_depends_on may reference tasks within the same Phase 4 model

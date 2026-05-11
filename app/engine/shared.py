@@ -475,15 +475,19 @@ def apply_order_flow_objective(
     horizon: int,
 ) -> List[Any]:
     """
-    Minimize the completion time (makespan) and duration (span) of each order.
-    
-    This drives the solver to parallelize POs across multiple machines so that
-    downstream operations can begin as early as possible.
+    Minimize the completion time (makespan) and span of each order.
+
+    For non-slice groups this drives parallelism across machines (both group_end
+    and span terms).  For groups where every task is is_slice=True, both terms
+    are skipped — apply_slice_sync_objective handles coordination instead.
+    Keeping span for slice groups causes the solver to bunch all slices of one
+    order together before starting the next (span minimisation), delaying the
+    downstream tasks that wait for slice_N of multiple POs.
     """
     terms: List[Any] = []
     lateness_scale = min(max(1, horizon // 1000), 50)
     task_map = {t["task_id"]: t for t in tasks}
-    
+
     # Group tasks by group_id (the Production Order / Order ID)
     groups: Dict[str, List[str]] = {}
     for t in tasks:
@@ -491,16 +495,21 @@ def apply_order_flow_objective(
         t_id = t["task_id"]
         if gid and t_id in task_vars and t.get("operation", "").lower() != "capacity_block":
             groups.setdefault(gid, []).append(t_id)
-            
+
     for gid, t_ids in sorted(groups.items()):
         if not t_ids:
             continue
-            
+
+        # If every task in this group is a slice, skip group_end + span entirely.
+        # apply_slice_sync_objective owns cross-order slice coordination.
+        if all(task_map.get(tid, {}).get("is_slice") for tid in t_ids):
+            continue
+
         # Representative priority (use the highest priority in the group)
         max_priority = min((int(task_map[tid].get("priority", 5)) for tid in t_ids), default=3)
         weight = 10 ** (6 - max_priority)
         flow_w = (weight * lateness_scale) // 20
-        
+
         if flow_w <= 0:
             continue
 
@@ -508,21 +517,85 @@ def apply_order_flow_objective(
         group_end = model.NewIntVar(0, horizon, f"group_end_{gid}")
         # group_start = min(all task starts in group)
         group_start = model.NewIntVar(0, horizon, f"group_start_{gid}")
-        
+
         for tid in t_ids:
             tv = task_vars[tid]
             model.Add(group_end >= tv["end"])
             model.Add(group_start <= tv["start"])
-            
+
         # Penalty 1: Minimize completion time of the group
         terms.append(group_end * flow_w)
-        
+
         # Penalty 2: Minimize span (elapsed time) to drive parallelism
-        # span = end - start
         span = model.NewIntVar(0, horizon, f"group_span_{gid}")
         model.Add(span == group_end - group_start)
         terms.append(span * flow_w)
-        
+
+    return terms
+
+
+def apply_slice_sync_objective(
+    model: cp_model.CpModel,
+    task_vars: Dict[str, Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+    horizon: int,
+) -> List[Any]:
+    """
+    For is_slice=True tasks, minimize the maximum end time across all tasks
+    sharing the same slice_index (across all orders/groups).
+
+    This drives interleaving: completing slice_1 of ALL orders before any order
+    moves to slice_2, so downstream tasks that depend on slice_1 from multiple
+    POs can start at the earliest possible time.
+
+    Weight is higher for smaller slice_index because earlier syncs unblock more
+    downstream work.  Uses the same flow_w scale as apply_order_flow_objective
+    so the two objectives are commensurate.
+    """
+    terms: List[Any] = []
+    task_map = {t["task_id"]: t for t in tasks}
+
+    # Collect is_slice tasks grouped by slice_index
+    slice_groups: Dict[int, List[str]] = {}
+    for t in tasks:
+        if not t.get("is_slice"):
+            continue
+        t_id = t["task_id"]
+        if t_id not in task_vars:
+            continue
+        idx = int(t.get("slice_index", 0))
+        slice_groups.setdefault(idx, []).append(t_id)
+
+    if not slice_groups:
+        return terms
+
+    lateness_scale = min(max(1, horizon // 1000), 50)
+    max_idx = max(slice_groups.keys())
+
+    # Representative priority: best (lowest) across all slice tasks
+    all_priorities = [
+        int(task_map[tid].get("priority", 5))
+        for t_ids in slice_groups.values()
+        for tid in t_ids
+        if tid in task_map
+    ]
+    best_priority = min(all_priorities) if all_priorities else 3
+    weight = 10 ** (6 - best_priority)
+    flow_w = (weight * lateness_scale) // 20
+
+    for idx, t_ids in sorted(slice_groups.items()):
+        if not t_ids:
+            continue
+
+        # Higher weight for smaller slice_index (slice_1 is most urgent)
+        idx_weight = max(1, max_idx - idx + 1)
+
+        slice_end = model.NewIntVar(0, horizon, f"slice_sync_end_{idx}")
+        for t_id in t_ids:
+            model.Add(slice_end >= task_vars[t_id]["end"])
+
+        terms.append(slice_end * idx_weight * flow_w)
+
     return terms
 
 
