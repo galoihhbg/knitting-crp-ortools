@@ -854,7 +854,7 @@ def extract_results(
             "batch_slot_id": batch_slot_id,
         })
 
-        if is_late:
+        if is_late and not tv.get("is_pinned"):
             if config is not None:
                 root_cause = _classify_root_cause(
                     t_id, selected_res, start_val,

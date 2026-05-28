@@ -312,19 +312,70 @@ def _solve_group(
                 model.Add(tv["start"] >= S).OnlyEnforceIf(b.Not())
 
     if actual_free_qty <= capacity and len(free_scheduled_ids) > 1:
+        # Intersection of compatible machines across all free tasks.
+        # Non-empty → all tasks can physically share one machine.
+        common_machines: Optional[set] = None
+        for t_id in free_scheduled_ids:
+            t_m = set(task_vars[t_id].get("r_ids") or [])
+            common_machines = t_m if common_machines is None else common_machines & t_m
+        common_machines = common_machines or set()
+
         group_machine_ids: set = set()
         for t_id in free_scheduled_ids:
             group_machine_ids.update(task_vars[t_id].get("r_ids") or [])
         n_machines = len(group_machine_ids)
 
-        if n_machines >= len(free_scheduled_ids):
+        if common_machines:
+            # ── Slot co-location (same batch cycle) ──────────────────────────
+            t0 = free_scheduled_ids[0]
+            for t_other in free_scheduled_ids[1:]:
+                for k in range(K):
+                    model.Add(x[t0][k] == x[t_other][k])
+
+            # ── Machine co-location (same machine) ───────────────────────────
+            # 1. Restrict every task to only machines in the intersection.
+            for t_id in free_scheduled_ids:
+                t_rids = task_vars[t_id].get("r_ids") or []
+                t_lits = task_vars[t_id].get("literals") or []
+                for i, m_id in enumerate(t_rids):
+                    if i < len(t_lits) and m_id not in common_machines:
+                        model.AddBoolAnd([t_lits[i].Not()])
+
+            # 2. Force all tasks to match t0's machine choice.
+            t0_rids = task_vars[t0].get("r_ids") or []
+            t0_lits = task_vars[t0].get("literals") or []
+            t0_ml = {
+                t0_rids[i]: t0_lits[i]
+                for i in range(min(len(t0_rids), len(t0_lits)))
+                if t0_rids[i] in common_machines
+            }
+            for t_other in free_scheduled_ids[1:]:
+                t_other_rids = task_vars[t_other].get("r_ids") or []
+                t_other_lits = task_vars[t_other].get("literals") or []
+                t_other_ml = {
+                    t_other_rids[i]: t_other_lits[i]
+                    for i in range(min(len(t_other_rids), len(t_other_lits)))
+                    if t_other_rids[i] in common_machines
+                }
+                for m_id in common_machines:
+                    if m_id in t0_ml and m_id in t_other_ml:
+                        model.AddImplication(t0_ml[m_id], t_other_ml[m_id])
+                        model.AddImplication(t_other_ml[m_id], t0_ml[m_id])
+
+            logger.info(
+                f"   🔒 Group {group_key}: co-located (slot + machine) "
+                f"(free_qty={actual_free_qty}≤cap={capacity}, "
+                f"common_machines={len(common_machines)})"
+            )
+        elif n_machines >= len(free_scheduled_ids):
+            # No single machine can hold all tasks, but enough machines exist
+            # for each task — force same slot (sequential batches still pack tightly).
             t0 = free_scheduled_ids[0]
             for t_other in free_scheduled_ids[1:]:
                 for k in range(K):
                     model.Add(x[t0][k] == x[t_other][k])
             logger.info(
-                f"   🔒 Group {group_key}: co-located "
-                f"(free_qty={actual_free_qty}≤cap={capacity}, "
+                f"   🔒 Group {group_key}: slot co-located (no common machine, "
                 f"{n_machines} machines ≥ {len(free_scheduled_ids)} tasks)"
             )
         else:
@@ -413,6 +464,32 @@ def _solve_group(
 
     task_map = {t["task_id"]: t for t in group_tasks}
     obj_terms += apply_soft_deadlines(model, task_vars, task_map, horizon)
+
+    # Pairwise co-location incentive: khi total qty > capacity (không gộp được hết),
+    # vẫn cần ép các cặp vừa vặn vào chung 1 slot thay vì để solver tự quyết.
+    # pair_w = 2 * batch_w → mỗi cặp bị tách tốn gấp đôi chi phí 1 slot active.
+    if actual_free_qty > capacity and len(free_scheduled_ids) >= 2:
+        pair_w = 2 * batch_w
+        ids = free_scheduled_ids
+        n_ids = len(ids)
+        # Guard: bỏ qua nếu số BoolVar sẽ quá lớn (> 8000)
+        if n_ids * (n_ids - 1) // 2 * K <= 8000:
+            for i in range(n_ids):
+                for j in range(i + 1, n_ids):
+                    a, b = ids[i], ids[j]
+                    if task_qtys[a] + task_qtys[b] > capacity:
+                        continue
+                    # same_slot[k] = 1 iff cả a và b cùng ở slot k
+                    same_slots = []
+                    for k in range(K):
+                        s = model.NewBoolVar(f"ss_{i}_{j}_{k}")
+                        model.AddBoolAnd([x[a][k], x[b][k]]).OnlyEnforceIf(s)
+                        model.AddBoolOr([x[a][k].Not(), x[b][k].Not()]).OnlyEnforceIf(s.Not())
+                        same_slots.append(s)
+                    co = model.NewBoolVar(f"co_{i}_{j}")
+                    model.AddMaxEquality(co, same_slots)
+                    # Phạt khi KHÔNG chung slot
+                    obj_terms.append(pair_w - co * pair_w)
 
     model.Minimize(sum(obj_terms) if obj_terms else 0)
 

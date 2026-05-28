@@ -78,6 +78,27 @@ def optimize_schedule(self, payload: dict):
         except Exception as e:
             logger.error(f"[Task {self.request.id}] Failed to dump input payload: {e}")
 
+        # ─── MOCK MODE ────────────────────────────────────────────────────────
+        # Khi MOCK_RESPONSE_FILE set, bỏ qua solver hoàn toàn, trả về nguyên
+        # nội dung file đó cho Go (giữ nguyên job_id từ payload để Go route được).
+        # Dùng để debug downstream (vd: stock check) với dữ liệu cố định.
+        mock_file = os.getenv("MOCK_RESPONSE_FILE")
+        if mock_file:
+            try:
+                with open(mock_file) as f:
+                    mock_data = json.load(f)
+                mock_data["job_id"] = job_id
+                mock_data["task_id"] = self.request.id
+                logger.warning(
+                    f"[Task {self.request.id}] 🧪 MOCK_RESPONSE_FILE active: "
+                    f"trả về nguyên nội dung {mock_file} (bỏ qua solver)"
+                )
+                _post_webhook(mock_data, self.request.id)
+                return "Mock Callback Sent"
+            except Exception as e:
+                logger.error(f"[Task {self.request.id}] MOCK_RESPONSE_FILE lỗi: {e}")
+                # rớt xuống chạy solver bình thường
+
         result = Engine(payload).solve()
 
         raw_assignments = result.get("assignments", [])

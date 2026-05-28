@@ -1618,7 +1618,7 @@ class TaskModelBuilder:
                     "status": "LATE" if is_late else "ON_TIME",
                     "batch_slot_id": batch_slot_id,
                 })
-                if is_late:
+                if is_late and not tv.get("is_pinned"):
                     overloads.append({
                         "task_id": t_id,
                         "order_id": tv.get("original_order_id", ""),
