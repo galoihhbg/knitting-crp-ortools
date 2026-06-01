@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from .pipeline import Pipeline
 
@@ -61,6 +61,15 @@ class Engine:
         self.resources = payload.get("resources", [])
         self.tasks = payload.get("tasks", [])
 
+        # Optional re-schedule stability hint (None → fresh solve, behavior unchanged).
+        rh = payload.get("reschedule_hint")
+        self.reschedule_hint: Optional[Dict[str, Any]] = rh if rh else None
+        if self.reschedule_hint:
+            logger.info(
+                f"🎯 reschedule_hint received: "
+                f"{len(self.reschedule_hint.get('previous_assignments') or [])} previous assignments"
+            )
+
         # Fallback for empty task operations (defensive programming against Go backend bugs)
         resource_ops = {r.get("id"): r.get("operation") for r in self.resources if r.get("id")}
         for t in self.tasks:
@@ -97,5 +106,6 @@ class Engine:
             self.resources,
             self.tasks,
             self.material_capacities,
+            reschedule_hint=self.reschedule_hint,
         )
         return pipeline.run()

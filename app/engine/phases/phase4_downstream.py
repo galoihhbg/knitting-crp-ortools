@@ -23,6 +23,7 @@ from app.engine.shared import (
     apply_order_flow_objective,
     apply_slice_sync_objective,
     apply_soft_deadlines,
+    apply_stability_objective,
     build_resource_model,
     compute_horizon,
     extract_results,
@@ -51,6 +52,7 @@ def solve_downstream(
     config: Dict[str, Any],
     p3_end_times: Dict[str, int],
     horizon: Optional[int] = None,
+    reschedule_hint: Optional[Dict[str, Any]] = None,
 ) -> Phase4Result:
     """
     Solve all downstream operations (ironing, packing, or any future op).
@@ -102,8 +104,10 @@ def solve_downstream(
 
     task_map = {t["task_id"]: t for t in downstream_tasks}
     obj_terms = apply_soft_deadlines(model, task_vars, task_map, horizon)
-    obj_terms += apply_order_flow_objective(model, task_vars, downstream_tasks, horizon)
-    obj_terms += apply_slice_sync_objective(model, task_vars, downstream_tasks, horizon)
+    # Re-schedule: skip flow/sync (they outweigh stability pin) — see phase1.
+    if not reschedule_hint:
+        obj_terms += apply_order_flow_objective(model, task_vars, downstream_tasks, horizon)
+        obj_terms += apply_slice_sync_objective(model, task_vars, downstream_tasks, horizon)
 
     # ── Intra-phase dependency constraints ──────────────────────────────────
     # final_depends_on may reference tasks within the same Phase 4 model
@@ -121,6 +125,18 @@ def solve_downstream(
     if intra_dep_count:
         logger.info(f"   🔗 Phase 4: {intra_dep_count} intra-phase dependency constraints added")
 
+    stab_terms, stab_stats = apply_stability_objective(
+        model, task_vars, downstream_tasks, reschedule_hint, horizon, start_lb=start_lb,
+    )
+    obj_terms += stab_terms
+    if reschedule_hint:
+        logger.info(
+            f"   🎯 Phase4 stability_stats: total_previous={stab_stats.total_previous} "
+            f"matched_exact={stab_stats.matched_exact} matched_via_order={stab_stats.matched_via_order} "
+            f"n_hinted={stab_stats.n_hinted} time_terms={stab_stats.time_terms_added} "
+            f"machine_terms={stab_stats.machine_terms_added}"
+        )
+
     model.Minimize(sum(obj_terms) if obj_terms else 0)
 
     validation = model.Validate()
@@ -128,7 +144,7 @@ def solve_downstream(
         logger.error(f"❌ Phase 4 MODEL_INVALID: {validation}")
         return Phase4Result(status="model_invalid")
 
-    solver = make_solver(config)
+    solver = make_solver(config, has_hint=bool(reschedule_hint))
     status_code = solver.Solve(model)
 
     logger.info(

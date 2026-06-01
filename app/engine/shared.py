@@ -11,11 +11,240 @@ Provides:
 """
 import math
 import logging
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ortools.sat.python import cp_model
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Re-schedule stability — apply_stability_objective + StabilityStats
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StabilityStats:
+    """Per-phase reporting for stability-hint application (used by tests + logs).
+
+    Fields are integer counters so assertions don't depend on float noise.
+    """
+    total_previous: int = 0
+    matched_exact: int = 0
+    matched_via_order: int = 0
+    n_hinted: int = 0
+    time_terms_added: int = 0
+    machine_terms_added: int = 0
+
+
+def apply_stability_objective(
+    model: cp_model.CpModel,
+    task_vars: Dict[str, Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+    reschedule_hint: Optional[Dict[str, Any]],
+    horizon: int,
+    start_lb: Optional[Dict[str, int]] = None,
+) -> Tuple[List[Any], StabilityStats]:
+    """
+    Add warm-start hints + minimum-perturbation penalty terms to the model.
+
+    Semantics
+    ---------
+    For each non-pinned task that matches a previous assignment:
+      * `AddHint(start, clipped_prev_start)` — clipped to [max(0, start_lb[t_id]), horizon].
+      * `AddHint(lit, 1)` for the literal of the previous machine; `AddHint(lit, 0)` for others.
+      * Penalty: `|start - prev_start| * w_time` (EXACT-matched tasks only; fallback-matched
+        tasks SKIP this term — see FIX-3, B.2 ngữ nghĩa).
+      * Penalty: `lit_machine_other * w_machine` for every literal on a machine ≠ prev_machine.
+
+    Pinned tasks are skipped entirely (they have no choice variables).
+    Hint is dropped silently when reschedule_hint is None or empty.
+
+    Returns
+    -------
+    (penalty_terms, StabilityStats) — caller sums `penalty_terms` into the
+    phase's `model.Minimize(...)`.
+    """
+    stats = StabilityStats()
+    if not reschedule_hint:
+        return [], stats
+
+    previous = reschedule_hint.get("previous_assignments") or []
+    if not previous:
+        return [], stats
+
+    stats.total_previous = len(previous)
+
+    w_time = int(reschedule_hint.get("stability_weight_time_per_min", 500))
+    w_machine = int(reschedule_hint.get("stability_weight_machine_swap", 5000))
+    fallback_enabled = bool(reschedule_hint.get("match_by_order_fallback", True))
+    start_lb = start_lb or {}
+
+    # Index previous by exact task_id AND a LIST per original_order_id (for fallback).
+    # An order spans multiple operations (knitting + linking), so per-task fallback
+    # must pick the prev whose machine is compatible with the current task — not
+    # just "first prev in this order".
+    prev_by_taskid: Dict[str, Dict[str, Any]] = {p["task_id"]: p for p in previous}
+    prev_by_order: Dict[str, List[Dict[str, Any]]] = {}
+    for p in previous:
+        oid = p.get("original_order_id", "")
+        if oid:
+            prev_by_order.setdefault(oid, []).append(p)
+
+    terms: List[Any] = []
+
+    # Build task_info index (we also accept callers passing already-filtered tasks)
+    task_info_by_id: Dict[str, Dict[str, Any]] = {t["task_id"]: t for t in tasks}
+
+    for t_id, tv in task_vars.items():
+        if tv.get("is_pinned"):
+            continue
+
+        # Match: exact first, then fallback by order
+        match_kind: Optional[str] = None
+        prev: Optional[Dict[str, Any]] = None
+        if t_id in prev_by_taskid:
+            prev = prev_by_taskid[t_id]
+            match_kind = "exact"
+        elif fallback_enabled:
+            order_id = (
+                task_info_by_id.get(t_id, {}).get("original_order_id", "")
+                or tv.get("original_order_id", "")
+            )
+            if order_id and order_id in prev_by_order:
+                compatible = set(tv.get("r_ids") or [])
+                for cand in prev_by_order[order_id]:
+                    if cand.get("machine_id") in compatible:
+                        prev = cand
+                        match_kind = "order"
+                        break
+
+        if prev is None or match_kind is None:
+            continue
+
+        # ── Counters & hints ─────────────────────────────────────────────────
+        if match_kind == "exact":
+            stats.matched_exact += 1
+        else:
+            stats.matched_via_order += 1
+        stats.n_hinted += 1
+
+        # Clip prev_start into the task's feasible window.
+        prev_start = int(prev.get("start_time", 0))
+        lo = max(0, int(start_lb.get(t_id, 0)))
+        prev_start_clipped = max(lo, min(horizon, prev_start))
+        model.AddHint(tv["start"], prev_start_clipped)
+
+        # Machine hints + machine-swap penalty terms
+        prev_machine = prev.get("machine_id", "")
+        literals = tv.get("literals", []) or []
+        r_ids = tv.get("r_ids", []) or []
+        for lit, r_id in zip(literals, r_ids):
+            if r_id == prev_machine:
+                model.AddHint(lit, 1)
+            else:
+                model.AddHint(lit, 0)
+                if w_machine > 0:
+                    terms.append(lit * w_machine)
+                    stats.machine_terms_added += 1
+
+        # Time-deviation penalty — EXACT match only.
+        # Fallback-match (slicing rename, qty change) hints machine but skips
+        # the time term to avoid pulling N renamed slices toward a single
+        # prev_start (would conflict with no-overlap, see FIX-3 in C5 revised).
+        if match_kind == "exact" and w_time > 0:
+            dev = model.NewIntVar(0, horizon, f"sdev_{t_id}")
+            model.AddAbsEquality(dev, tv["start"] - prev_start_clipped)
+            terms.append(dev * w_time)
+            stats.time_terms_added += 1
+
+    return terms, stats
+
+
+def apply_stability_hints_only(
+    model: cp_model.CpModel,
+    task_vars: Dict[str, Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+    reschedule_hint: Optional[Dict[str, Any]],
+    horizon: int,
+    start_lb: Optional[Dict[str, int]] = None,
+) -> Tuple[List[Any], StabilityStats]:
+    """Hints-ONLY variant of apply_stability_objective for the knitting phase.
+
+    Adds the same `AddHint` warm-start calls as `apply_stability_objective`
+    (start IntVar + machine literals) but contributes ZERO objective terms.
+    Used by phase 1 when reified-keep is active, so the soft time-dev / machine-
+    swap penalties do NOT double-stabilize alongside the hard keep constraint.
+
+    Returns ([], StabilityStats) for API parity with apply_stability_objective.
+    Callers MUST NOT sum the returned terms (empty by contract).
+    """
+    stats = StabilityStats()
+    if not reschedule_hint:
+        return [], stats
+
+    previous = reschedule_hint.get("previous_assignments") or []
+    if not previous:
+        return [], stats
+
+    stats.total_previous = len(previous)
+    fallback_enabled = bool(reschedule_hint.get("match_by_order_fallback", True))
+    start_lb = start_lb or {}
+
+    prev_by_taskid: Dict[str, Dict[str, Any]] = {p["task_id"]: p for p in previous}
+    prev_by_order: Dict[str, List[Dict[str, Any]]] = {}
+    for p in previous:
+        oid = p.get("original_order_id", "")
+        if oid:
+            prev_by_order.setdefault(oid, []).append(p)
+
+    task_info_by_id: Dict[str, Dict[str, Any]] = {t["task_id"]: t for t in tasks}
+
+    for t_id, tv in task_vars.items():
+        if tv.get("is_pinned"):
+            continue
+
+        match_kind: Optional[str] = None
+        prev: Optional[Dict[str, Any]] = None
+        if t_id in prev_by_taskid:
+            prev = prev_by_taskid[t_id]
+            match_kind = "exact"
+        elif fallback_enabled:
+            order_id = (
+                task_info_by_id.get(t_id, {}).get("original_order_id", "")
+                or tv.get("original_order_id", "")
+            )
+            if order_id and order_id in prev_by_order:
+                compatible = set(tv.get("r_ids") or [])
+                for cand in prev_by_order[order_id]:
+                    if cand.get("machine_id") in compatible:
+                        prev = cand
+                        match_kind = "order"
+                        break
+
+        if prev is None or match_kind is None:
+            continue
+
+        if match_kind == "exact":
+            stats.matched_exact += 1
+        else:
+            stats.matched_via_order += 1
+        stats.n_hinted += 1
+
+        prev_start = int(prev.get("start_time", 0))
+        lo = max(0, int(start_lb.get(t_id, 0)))
+        prev_start_clipped = max(lo, min(horizon, prev_start))
+        model.AddHint(tv["start"], prev_start_clipped)
+
+        prev_machine = prev.get("machine_id", "")
+        literals = tv.get("literals", []) or []
+        r_ids = tv.get("r_ids", []) or []
+        for lit, r_id in zip(literals, r_ids):
+            model.AddHint(lit, 1 if r_id == prev_machine else 0)
+
+    return [], stats
+
 
 INT64_MAX: int = 9_223_372_036_854_775_807
 _PENALTY_CHANGE_DESIGN: int = 10
@@ -148,12 +377,55 @@ def compute_global_horizon(
     return min(base, _safe)
 
 
-def make_solver(config: Dict[str, Any]) -> cp_model.CpSolver:
+def make_solver(config: Dict[str, Any], *, has_hint: bool = False) -> cp_model.CpSolver:
+    """
+    Configured CpSolver factory.
+
+    Determinism strategy (CỔNG-1 D6): use `max_deterministic_time` + fixed
+    `random_seed` to guarantee reproducibility AT ALL SCALES, while keeping
+    multi-worker enabled for speed.  Wall-clock is a safety cap only.
+
+    For `has_hint=True` (re-schedule path) additionally set `repair_hint=True`
+    so CP-SAT actively repairs hint conflicts rather than silently discarding.
+    Workers count is NOT overridden — caller's `num_search_workers` is honored.
+
+    Tuning notes:
+      * `max_deterministic_time` is the primary stop criterion (deterministic
+        units ≈ single-core seconds).  Auto-derived as `max_search_time × workers`
+        when caller omits it.
+      * `max_time_in_seconds = max_search_time × 4` is a safety cap; deterministic
+        stop should fire first under normal load.
+      * If output appears non-deterministic across runs, raise
+        `max_deterministic_time` so the solver fully converges within the budget.
+    """
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = int(config.get("max_search_time", 60))
+
+    requested_workers = int(config.get("num_search_workers", 8))
+    wall_budget_s = int(config.get("max_search_time", 60))
+
+    # has_hint path: max_deterministic_time is the primary stop criterion
+    # (D6).  Cold path keeps the original wall-clock-only stop, preserving
+    # backward-compat with test_determinism.py::test_five_replays_identical_*.
+    if has_hint:
+        det_budget = config.get("max_deterministic_time")
+        if det_budget is None:
+            det_budget = float(wall_budget_s) * max(1, requested_workers)
+        solver.parameters.max_deterministic_time = float(det_budget)
+        solver.parameters.max_time_in_seconds = float(wall_budget_s) * 4.0
+    else:
+        explicit_det = config.get("max_deterministic_time")
+        if explicit_det is not None:
+            solver.parameters.max_deterministic_time = float(explicit_det)
+        solver.parameters.max_time_in_seconds = float(wall_budget_s)
+
     solver.parameters.relative_gap_limit = 0.01
-    solver.parameters.num_search_workers = int(config.get("num_search_workers", 8))
+    solver.parameters.num_search_workers = requested_workers
     solver.parameters.random_seed = int(config.get("random_seed", 42))
+
+    # NOTE: `repair_hint=True` triggers `Check failed: heuristics.fixed_search != nullptr`
+    # SIGABRT on CP-SAT 9.8+ unless `search_branching=FIXED_SEARCH` is also set.
+    # AddHint() warm-start + reified-keep on knitting + soft penalty on other phases
+    # are sufficient; repair_hint is an optional accelerator that crashes here.
     return solver
 
 

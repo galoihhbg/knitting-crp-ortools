@@ -19,6 +19,8 @@ from app.engine.shared import (
     apply_order_flow_objective,
     apply_slice_sync_objective,
     apply_soft_deadlines,
+    apply_stability_hints_only,
+    apply_stability_objective,
     build_resource_model,
     compute_horizon,
     extract_results,
@@ -28,6 +30,104 @@ from app.engine.shared import (
 logger = logging.getLogger(__name__)
 
 PHASE1_OPS = frozenset({"knitting", "capacity_block"})
+
+
+def apply_knitting_keep_lex(
+    model: Any,
+    task_vars: Dict[str, Dict[str, Any]],
+    knitting_tasks: List[Dict[str, Any]],
+    reschedule_hint: Optional[Dict[str, Any]],
+    horizon: int,
+) -> Dict[str, Any]:
+    """Reified-keep on knitting start times.
+
+    For every knitting task that has an EXACT task_id match in
+    `reschedule_hint.previous_assignments`, create a Bool `keep_t` with the
+    reified constraint:
+
+        model.Add(start == prev_start).OnlyEnforceIf(keep_t)
+
+    Pass 2 (`solve_knitting`) constrains `sum(keep_lits) >= len(keep_lits) - D*`
+    so the solver hard-pins at least `N - D*` previous knitting tasks while
+    choosing optimally WHICH to break.
+
+    Skipped (not added to keep_lits, logged for diagnostics):
+      * Pinned tasks (already have NewConstant start, no choice variable)
+      * Prevs whose `prev_start` is outside `[0, horizon - duration]` — likely a
+        REBASE error.  A high drop rate signals stale `t=0` from the Go side.
+      * Order-fallback matches — knitting freeze is strict-by-task_id only;
+        slicing renames are intentionally not stabilised here (would risk
+        pinning the WRONG task to a stale start).
+
+    Machine is NOT constrained — design D1: knitting machine stays free,
+    `apply_stability_hints_only` adds soft `AddHint(lit)` separately for warm-start.
+
+    Returns
+    -------
+    dict with:
+      keep_lits:        List[BoolVar]   (length N_eligible)
+      eligible_ids:     List[str]
+      n_prev_knitting:  int             (count of knitting prevs in hint)
+      n_dropped_oob:    int             (prev_start outside domain)
+      n_dropped_pinned: int             (skipped because is_pinned)
+      n_dropped_other:  int             (no exact match in task_vars)
+    """
+    result = {
+        "keep_lits": [],
+        "eligible_ids": [],
+        "n_prev_knitting": 0,
+        "n_dropped_oob": 0,
+        "n_dropped_pinned": 0,
+        "n_dropped_other": 0,
+    }
+    if not reschedule_hint:
+        return result
+
+    previous = reschedule_hint.get("previous_assignments") or []
+    if not previous:
+        return result
+
+    knitting_ids = {t["task_id"] for t in knitting_tasks
+                    if t.get("operation", "").lower() == "knitting"}
+    duration_by_id = {t["task_id"]: int(t.get("duration", 0)) for t in knitting_tasks}
+
+    knitting_prevs = [p for p in previous if p["task_id"] in knitting_ids]
+    result["n_prev_knitting"] = len(knitting_prevs)
+
+    for prev in knitting_prevs:
+        t_id = prev["task_id"]
+        tv = task_vars.get(t_id)
+        if tv is None:
+            result["n_dropped_other"] += 1
+            continue
+        if tv.get("is_pinned"):
+            result["n_dropped_pinned"] += 1
+            continue
+
+        prev_start = int(prev.get("start_time", -1))
+        dur = duration_by_id.get(t_id, 0)
+        if prev_start < 0 or prev_start + dur > horizon:
+            result["n_dropped_oob"] += 1
+            logger.warning(
+                f"⚠️ Knitting keep DROPPED (OOB): task={t_id} prev_start={prev_start} "
+                f"duration={dur} horizon={horizon} — possible stale rebase from Go."
+            )
+            continue
+
+        keep_lit = model.NewBoolVar(f"keep_{t_id}")
+        model.Add(tv["start"] == prev_start).OnlyEnforceIf(keep_lit)
+        result["keep_lits"].append(keep_lit)
+        result["eligible_ids"].append(t_id)
+
+    if result["n_prev_knitting"] > 0:
+        drop_pct = 100.0 * result["n_dropped_oob"] / result["n_prev_knitting"]
+        if drop_pct > 30.0:
+            logger.warning(
+                f"⚠️ Knitting keep: dropped {result['n_dropped_oob']}/{result['n_prev_knitting']} "
+                f"prev_start as OOB ({drop_pct:.0f}%).  Check Go-side rebase logic."
+            )
+
+    return result
 
 
 def _log_task_diagnostics(tasks: List[Dict[str, Any]], horizon: int) -> None:
@@ -104,6 +204,7 @@ def solve_knitting(
     config: Dict[str, Any],
     material_capacities: Optional[Dict[str, int]] = None,
     horizon: Optional[int] = None,
+    reschedule_hint: Optional[Dict[str, Any]] = None,
 ) -> Phase1Result:
     """
     Solve the knitting phase in isolation.
@@ -175,23 +276,107 @@ def solve_knitting(
     _apply_po_bounding_box(model, task_vars, knitting_tasks, resource_map, horizon)
 
     obj_terms += apply_soft_deadlines(model, task_vars, task_map, horizon)
-    obj_terms += apply_order_flow_objective(model, task_vars, knitting_tasks, horizon)
-    obj_terms += apply_slice_sync_objective(model, task_vars, knitting_tasks, horizon)
-    model.Minimize(sum(obj_terms) if obj_terms else 0)
+    # Re-schedule path: skip flow/sync objectives — they fight the reified-keep
+    # constraint by trying to re-optimise group_end/span on already-pinned tasks.
+    # Previous solve already optimised those.
+    if not reschedule_hint:
+        obj_terms += apply_order_flow_objective(model, task_vars, knitting_tasks, horizon)
+        obj_terms += apply_slice_sync_objective(model, task_vars, knitting_tasks, horizon)
+
+    # Reified-keep + hints-only on knitting.  apply_stability_objective is
+    # NOT called here (it would double-stabilize via soft time penalty +
+    # machine-swap penalty on the same start var).  Hints-only adds AddHint()
+    # for warm-start + machine AddHint(lit) without any objective contribution.
+    keep_info: Dict[str, Any] = {"keep_lits": []}
+    if reschedule_hint:
+        _, hint_stats = apply_stability_hints_only(
+            model, task_vars, knitting_tasks, reschedule_hint, horizon, start_lb=None,
+        )
+        keep_info = apply_knitting_keep_lex(
+            model, task_vars, knitting_tasks, reschedule_hint, horizon,
+        )
+        logger.info(
+            f"   🎯 Phase1 hints: total_previous={hint_stats.total_previous} "
+            f"matched_exact={hint_stats.matched_exact} matched_via_order={hint_stats.matched_via_order} "
+            f"n_hinted={hint_stats.n_hinted}"
+        )
+        logger.info(
+            f"   🔒 Phase1 keep: n_prev_knitting={keep_info['n_prev_knitting']} "
+            f"eligible={len(keep_info['eligible_ids'])} "
+            f"dropped_oob={keep_info['n_dropped_oob']} "
+            f"dropped_pinned={keep_info['n_dropped_pinned']} "
+            f"dropped_other={keep_info['n_dropped_other']}"
+        )
 
     validation = model.Validate()
     if validation:
         logger.error(f"❌ Phase 1 MODEL_INVALID: {validation}")
         return Phase1Result(status="model_invalid")
 
-    solver = make_solver(config)
-    status_code = solver.Solve(model)
+    keep_lits = keep_info["keep_lits"]
+    if keep_lits:
+        # Pass 1: maximise kept (= minimise n_broken).
+        n_broken = model.NewIntVar(0, len(keep_lits), "n_broken_keep")
+        model.Add(n_broken == len(keep_lits) - sum(keep_lits))
+        model.Minimize(n_broken)
 
-    logger.info(
-        f"⚙️ Phase 1 (Knitting): {len(task_vars)} task vars, "
-        f"status={solver.StatusName(status_code)}, "
-        f"time={solver.WallTime():.1f}s"
-    )
+        solver = make_solver(config, has_hint=True)
+        pass1_status = solver.Solve(model)
+        if pass1_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            logger.error(
+                f"❌ Phase 1 pass 1 (keep maximisation) failed: "
+                f"status={solver.StatusName(pass1_status)} — re-schedule cannot proceed."
+            )
+            status_str, assignments, overloads, start_times, end_times = extract_results(
+                solver, pass1_status, task_vars, knitting_tasks, config=config
+            )
+            return Phase1Result(
+                status=status_str, assignments=assignments, overloads=overloads,
+                start_times=start_times, end_times=end_times,
+                solve_time_seconds=solver.WallTime(),
+            )
+
+        d_star = int(solver.Value(n_broken))
+        logger.info(
+            f"   🔒 Phase1 pass 1: D*={d_star} broken / {len(keep_lits)} keep_lits "
+            f"(pass1 time={solver.WallTime():.1f}s, status={solver.StatusName(pass1_status)})"
+        )
+        if d_star > 0:
+            broken_ids = [
+                keep_info["eligible_ids"][i]
+                for i, kl in enumerate(keep_lits)
+                if solver.Value(kl) == 0
+            ]
+            logger.warning(
+                f"⚠️ Phase1 lex pass 2 will allow ≤{d_star} broken keep(s); "
+                f"sample broken ids: {broken_ids[:5]}"
+            )
+
+        # Lex constraint for pass 2.  Pass 2 may choose a DIFFERENT subset of
+        # `d_star` tasks to break (whichever minimises pass-2 obj), so we use
+        # an inequality not equality on n_broken.
+        model.Add(n_broken <= d_star)
+        model.ClearObjective()
+        model.Minimize(sum(obj_terms) if obj_terms else 0)
+
+        pass1_time = solver.WallTime()
+        solver = make_solver(config, has_hint=True)
+        status_code = solver.Solve(model)
+        logger.info(
+            f"⚙️ Phase 1 (Knitting) two-pass: {len(task_vars)} task vars, "
+            f"pass1={pass1_time:.1f}s pass2={solver.WallTime():.1f}s "
+            f"status={solver.StatusName(status_code)}"
+        )
+    else:
+        # Cold path or no eligible keeps — single-pass with normal objective.
+        model.Minimize(sum(obj_terms) if obj_terms else 0)
+        solver = make_solver(config, has_hint=bool(reschedule_hint))
+        status_code = solver.Solve(model)
+        logger.info(
+            f"⚙️ Phase 1 (Knitting): {len(task_vars)} task vars, "
+            f"status={solver.StatusName(status_code)}, "
+            f"time={solver.WallTime():.1f}s"
+        )
 
     status_str, assignments, overloads, start_times, end_times = extract_results(
         solver, status_code, task_vars, knitting_tasks, config=config

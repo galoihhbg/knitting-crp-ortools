@@ -18,7 +18,7 @@ Returns the same dict format as the legacy Engine.solve():
   {"status", "assignments", "overloads", "objective_value", "solve_time_seconds"}
 """
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .phases.phase1_knitting import PHASE1_OPS, Phase1Result, solve_knitting
 from .shared import compute_global_horizon, diagnose_infeasibility
@@ -38,12 +38,18 @@ class Pipeline:
         resources: List[Dict[str, Any]],
         tasks: List[Dict[str, Any]],
         material_capacities: Optional[Dict[str, int]] = None,
+        reschedule_hint: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.config = config
         self.resources = resources
         self.tasks = _sanitize_dummy_tasks(tasks)
         self.material_capacities = material_capacities or {}
         self.translation_map: Dict[str, str] = _build_translation_map(self.tasks)
+        self.reschedule_hint = reschedule_hint
+        self.partitioned_hint: Dict[str, Any] = (
+            partition_hint_for_pipeline(reschedule_hint, self.tasks)
+            if reschedule_hint else {}
+        )
 
     def run(self) -> Dict[str, Any]:
         if not self.tasks:
@@ -64,10 +70,12 @@ class Pipeline:
 
         # ── Phase 1: Knitting ─────────────────────────────────────────────
         p1_tasks = [t for t in self.tasks if t.get("operation", "").lower() in PHASE1_OPS]
+        p1_hint = _hint_for_phase(self.reschedule_hint, self.partitioned_hint.get("knitting"))
         p1: Phase1Result = solve_knitting(
             p1_tasks, all_resources, self.config,
             material_capacities=self.material_capacities,
             horizon=global_horizon,
+            reschedule_hint=p1_hint,
         )
         logger.info(f"✅ Phase 1 complete: {len(p1.assignments)} assignments, status={p1.status}")
 
@@ -76,12 +84,14 @@ class Pipeline:
 
         # ── Phase 2: Linking ──────────────────────────────────────────────
         p2_tasks = [t for t in self.tasks if t.get("operation", "").lower() in PHASE2_OPS]
+        p2_hint = _hint_for_phase(self.reschedule_hint, self.partitioned_hint.get("linking"))
         p2: Phase2Result = solve_linking(
             p2_tasks, all_resources, self.config,
             p1_start_times=p1.start_times,
             p1_end_times=p1.end_times,
             translation_map=self.translation_map,
             horizon=global_horizon,
+            reschedule_hint=p2_hint,
         )
         logger.info(f"✅ Phase 2 complete: {len(p2.assignments)} assignments, status={p2.status}")
 
@@ -94,11 +104,15 @@ class Pipeline:
 
         p3_tasks = [t for t in self.tasks if t.get("operation", "").lower() in PHASE3_OPS]
         shift_ends: List[int] = [int(s) for s in self.config.get("shift_ends_min", [])]
+        # Phase 3 is group-isolated; pass the full hint (with washing-group partition
+        # already computed) so each group filter its own previous_assignments.
+        p3_hint = _hint_for_phase_washing(self.reschedule_hint, self.partitioned_hint.get("washing"))
         p3: Phase3Result = solve_washing(
             p3_tasks, all_resources, self.config,
             p2_end_times=combined_end_times,
             shift_ends=shift_ends,
             horizon=global_horizon,
+            reschedule_hint=p3_hint,
         )
         logger.info(
             f"✅ Phase 3 complete: {len(p3.assignments)} assignments, "
@@ -116,10 +130,12 @@ class Pipeline:
             t for t in self.tasks
             if t.get("operation", "").lower() not in UPSTREAM_OPS
         ]
+        p4_hint = _hint_for_phase(self.reschedule_hint, self.partitioned_hint.get("downstream"))
         p4: Phase4Result = solve_downstream(
             p4_tasks, all_resources, self.config,
             p3_end_times=all_end_times,
             horizon=global_horizon,
+            reschedule_hint=p4_hint,
         )
         logger.info(f"✅ Phase 4 complete: {len(p4.assignments)} assignments, status={p4.status}")
 
@@ -145,6 +161,141 @@ class Pipeline:
             "objective_value": combined_obj,
             "solve_time_seconds": total_time,
         }
+
+
+# ---------------------------------------------------------------------------
+# Reschedule-hint partitioning (B.3)
+# ---------------------------------------------------------------------------
+
+_PHASE1_OP_SET = {"knitting", "capacity_block"}
+_PHASE2_OP_SET = {"linking"}
+_PHASE3_OP_SET = {"washing"}
+
+
+def partition_hint_for_pipeline(
+    reschedule_hint: Optional[Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Split a global reschedule_hint into per-phase / per-group sub-hints.
+
+    Output shape:
+        {
+          "knitting":   [PreviousAssignment dicts],
+          "linking":    [...],
+          "washing":    { (color, substance): [...], ... },
+          "downstream": [...],
+        }
+
+    The previous_assignments are matched to the current task list by task_id.
+    Tasks whose task_id is unknown go to whichever bucket their original_order_id
+    maps to via existing tasks (best-effort); otherwise they are dropped so a
+    later fallback in apply_stability_objective can still match them by order.
+
+    Always returns the full 4-key skeleton so callers can `.get()` safely.
+    """
+    result: Dict[str, Any] = {
+        "knitting": [],
+        "linking": [],
+        "washing": {},
+        "downstream": [],
+    }
+    if not reschedule_hint:
+        return result
+
+    previous = reschedule_hint.get("previous_assignments") or []
+    if not previous:
+        return result
+
+    task_op: Dict[str, str] = {
+        t["task_id"]: t.get("operation", "").lower() for t in tasks
+    }
+    task_wash_key: Dict[str, Tuple[str, str]] = {
+        t["task_id"]: (t.get("color", ""), t.get("substance", ""))
+        for t in tasks
+        if t.get("operation", "").lower() == "washing"
+    }
+    # Order-keyed fallback for rename cases (slicing changed → task_id no longer
+    # matches but original_order_id still does).  Map order → set of ops it
+    # touches, plus per-op washing keys, so a renamed prev can still land in
+    # the right partition bucket.
+    order_ops: Dict[str, Set[str]] = {}
+    order_wash_keys: Dict[str, Set[Tuple[str, str]]] = {}
+    for t in tasks:
+        oid = t.get("original_order_id", "")
+        if not oid:
+            continue
+        op = t.get("operation", "").lower()
+        order_ops.setdefault(oid, set()).add(op)
+        if op == "washing":
+            order_wash_keys.setdefault(oid, set()).add(
+                (t.get("color", ""), t.get("substance", ""))
+            )
+
+    def _route(op: str, prev: Dict[str, Any], wash_key: Tuple[str, str]) -> None:
+        if op in _PHASE1_OP_SET:
+            result["knitting"].append(prev)
+        elif op in _PHASE2_OP_SET:
+            result["linking"].append(prev)
+        elif op in _PHASE3_OP_SET:
+            result["washing"].setdefault(wash_key, []).append(prev)
+        elif op:
+            result["downstream"].append(prev)
+
+    for prev in previous:
+        op = task_op.get(prev["task_id"], "").lower()
+        if op:
+            wash_key = task_wash_key.get(prev["task_id"], ("", ""))
+            _route(op, prev, wash_key)
+            continue
+
+        # Rename / slicing case — task_id unknown.  Fan out by order's ops so
+        # apply_stability_objective's machine-compatibility fallback can pick
+        # a sensible match within each phase.
+        oid = prev.get("original_order_id", "")
+        if not oid or oid not in order_ops:
+            continue
+        for cand_op in order_ops[oid]:
+            if cand_op == "washing":
+                for wk in order_wash_keys.get(oid, {("", "")}):
+                    _route(cand_op, prev, wk)
+            else:
+                _route(cand_op, prev, ("", ""))
+
+    return result
+
+
+def _hint_for_phase(
+    base_hint: Optional[Dict[str, Any]],
+    subset_previous: Optional[List[Dict[str, Any]]],
+) -> Optional[Dict[str, Any]]:
+    """Build a per-phase hint dict carrying the same weights as the global one."""
+    if not base_hint or not subset_previous:
+        return None
+    return {
+        "previous_assignments": list(subset_previous),
+        "stability_weight_time_per_min": base_hint.get("stability_weight_time_per_min", 500),
+        "stability_weight_machine_swap": base_hint.get("stability_weight_machine_swap", 5000),
+        "match_by_order_fallback": base_hint.get("match_by_order_fallback", True),
+    }
+
+
+def _hint_for_phase_washing(
+    base_hint: Optional[Dict[str, Any]],
+    washing_groups: Optional[Dict[Tuple[str, str], List[Dict[str, Any]]]],
+) -> Optional[Dict[str, Any]]:
+    """Phase 3 hint: keep the per-group breakdown so _solve_group can filter."""
+    if not base_hint or not washing_groups:
+        return None
+    # Flatten across groups; solve_washing will filter per (color, substance)
+    flat = [p for prevs in washing_groups.values() for p in prevs]
+    if not flat:
+        return None
+    h = _hint_for_phase(base_hint, flat)
+    if h is None:
+        return None
+    # Carry the per-group partition for the per-group solver.
+    h["_washing_groups"] = {k: list(v) for k, v in washing_groups.items()}
+    return h
 
 
 # ---------------------------------------------------------------------------

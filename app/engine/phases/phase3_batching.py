@@ -28,6 +28,7 @@ from ortools.sat.python import cp_model
 
 from app.engine.shared import (
     apply_soft_deadlines,
+    apply_stability_objective,
     build_resource_model,
     compute_horizon,
     extract_results,
@@ -68,6 +69,7 @@ def solve_washing(
     p2_end_times: Dict[str, int],
     shift_ends: List[int],
     horizon: Optional[int] = None,
+    reschedule_hint: Optional[Dict[str, Any]] = None,
 ) -> Phase3Result:
     """
     Solve the washing phase using per-group model isolation.
@@ -105,7 +107,22 @@ def solve_washing(
     all_end_times: Dict[str, int] = {}
     total_solve_time = 0.0
 
+    # Per-group hint subset (Phase 3 is group-isolated by color+substance).
+    washing_groups_hint = (
+        reschedule_hint.get("_washing_groups") if reschedule_hint else None
+    )
+
     for group_key, group_tasks in sorted(groups.items()):
+        group_hint = None
+        if reschedule_hint and washing_groups_hint:
+            group_prev = washing_groups_hint.get(group_key, [])
+            if group_prev:
+                group_hint = {
+                    "previous_assignments": group_prev,
+                    "stability_weight_time_per_min": reschedule_hint.get("stability_weight_time_per_min", 500),
+                    "stability_weight_machine_swap": reschedule_hint.get("stability_weight_machine_swap", 5000),
+                    "match_by_order_fallback": reschedule_hint.get("match_by_order_fallback", True),
+                }
         result = _solve_group(
             group_key=group_key,
             group_tasks=group_tasks,
@@ -115,6 +132,7 @@ def solve_washing(
             capacity=capacity,
             start_lb=start_lb,
             shift_ends=shift_ends,
+            reschedule_hint=group_hint,
         )
         all_assignments.extend(result["assignments"])
         all_overloads.extend(result["overloads"])
@@ -146,6 +164,7 @@ def _solve_group(
     start_lb: Dict[str, int],
     shift_ends: List[int],
     _chunked: bool = False,
+    reschedule_hint: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     # Split pinned vs free tasks.
     # Pinned tasks have fixed start/end and must NOT consume batch slots or
@@ -465,6 +484,19 @@ def _solve_group(
     task_map = {t["task_id"]: t for t in group_tasks}
     obj_terms += apply_soft_deadlines(model, task_vars, task_map, horizon)
 
+    stab_terms, stab_stats = apply_stability_objective(
+        model, task_vars, group_tasks, reschedule_hint, horizon,
+        start_lb=group_start_lb,
+    )
+    obj_terms += stab_terms
+    if reschedule_hint:
+        logger.info(
+            f"   🎯 Phase3 group={group_key} stability_stats: "
+            f"total_previous={stab_stats.total_previous} matched_exact={stab_stats.matched_exact} "
+            f"matched_via_order={stab_stats.matched_via_order} n_hinted={stab_stats.n_hinted} "
+            f"time_terms={stab_stats.time_terms_added} machine_terms={stab_stats.machine_terms_added}"
+        )
+
     # Pairwise co-location incentive: khi total qty > capacity (không gộp được hết),
     # vẫn cần ép các cặp vừa vặn vào chung 1 slot thay vì để solver tự quyết.
     # pair_w = 2 * batch_w → mỗi cặp bị tách tốn gấp đôi chi phí 1 slot active.
@@ -493,7 +525,7 @@ def _solve_group(
 
     model.Minimize(sum(obj_terms) if obj_terms else 0)
 
-    solver = make_solver(config)
+    solver = make_solver(config, has_hint=bool(reschedule_hint))
     per_group_time = max(5, int(config.get("max_search_time", 60)) // max(1, 4))
     solver.parameters.max_time_in_seconds = per_group_time
 

@@ -67,6 +67,11 @@ class SolverConfig(BaseModel):
     max_factory_machines: int = 40
     random_seed: int = 42       # Fixed seed for deterministic output across runs
     num_search_workers: int = 8  # Set to 1 for byte-identical replay; 8 for production speed
+    # Primary stop criterion: deterministic units (≈ single-core seconds).
+    # None → auto-derive as max_search_time × num_search_workers (sum-across-workers
+    # heuristic).  Set explicit value to tune for unusual payload sizes / hardware.
+    # See make_solver() for full semantics.
+    max_deterministic_time: Optional[float] = None
     washing_batch_capacity: int = 10
     max_washing_batches: Optional[int] = None
     # Số slot (K) tối đa cho washing batching.
@@ -79,6 +84,39 @@ class SolverConfig(BaseModel):
     shift_ends_min: List[int] = Field(default_factory=list)
 
 
+class PreviousAssignment(BaseModel):
+    """One task↔machine assignment from a prior solve, used to seed re-schedule hints."""
+    task_id: str
+    machine_id: str
+    start_time: int
+    end_time: int
+    original_order_id: str = ""
+
+
+class RescheduleHint(BaseModel):
+    """Optional hint payload that drives the re-schedule stability mechanism.
+
+    Calibration (B.4 — measured on the symmetric fixture):
+      * start tie-breaker (per task per start-minute) = max(1, 10**(6-priority)//100).
+        With priority=3 (default) → 10.  Uniform priority=1 → 1000.
+      * lateness coeff (per task per minute late)     = 10**(6-priority)*100.
+        With priority=3 (default) → 100_000.
+
+    Calibration window required: start_coeff  «  w_time  «  lateness_coeff.
+      → w_time = 500 (50× the typical start tie-breaker, 200× below lateness).
+      → w_machine = 50_000 (100× w_time, ≈ 5_000 start-minutes worth — set
+        empirically after observing production payload (732 tasks, 110 machines,
+        60s search) where w_machine=20_000 left keep_rate at 86%.  Combined
+        with solver `repair_hint=True` in make_solver, this raises keep_rate
+        toward the ≥95% target.  Still < lateness coeff (100_000) so no
+        accidental "ổn định thay vì kịp deadline" tradeoff.
+    """
+    previous_assignments: List[PreviousAssignment] = Field(default_factory=list)
+    stability_weight_time_per_min: int = 500
+    stability_weight_machine_swap: int = 50_000
+    match_by_order_fallback: bool = True
+
+
 class SolverPayload(BaseModel):
     job_id: str
     config: SolverConfig
@@ -89,3 +127,4 @@ class SolverPayload(BaseModel):
         default_factory=dict,
         description="Per-material creel capacity: material_code → total available rolls/slots",
     )
+    reschedule_hint: Optional[RescheduleHint] = None
