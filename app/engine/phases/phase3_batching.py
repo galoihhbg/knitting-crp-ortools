@@ -526,8 +526,16 @@ def _solve_group(
     model.Minimize(sum(obj_terms) if obj_terms else 0)
 
     solver = make_solver(config, has_hint=bool(reschedule_hint))
-    per_group_time = max(5, int(config.get("max_search_time", 60)) // max(1, 4))
-    solver.parameters.max_time_in_seconds = per_group_time
+    # Fix B: per-group DETERMINISTIC budget.  Washing groups are isolated models,
+    # so each group is capped at ≈ 1/4 of the global deterministic budget make_solver
+    # set, to keep the phase tractable when there are many groups.  Inheriting
+    # make_solver's value (rather than recomputing from config) keeps the per-group
+    # budget consistent with the 1-effective-worker determinism contract.  No
+    # wall-clock cap is set (make_solver leaves it +inf) — a wall-clock stop would
+    # be non-deterministic.
+    solver.parameters.max_deterministic_time = max(
+        5.0, solver.parameters.max_deterministic_time / 4.0
+    )
 
     status_code = solver.Solve(model)
     logger.info(

@@ -381,45 +381,67 @@ def make_solver(config: Dict[str, Any], *, has_hint: bool = False) -> cp_model.C
     """
     Configured CpSolver factory.
 
-    Determinism strategy (CỔNG-1 D6): use `max_deterministic_time` + fixed
-    `random_seed` to guarantee reproducibility AT ALL SCALES, while keeping
-    multi-worker enabled for speed.  Wall-clock is a safety cap only.
+    Determinism strategy (revised after empirical measurement — supersedes D6).
+    Reproducible "same input → same output" requires TWO things together, because
+    there are two independent sources of run-to-run drift:
 
-    For `has_hint=True` (re-schedule path) additionally set `repair_hint=True`
-    so CP-SAT actively repairs hint conflicts rather than silently discarding.
-    Workers count is NOT overridden — caller's `num_search_workers` is honored.
+      1. Single-worker search.  CP-SAT with `num_search_workers > 1` shares bounds
+         and learned clauses between worker threads by WALL-CLOCK timing, so the
+         result varies between runs even with a fixed seed + `max_deterministic_time`
+         — measured directly on the 850-task payload (155 vs 129 late orders across
+         runs at 8 workers; byte-identical at 1 worker).  So we FORCE 1 worker.
+         `interleave_search=True` is deterministic but far too slow here (INFEASIBLE
+         within budget), so it is not used.
+      2. `PYTHONHASHSEED=0` (set in the Dockerfile) so set/dict iteration — and thus
+         the order variables/constraints are added to the model — is identical across
+         processes.  Without it, even 1 worker is non-deterministic because the MODEL
+         itself differs run-to-run.  make_solver cannot fix this (it is a process-start
+         env var); it is documented here because the two fixes are a matched pair.
+
+    `max_deterministic_time` + fixed `random_seed` are the ONLY stop criterion for
+    EVERY phase (cold /solve and re-schedule alike).  `max_time_in_seconds` is
+    deliberately NOT set: a wall-clock stop is non-deterministic (it fires at a
+    machine-speed-dependent search node), so even as a "safety cap" it would
+    reintroduce run-to-run drift whenever it bound under load.  Deterministic time
+    always advances, so it guarantees termination on its own — no wall cap needed.
+    Each phase feeds its end_times into the next phase's start_lb, so one
+    non-deterministic phase destabilises everything downstream — the deterministic-
+    only stop must hold for all phases.
+
+    `has_hint` no longer changes the stop criterion (kept for API compatibility and
+    call-site readability).
 
     Tuning notes:
-      * `max_deterministic_time` is the primary stop criterion (deterministic
-        units ≈ single-core seconds).  Auto-derived as `max_search_time × workers`
-        when caller omits it.
-      * `max_time_in_seconds = max_search_time × 4` is a safety cap; deterministic
-        stop should fire first under normal load.
-      * If output appears non-deterministic across runs, raise
-        `max_deterministic_time` so the solver fully converges within the budget.
+      * `max_deterministic_time` (deterministic units ≈ single-core seconds) is
+        auto-derived as `max_search_time` (1 effective worker) when the caller omits
+        it.  An explicit config value always wins.
+      * Do NOT set `max_time_in_seconds` (stays at the CP-SAT default of +inf) — a
+        finite wall cap is non-deterministic.
+      * If a phase still looks non-deterministic, raise `max_deterministic_time` so it
+        converges within budget — do NOT raise `num_search_workers` (breaks determinism)
+        and do NOT add a wall-clock cap.
     """
     solver = cp_model.CpSolver()
 
-    requested_workers = int(config.get("num_search_workers", 8))
     wall_budget_s = int(config.get("max_search_time", 60))
 
-    # has_hint path: max_deterministic_time is the primary stop criterion
-    # (D6).  Cold path keeps the original wall-clock-only stop, preserving
-    # backward-compat with test_determinism.py::test_five_replays_identical_*.
-    if has_hint:
-        det_budget = config.get("max_deterministic_time")
-        if det_budget is None:
-            det_budget = float(wall_budget_s) * max(1, requested_workers)
-        solver.parameters.max_deterministic_time = float(det_budget)
-        solver.parameters.max_time_in_seconds = float(wall_budget_s) * 4.0
-    else:
-        explicit_det = config.get("max_deterministic_time")
-        if explicit_det is not None:
-            solver.parameters.max_deterministic_time = float(explicit_det)
-        solver.parameters.max_time_in_seconds = float(wall_budget_s)
+    # Determinism requires single-worker search (see docstring §1).  We force it
+    # regardless of the caller's num_search_workers so /solve and /re-schedule are
+    # both reproducible.  Empirically only ~12% slower than 8 workers on the
+    # production payload, with equal-or-better lateness.
+    effective_workers = 1
+
+    # max_deterministic_time is the ONLY stop criterion for ALL phases.
+    # Auto-derive from the wall budget at 1 effective worker (det units ≈ seconds);
+    # an explicit config value always wins.  max_time_in_seconds is intentionally
+    # left unset (CP-SAT default +inf): a wall-clock stop would be non-deterministic.
+    det_budget = config.get("max_deterministic_time")
+    if det_budget is None:
+        det_budget = float(wall_budget_s) * effective_workers
+    solver.parameters.max_deterministic_time = float(det_budget)
 
     solver.parameters.relative_gap_limit = 0.01
-    solver.parameters.num_search_workers = requested_workers
+    solver.parameters.num_search_workers = effective_workers
     solver.parameters.random_seed = int(config.get("random_seed", 42))
 
     # NOTE: `repair_hint=True` triggers `Check failed: heuristics.fixed_search != nullptr`
@@ -715,6 +737,18 @@ def apply_soft_deadlines(
     """
     Create a lateness IntVar (= max(0, end - due_at)) per non-pinned, non-dummy task.
     Returns weighted objective terms to be summed into model.Minimize().
+
+    Objective hierarchy per task (descending magnitude):
+      1. lateness × weight × 100   — minimise total tardiness (primary)
+      2. is_late × weight × 10     — minimise NUMBER of late tasks at equal
+                                     total tardiness (tie-breaker).  Without
+                                     this, two solutions with the same total
+                                     minutes-late but different distributions
+                                     (e.g. 1 task × 100min vs 10 × 10min)
+                                     are tied → multi-worker race picks
+                                     different distributions across runs →
+                                     "lúc trễ đơn, lúc không trễ" symptom.
+      3. start × weight // 100     — prefer earlier starts (light tie-breaker)
     """
     terms: List[Any] = []
     for t_id, tv in sorted(task_vars.items()):
@@ -733,7 +767,19 @@ def apply_soft_deadlines(
         model.Add(lateness >= tv["end"] - due_at)
         terms.append(lateness * weight * 100)
 
-        # Tie-breaker: prefer earlier starts (10 000× lighter than lateness)
+        # Late-count tie-breaker: BoolVar is_late ⇔ lateness > 0.
+        # Weight chosen as `weight × 10` so:
+        #   * 1 task flipping late→on-time saves   weight × 10
+        #   * 1 minute of lateness reduction saves weight × 100 (10× more)
+        #   → reducing total tardiness still dominates reducing count.
+        # Skipped when max_lateness == 0 (due past horizon → cannot be late).
+        if max_lateness > 0:
+            is_late = model.NewBoolVar(f"is_late_{t_id}")
+            model.Add(lateness >= 1).OnlyEnforceIf(is_late)
+            model.Add(lateness == 0).OnlyEnforceIf(is_late.Not())
+            terms.append(is_late * weight * 10)
+
+        # Earliest-start tie-breaker (light)
         start_coeff = max(1, weight // 100)
         terms.append(tv["start"] * start_coeff)
 

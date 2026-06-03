@@ -76,6 +76,7 @@ class Pipeline:
             material_capacities=self.material_capacities,
             horizon=global_horizon,
             reschedule_hint=p1_hint,
+            all_pipeline_tasks=self.tasks,
         )
         logger.info(f"✅ Phase 1 complete: {len(p1.assignments)} assignments, status={p1.status}")
 

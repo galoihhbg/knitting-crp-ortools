@@ -32,12 +32,64 @@ logger = logging.getLogger(__name__)
 PHASE1_OPS = frozenset({"knitting", "capacity_block"})
 
 
+def _compute_downstream_chain_min(
+    all_tasks: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    """For every task, compute the minimum number of minutes required from
+    that task's END to the end of the longest dependent chain.
+
+    A dependent of t is any task d with `t ∈ d.final_depends_on` or
+    `t ∈ d.WaitOffsets.keys()`.  The contribution of d to t's chain is:
+
+        offset_from_t_to_d  +  d.duration  +  chain_min(d)
+
+    where offset is `d.WaitOffsets[t]` if present, else 0 (synchronous dep).
+
+    Used to drop reified-keep on a knitting task whose `prev_start` would
+    cascade past horizon, e.g. prev_end ≤ horizon but
+    prev_end + chain > horizon → linking/washing/downstream INFEASIBLE.
+    """
+    task_by_id: Dict[str, Dict[str, Any]] = {t["task_id"]: t for t in all_tasks}
+    dependents: Dict[str, List[tuple]] = {}  # t_id → [(d_id, offset)]
+    for d in all_tasks:
+        d_id = d["task_id"]
+        wait = d.get("WaitOffsets") or {}
+        deps_from_final = d.get("final_depends_on") or []
+        # Union of both reference sets
+        all_deps = set(deps_from_final) | set(wait.keys())
+        for dep_id in all_deps:
+            offset = int(wait.get(dep_id, 0))
+            dependents.setdefault(dep_id, []).append((d_id, offset))
+
+    cache: Dict[str, int] = {}
+
+    def chain(t_id: str) -> int:
+        if t_id in cache:
+            return cache[t_id]
+        best = 0
+        for d_id, offset in dependents.get(t_id, []):
+            d = task_by_id.get(d_id)
+            if d is None:
+                continue
+            d_dur = max(0, int(d.get("duration", 0)))
+            cand = offset + d_dur + chain(d_id)
+            if cand > best:
+                best = cand
+        cache[t_id] = best
+        return best
+
+    for t in all_tasks:
+        chain(t["task_id"])
+    return cache
+
+
 def apply_knitting_keep_lex(
     model: Any,
     task_vars: Dict[str, Dict[str, Any]],
     knitting_tasks: List[Dict[str, Any]],
     reschedule_hint: Optional[Dict[str, Any]],
     horizon: int,
+    downstream_chain_min: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """Reified-keep on knitting start times.
 
@@ -79,6 +131,7 @@ def apply_knitting_keep_lex(
         "n_dropped_oob": 0,
         "n_dropped_pinned": 0,
         "n_dropped_other": 0,
+        "n_dropped_downstream_overflow": 0,
     }
     if not reschedule_hint:
         return result
@@ -90,6 +143,7 @@ def apply_knitting_keep_lex(
     knitting_ids = {t["task_id"] for t in knitting_tasks
                     if t.get("operation", "").lower() == "knitting"}
     duration_by_id = {t["task_id"]: int(t.get("duration", 0)) for t in knitting_tasks}
+    downstream_chain_min = downstream_chain_min or {}
 
     knitting_prevs = [p for p in previous if p["task_id"] in knitting_ids]
     result["n_prev_knitting"] = len(knitting_prevs)
@@ -111,6 +165,19 @@ def apply_knitting_keep_lex(
             logger.warning(
                 f"⚠️ Knitting keep DROPPED (OOB): task={t_id} prev_start={prev_start} "
                 f"duration={dur} horizon={horizon} — possible stale rebase from Go."
+            )
+            continue
+
+        # Downstream-chain feasibility check: if prev_end + downstream_chain > horizon,
+        # honoring this keep would force a linking/washing/downstream task past horizon.
+        # Drop the keep here so this knitting can move earlier and unblock the cascade.
+        chain = int(downstream_chain_min.get(t_id, 0))
+        if chain > 0 and prev_start + dur + chain > horizon:
+            result["n_dropped_downstream_overflow"] += 1
+            logger.warning(
+                f"⚠️ Knitting keep DROPPED (downstream-overflow): task={t_id} "
+                f"prev_start={prev_start} duration={dur} chain={chain} horizon={horizon} "
+                f"(prev_end + chain = {prev_start + dur + chain} > horizon)"
             )
             continue
 
@@ -205,6 +272,7 @@ def solve_knitting(
     material_capacities: Optional[Dict[str, int]] = None,
     horizon: Optional[int] = None,
     reschedule_hint: Optional[Dict[str, Any]] = None,
+    all_pipeline_tasks: Optional[List[Dict[str, Any]]] = None,
 ) -> Phase1Result:
     """
     Solve the knitting phase in isolation.
@@ -234,6 +302,39 @@ def solve_knitting(
     task_vars, affinity_terms, no_resource_tasks = build_resource_model(
         model, knitting_tasks, resource_map, horizon, use_affinity=True
     )
+
+    # Pipeline-wide downstream chain — used both to upper-bound knitting end
+    # (so NEW tasks must finish early enough for downstream to fit) and to
+    # decide which prev keeps to drop (those whose prev_end + chain overflows).
+    downstream_chain: Dict[str, int] = (
+        _compute_downstream_chain_min(all_pipeline_tasks)
+        if all_pipeline_tasks else {}
+    )
+
+    # Hard upper bound: end[t] ≤ horizon − chain[t].  Forces NEW knitting to
+    # be scheduled early enough that the entire downstream pipeline fits.
+    # For PREV knitting kept at prev_start that violates this bound, pass 1
+    # will minimise broken keeps and drop the offending ones.
+    n_bounded = 0
+    for t_id, tv in task_vars.items():
+        if tv.get("is_pinned"):
+            continue
+        chain = int(downstream_chain.get(t_id, 0))
+        if chain > 0:
+            ub = horizon - chain
+            if ub >= 0:
+                model.Add(tv["end"] <= ub)
+                n_bounded += 1
+            else:
+                logger.error(
+                    f"❌ Phase 1: task {t_id} has downstream chain {chain} > horizon {horizon}; "
+                    f"pipeline geometrically infeasible regardless of keep."
+                )
+    if n_bounded and reschedule_hint:
+        logger.info(
+            f"   ⛓  Phase1 downstream chain bound: {n_bounded} tasks constrained to "
+            f"end ≤ horizon − chain"
+        )
 
     # Any real (non-dummy) task that has no compatible machine → infeasible
     real_no_res = [
@@ -292,8 +393,10 @@ def solve_knitting(
         _, hint_stats = apply_stability_hints_only(
             model, task_vars, knitting_tasks, reschedule_hint, horizon, start_lb=None,
         )
+        # Reuse the downstream chain computed above for the upper-bound check.
         keep_info = apply_knitting_keep_lex(
             model, task_vars, knitting_tasks, reschedule_hint, horizon,
+            downstream_chain_min=downstream_chain,
         )
         logger.info(
             f"   🎯 Phase1 hints: total_previous={hint_stats.total_previous} "
@@ -304,6 +407,7 @@ def solve_knitting(
             f"   🔒 Phase1 keep: n_prev_knitting={keep_info['n_prev_knitting']} "
             f"eligible={len(keep_info['eligible_ids'])} "
             f"dropped_oob={keep_info['n_dropped_oob']} "
+            f"dropped_downstream={keep_info.get('n_dropped_downstream_overflow', 0)} "
             f"dropped_pinned={keep_info['n_dropped_pinned']} "
             f"dropped_other={keep_info['n_dropped_other']}"
         )
