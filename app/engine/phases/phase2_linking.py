@@ -50,6 +50,7 @@ def solve_linking(
     translation_map: Dict[str, str],
     horizon: Optional[int] = None,
     reschedule_hint: Optional[Dict[str, Any]] = None,
+    workload_shrank: bool = False,
 ) -> Phase2Result:
     """
     Solve the linking phase.
@@ -101,12 +102,15 @@ def solve_linking(
     task_map = {t["task_id"]: t for t in linking_tasks}
     obj_terms = apply_soft_deadlines(model, task_vars, task_map, horizon)
     # Re-schedule: skip flow/sync (they outweigh stability pin) — see phase1.
-    if not reschedule_hint:
+    # EXCEPTION — workload shrank: re-enable so survivors re-pack (no gaps); the
+    # soft anchor is one-sided (late_only) this run so it won't fight compaction.
+    if not reschedule_hint or workload_shrank:
         obj_terms += apply_order_flow_objective(model, task_vars, linking_tasks, horizon)
         obj_terms += apply_slice_sync_objective(model, task_vars, linking_tasks, horizon)
 
     stab_terms, stab_stats = apply_stability_objective(
         model, task_vars, linking_tasks, reschedule_hint, horizon, start_lb=start_lb,
+        time_penalty="late_only" if workload_shrank else "abs",
     )
     obj_terms += stab_terms
     if reschedule_hint:

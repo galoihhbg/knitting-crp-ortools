@@ -45,6 +45,7 @@ def apply_stability_objective(
     reschedule_hint: Optional[Dict[str, Any]],
     horizon: int,
     start_lb: Optional[Dict[str, int]] = None,
+    time_penalty: str = "abs",
 ) -> Tuple[List[Any], StabilityStats]:
     """
     Add warm-start hints + minimum-perturbation penalty terms to the model.
@@ -134,7 +135,13 @@ def apply_stability_objective(
         prev_start = int(prev.get("start_time", 0))
         lo = max(0, int(start_lb.get(t_id, 0)))
         prev_start_clipped = max(lo, min(horizon, prev_start))
-        model.AddHint(tv["start"], prev_start_clipped)
+        # On a workload shrink (late_only) warm-start at the EARLIEST feasible
+        # time so the solver is nudged to compact instead of re-discovering the
+        # old (now gapped) layout — important for large groups that stop at
+        # FEASIBLE before they would otherwise improve past the stale hint.
+        model.AddHint(
+            tv["start"], lo if time_penalty == "late_only" else prev_start_clipped
+        )
 
         # Machine hints + machine-swap penalty terms
         prev_machine = prev.get("machine_id", "")
@@ -153,10 +160,22 @@ def apply_stability_objective(
         # Fallback-match (slicing rename, qty change) hints machine but skips
         # the time term to avoid pulling N renamed slices toward a single
         # prev_start (would conflict with no-overlap, see FIX-3 in C5 revised).
-        if match_kind == "exact" and w_time > 0:
-            dev = model.NewIntVar(0, horizon, f"sdev_{t_id}")
-            model.AddAbsEquality(dev, tv["start"] - prev_start_clipped)
-            terms.append(dev * w_time)
+        #
+        # time_penalty mode:
+        #   "abs"       — phạt |start - prev| đối xứng (mặc định, giữ ổn định 2 chiều).
+        #   "late_only" — CHỈ phạt khi dời MUỘN hơn: max(0, start - prev).  Cho phép
+        #                 dồn SỚM miễn phí.  Dùng khi workload co lại (bớt đơn) để
+        #                 các task còn lại nén về đầu thay vì đóng băng → hở gap.
+        #   "off"       — bỏ hẳn time term.
+        if match_kind == "exact" and w_time > 0 and time_penalty != "off":
+            if time_penalty == "late_only":
+                late = model.NewIntVar(0, horizon, f"slate_{t_id}")
+                model.AddMaxEquality(late, [tv["start"] - prev_start_clipped, 0])
+                terms.append(late * w_time)
+            else:
+                dev = model.NewIntVar(0, horizon, f"sdev_{t_id}")
+                model.AddAbsEquality(dev, tv["start"] - prev_start_clipped)
+                terms.append(dev * w_time)
             stats.time_terms_added += 1
 
     return terms, stats
@@ -169,6 +188,7 @@ def apply_stability_hints_only(
     reschedule_hint: Optional[Dict[str, Any]],
     horizon: int,
     start_lb: Optional[Dict[str, int]] = None,
+    prefer_earliest: bool = False,
 ) -> Tuple[List[Any], StabilityStats]:
     """Hints-ONLY variant of apply_stability_objective for the knitting phase.
 
@@ -235,7 +255,9 @@ def apply_stability_hints_only(
         prev_start = int(prev.get("start_time", 0))
         lo = max(0, int(start_lb.get(t_id, 0)))
         prev_start_clipped = max(lo, min(horizon, prev_start))
-        model.AddHint(tv["start"], prev_start_clipped)
+        # prefer_earliest (workload shrank) → warm-start at earliest feasible so
+        # knitting re-packs forward instead of re-anchoring to the stale start.
+        model.AddHint(tv["start"], lo if prefer_earliest else prev_start_clipped)
 
         prev_machine = prev.get("machine_id", "")
         literals = tv.get("literals", []) or []

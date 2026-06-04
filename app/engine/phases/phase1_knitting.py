@@ -273,6 +273,7 @@ def solve_knitting(
     horizon: Optional[int] = None,
     reschedule_hint: Optional[Dict[str, Any]] = None,
     all_pipeline_tasks: Optional[List[Dict[str, Any]]] = None,
+    workload_shrank: bool = False,
 ) -> Phase1Result:
     """
     Solve the knitting phase in isolation.
@@ -380,7 +381,10 @@ def solve_knitting(
     # Re-schedule path: skip flow/sync objectives — they fight the reified-keep
     # constraint by trying to re-optimise group_end/span on already-pinned tasks.
     # Previous solve already optimised those.
-    if not reschedule_hint:
+    # EXCEPTION — workload shrank (orders removed): there is no reified-keep this
+    # run (released below), so re-enable flow/sync to re-pack the survivors and
+    # avoid the gaps left by the removed orders.
+    if not reschedule_hint or workload_shrank:
         obj_terms += apply_order_flow_objective(model, task_vars, knitting_tasks, horizon)
         obj_terms += apply_slice_sync_objective(model, task_vars, knitting_tasks, horizon)
 
@@ -390,27 +394,37 @@ def solve_knitting(
     # for warm-start + machine AddHint(lit) without any objective contribution.
     keep_info: Dict[str, Any] = {"keep_lits": []}
     if reschedule_hint:
+        # Machine + start warm-start hints always apply (cheap, no objective).
+        # On a shrink, prefer_earliest nudges the warm-start to the earliest
+        # feasible time so knitting re-packs forward instead of re-anchoring.
         _, hint_stats = apply_stability_hints_only(
             model, task_vars, knitting_tasks, reschedule_hint, horizon, start_lb=None,
-        )
-        # Reuse the downstream chain computed above for the upper-bound check.
-        keep_info = apply_knitting_keep_lex(
-            model, task_vars, knitting_tasks, reschedule_hint, horizon,
-            downstream_chain_min=downstream_chain,
+            prefer_earliest=workload_shrank,
         )
         logger.info(
             f"   🎯 Phase1 hints: total_previous={hint_stats.total_previous} "
             f"matched_exact={hint_stats.matched_exact} matched_via_order={hint_stats.matched_via_order} "
             f"n_hinted={hint_stats.n_hinted}"
         )
-        logger.info(
-            f"   🔒 Phase1 keep: n_prev_knitting={keep_info['n_prev_knitting']} "
-            f"eligible={len(keep_info['eligible_ids'])} "
-            f"dropped_oob={keep_info['n_dropped_oob']} "
-            f"dropped_downstream={keep_info.get('n_dropped_downstream_overflow', 0)} "
-            f"dropped_pinned={keep_info['n_dropped_pinned']} "
-            f"dropped_other={keep_info['n_dropped_other']}"
-        )
+        if workload_shrank:
+            # Orders were removed → DON'T hard-pin survivors at their old starts
+            # (that is exactly what leaves gaps).  Release the keep; flow/sync +
+            # earliest warm-start re-pack the surviving knitting tasks.
+            logger.info("   🔓 Phase1 keep RELEASED (workload shrank → re-pack)")
+        else:
+            # Reuse the downstream chain computed above for the upper-bound check.
+            keep_info = apply_knitting_keep_lex(
+                model, task_vars, knitting_tasks, reschedule_hint, horizon,
+                downstream_chain_min=downstream_chain,
+            )
+            logger.info(
+                f"   🔒 Phase1 keep: n_prev_knitting={keep_info['n_prev_knitting']} "
+                f"eligible={len(keep_info['eligible_ids'])} "
+                f"dropped_oob={keep_info['n_dropped_oob']} "
+                f"dropped_downstream={keep_info.get('n_dropped_downstream_overflow', 0)} "
+                f"dropped_pinned={keep_info['n_dropped_pinned']} "
+                f"dropped_other={keep_info['n_dropped_other']}"
+            )
 
     validation = model.Validate()
     if validation:

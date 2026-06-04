@@ -46,6 +46,10 @@ class Pipeline:
         self.material_capacities = material_capacities or {}
         self.translation_map: Dict[str, str] = _build_translation_map(self.tasks)
         self.reschedule_hint = reschedule_hint
+        # Detect BEFORE partitioning: partition_hint_for_pipeline drops previous
+        # assignments whose task no longer exists, so the shrink signal must be
+        # read from the raw hint vs the full current task list.
+        self.workload_shrank: bool = _detect_workload_shrink(reschedule_hint, self.tasks)
         self.partitioned_hint: Dict[str, Any] = (
             partition_hint_for_pipeline(reschedule_hint, self.tasks)
             if reschedule_hint else {}
@@ -67,6 +71,13 @@ class Pipeline:
         # horizon across all phases preserves CP-SAT determinism (fixed seed + 1 worker).
         global_horizon = compute_global_horizon(self.tasks, all_resources, self.config)
         logger.info(f"🌐 Global horizon: {global_horizon} min")
+        if self.reschedule_hint:
+            logger.info(
+                f"🔁 Re-schedule: workload_shrank={self.workload_shrank} "
+                f"(orders removed since previous plan → relax to compaction)"
+                if self.workload_shrank else
+                f"🔁 Re-schedule: workload_shrank=False (same/grown set → keep layout)"
+            )
 
         # ── Phase 1: Knitting ─────────────────────────────────────────────
         p1_tasks = [t for t in self.tasks if t.get("operation", "").lower() in PHASE1_OPS]
@@ -77,6 +88,7 @@ class Pipeline:
             horizon=global_horizon,
             reschedule_hint=p1_hint,
             all_pipeline_tasks=self.tasks,
+            workload_shrank=self.workload_shrank,
         )
         logger.info(f"✅ Phase 1 complete: {len(p1.assignments)} assignments, status={p1.status}")
 
@@ -93,6 +105,7 @@ class Pipeline:
             translation_map=self.translation_map,
             horizon=global_horizon,
             reschedule_hint=p2_hint,
+            workload_shrank=self.workload_shrank,
         )
         logger.info(f"✅ Phase 2 complete: {len(p2.assignments)} assignments, status={p2.status}")
 
@@ -114,6 +127,7 @@ class Pipeline:
             shift_ends=shift_ends,
             horizon=global_horizon,
             reschedule_hint=p3_hint,
+            workload_shrank=self.workload_shrank,
         )
         logger.info(
             f"✅ Phase 3 complete: {len(p3.assignments)} assignments, "
@@ -137,6 +151,7 @@ class Pipeline:
             p3_end_times=all_end_times,
             horizon=global_horizon,
             reschedule_hint=p4_hint,
+            workload_shrank=self.workload_shrank,
         )
         logger.info(f"✅ Phase 4 complete: {len(p4.assignments)} assignments, status={p4.status}")
 
@@ -171,6 +186,45 @@ class Pipeline:
 _PHASE1_OP_SET = {"knitting", "capacity_block"}
 _PHASE2_OP_SET = {"linking"}
 _PHASE3_OP_SET = {"washing"}
+
+
+def _detect_workload_shrink(
+    reschedule_hint: Optional[Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+) -> bool:
+    """True when orders present in the previous plan are GONE from the current
+    task set (e.g. re-scheduling 10 orders down to 5).
+
+    Detected at ORDER level so it is rename-safe: slicing changes task_ids but
+    keeps the original_order_id, so a renamed task is NOT counted as removed.
+    Falls back to task_id level only when the hint carries no order metadata.
+
+    Why it matters: the previous absolute start times describe a denser plan.
+    Keeping them — hard pin OR the symmetric |Δ| soft penalty — freezes the
+    surviving tasks at their old clock positions and leaves GAPS where the
+    removed work used to sit.  On a shrink every phase relaxes to a one-sided
+    (late-only) anchor + cold-style compaction so the schedule re-packs forward.
+    """
+    if not reschedule_hint:
+        return False
+    previous = reschedule_hint.get("previous_assignments") or []
+    if not previous:
+        return False
+
+    current_orders = {
+        t.get("original_order_id", "") for t in tasks if t.get("original_order_id")
+    }
+    prev_orders = {
+        p.get("original_order_id", "") for p in previous if p.get("original_order_id")
+    }
+    if prev_orders:
+        return bool(prev_orders - current_orders)
+
+    # No order metadata in the hint — fall back to task_id level (rename-unsafe,
+    # but better than silently missing a genuine order removal).
+    current_tids = {t["task_id"] for t in tasks}
+    prev_tids = {p.get("task_id") for p in previous}
+    return bool(prev_tids - current_tids)
 
 
 def partition_hint_for_pipeline(

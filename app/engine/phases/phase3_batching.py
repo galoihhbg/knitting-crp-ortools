@@ -70,6 +70,7 @@ def solve_washing(
     shift_ends: List[int],
     horizon: Optional[int] = None,
     reschedule_hint: Optional[Dict[str, Any]] = None,
+    workload_shrank: bool = False,
 ) -> Phase3Result:
     """
     Solve the washing phase using per-group model isolation.
@@ -133,6 +134,7 @@ def solve_washing(
             start_lb=start_lb,
             shift_ends=shift_ends,
             reschedule_hint=group_hint,
+            workload_shrank=workload_shrank,
         )
         all_assignments.extend(result["assignments"])
         all_overloads.extend(result["overloads"])
@@ -165,6 +167,7 @@ def _solve_group(
     shift_ends: List[int],
     _chunked: bool = False,
     reschedule_hint: Optional[Dict[str, Any]] = None,
+    workload_shrank: bool = False,
 ) -> Dict[str, Any]:
     # Split pinned vs free tasks.
     # Pinned tasks have fixed start/end and must NOT consume batch slots or
@@ -220,6 +223,7 @@ def _solve_group(
             return _solve_group_chunked(
                 group_key, pinned_tasks, free_tasks,
                 resources, config, horizon, capacity, start_lb, shift_ends,
+                workload_shrank=workload_shrank,
             )
 
     logger.info(
@@ -484,11 +488,22 @@ def _solve_group(
     task_map = {t["task_id"]: t for t in group_tasks}
     obj_terms += apply_soft_deadlines(model, task_vars, task_map, horizon)
 
+    # workload_shrank is detected at the pipeline level (before hint partitioning
+    # drops the removed tasks) and threaded in.  On a shrink (orders removed) the
+    # old absolute starts describe a denser plan; neoing them — hard-keep + soft
+    # |Δ| đối xứng — đóng băng các task còn lại → hở gap đúng chỗ batch đã bị xoá.
+    # Xử lý: GIỮ máy cũ nhưng THẢ start/slot và đổi soft time-penalty sang một
+    # chiều (chỉ phạt dời MUỘN) để solver dồn về đầu.
+
+    # Stability terms kept separate from the production objective so the two-pass
+    # keep solve below can lock the kept layout first, then optimise production.
+    stability_terms: List = []
     stab_terms, stab_stats = apply_stability_objective(
         model, task_vars, group_tasks, reschedule_hint, horizon,
         start_lb=group_start_lb,
+        time_penalty="late_only" if workload_shrank else "abs",
     )
-    obj_terms += stab_terms
+    stability_terms += stab_terms
     if reschedule_hint:
         logger.info(
             f"   🎯 Phase3 group={group_key} stability_stats: "
@@ -496,6 +511,76 @@ def _solve_group(
             f"matched_via_order={stab_stats.matched_via_order} n_hinted={stab_stats.n_hinted} "
             f"time_terms={stab_stats.time_terms_added} machine_terms={stab_stats.machine_terms_added}"
         )
+
+    # ── Conditional hard-keep of the previous batch layout (re-schedule) ─────
+    # The large washing groups do not reach OPTIMAL within budget, so a soft hint
+    # cannot stabilise them — washing start times swing ~1000+ min every re-schedule.
+    # Fix: reconstruct the previous batches (prev tasks grouped by machine+start),
+    # map each to a FIXED slot index (earliest cycle → lowest slot), and HARD-KEEP
+    # each ELIGIBLE task at its previous (slot, machine, start) via
+    # OnlyEnforceIf(keep_lit).  Eligible ⇔ prev_start ≥ start_lb (staying is still
+    # feasible: if upstream/linking hasn't moved, keeping costs nothing; if it moved
+    # later, the task is NOT pinned and can slide).  The two-pass solve below
+    # maximises kept tasks first, so a keep breaks only when genuinely infeasible —
+    # never forcing the group INFEASIBLE.  (Pinning also shrinks the search enough
+    # that the big group reaches OPTIMAL, which is what makes washing converge.)
+    keep_lits: List = []
+    if reschedule_hint:
+        previous = reschedule_hint.get("previous_assignments") or []
+        free_set = set(free_scheduled_ids)
+        # workload_shrank computed above (drives both the soft time-penalty mode
+        # and whether we hard-keep start/slot or only the machine).
+        prev_batches: Dict[Tuple[str, int], List[str]] = {}
+        for p in previous:
+            tid = p.get("task_id")
+            if tid not in free_set:
+                continue  # exact-match only; renamed/new tasks fill remaining slots
+            bkey = (p.get("machine_id", ""), int(p.get("start_time", 0)))
+            prev_batches.setdefault(bkey, []).append(tid)
+        ordered_batches = sorted(prev_batches.items(), key=lambda kv: (kv[0][1], kv[0][0]))
+        w_slot = 2 * batch_w  # soft fallback for matched-but-not-eligible tasks
+        n_soft = 0
+        for slot_idx, ((p_mach, p_start), tids) in enumerate(ordered_batches):
+            if slot_idx >= K:
+                break  # more previous batches than slots — keep the first K
+            if not workload_shrank:
+                # Warm-start the stale layout only when re-solving the same set.
+                # On a shrink these hints would steer the survivors back into the
+                # gapped positions, fighting the compaction we want.
+                model.AddHint(batch_starts[slot_idx], max(0, min(horizon, p_start)))
+            for tid in tids:
+                if tid not in x:
+                    continue
+                tv = task_vars[tid]
+                if not workload_shrank:
+                    for k in range(K):
+                        model.AddHint(x[tid][k], 1 if k == slot_idx else 0)
+                lb = group_start_lb.get(tid, 0)
+                lits = tv.get("literals") or []
+                r_ids = tv.get("r_ids") or []
+                if p_start >= lb and (p_mach in r_ids) and lits:
+                    kl = model.NewBoolVar(f"wkeep_{group_key}_{tid}")
+                    keep_lits.append(kl)
+                    if not workload_shrank:
+                        # Same-size re-solve: pin the full layout (start + slot).
+                        model.Add(tv["start"] == p_start).OnlyEnforceIf(kl)
+                        model.Add(x[tid][slot_idx] == 1).OnlyEnforceIf(kl)
+                    # Machine is kept in BOTH cases — start/slot are released only
+                    # on a shrink so survivors can re-pack toward the front.
+                    for lit, r_id in zip(lits, r_ids):
+                        if r_id == p_mach:
+                            model.Add(lit == 1).OnlyEnforceIf(kl)
+                    model.AddHint(kl, 1)
+                elif not workload_shrank:
+                    if w_slot > 0:
+                        stability_terms.append((1 - x[tid][slot_idx]) * w_slot)
+                        n_soft += 1
+        if keep_lits or n_soft:
+            logger.info(
+                f"   📌 Group {group_key}: {len(keep_lits)} "
+                f"{'machine-keep (shrink→compact)' if workload_shrank else 'hard-keep'}-eligible, "
+                f"{n_soft} soft-anchored across {min(len(ordered_batches), K)} prev slot(s)"
+            )
 
     # Pairwise co-location incentive: khi total qty > capacity (không gộp được hết),
     # vẫn cần ép các cặp vừa vặn vào chung 1 slot thay vì để solver tự quyết.
@@ -523,21 +608,68 @@ def _solve_group(
                     # Phạt khi KHÔNG chung slot
                     obj_terms.append(pair_w - co * pair_w)
 
-    model.Minimize(sum(obj_terms) if obj_terms else 0)
+    objective_expr = sum(obj_terms + stability_terms) if (obj_terms or stability_terms) else 0
 
-    solver = make_solver(config, has_hint=bool(reschedule_hint))
-    # Fix B: per-group DETERMINISTIC budget.  Washing groups are isolated models,
-    # so each group is capped at ≈ 1/4 of the global deterministic budget make_solver
-    # set, to keep the phase tractable when there are many groups.  Inheriting
-    # make_solver's value (rather than recomputing from config) keeps the per-group
-    # budget consistent with the 1-effective-worker determinism contract.  No
-    # wall-clock cap is set (make_solver leaves it +inf) — a wall-clock stop would
-    # be non-deterministic.
-    solver.parameters.max_deterministic_time = max(
-        5.0, solver.parameters.max_deterministic_time / 4.0
-    )
+    def _wsolver(full_budget: bool = False) -> cp_model.CpSolver:
+        # Per-group DETERMINISTIC budget.  Cold solves use 1/4 of the global budget
+        # (enough to find a good schedule, keeps the phase tractable when there are
+        # many groups).  The re-schedule keep two-pass uses the FULL budget: pinning
+        # the previous layout shrinks the search so each pass reaches OPTIMAL quickly
+        # once stabilised, but the FIRST re-solve from an external hint needs the
+        # whole budget to converge (a too-small slice left it FEASIBLE/UNKNOWN →
+        # washing drift or a fallback that dropped the group).  No wall-clock cap
+        # (make_solver leaves it +inf) — that would be non-deterministic.
+        s = make_solver(config, has_hint=bool(reschedule_hint))
+        if not full_budget:
+            s.parameters.max_deterministic_time = max(5.0, s.parameters.max_deterministic_time / 4.0)
+        return s
 
-    status_code = solver.Solve(model)
+    if keep_lits:
+        # ── Two-pass lexicographic keep (mirrors the knitting phase) ─────────
+        # Pass 1: maximise kept (hard-pinned) tasks = minimise n_broken.  Pass 2:
+        # lock n_broken ≤ d* and minimise the production+stability objective.  Keeps
+        # the previous batch layout for every eligible task that can stay; breaks one
+        # only when infeasible — so washing converges across re-schedules.
+        n_broken = model.NewIntVar(0, len(keep_lits), f"wbroken_{group_key}")
+        model.Add(n_broken == len(keep_lits) - sum(keep_lits))
+        model.Minimize(n_broken)
+        s1 = _wsolver(full_budget=True)
+        p1_status = s1.Solve(model)
+        if p1_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            d_star = int(s1.Value(n_broken))
+            p1_time = s1.WallTime()
+            model.Add(n_broken <= d_star)
+            model.ClearObjective()
+            model.Minimize(objective_expr)
+            s2 = _wsolver(full_budget=True)
+            p2_status = s2.Solve(model)
+            # Pass 2 refines production among max-keep solutions.  If it cannot find
+            # one within budget (UNKNOWN), DON'T discard pass 1 — its solution is
+            # already feasible with the maximum number of kept tasks (the stability
+            # we want).  Falling through to fallback end_times instead would drop the
+            # whole group and destabilise washing far more.
+            if p2_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                solver, status_code = s2, p2_status
+            else:
+                solver, status_code = s1, p1_status
+            logger.info(
+                f"   🔒 Group {group_key} keep two-pass: kept "
+                f"{len(keep_lits) - d_star}/{len(keep_lits)} (broken={d_star}, "
+                f"pass1={p1_time:.1f}s {s1.StatusName(p1_status)}) → "
+                f"pass2 {s2.StatusName(p2_status)}/{s2.WallTime():.1f}s"
+                f"{' [used pass1]' if solver is s1 else ''}"
+            )
+        else:
+            # Pass 1 could not satisfy the model — drop the keep objective so the
+            # group still returns a schedule.
+            model.ClearObjective()
+            model.Minimize(objective_expr)
+            solver = _wsolver()
+            status_code = solver.Solve(model)
+    else:
+        model.Minimize(objective_expr)
+        solver = _wsolver()
+        status_code = solver.Solve(model)
     logger.info(
         f"   Group {group_key}: status={solver.StatusName(status_code)}, "
         f"time={solver.WallTime():.1f}s"
@@ -612,6 +744,7 @@ def _solve_group_chunked(
     capacity: int,
     start_lb: Dict[str, int],
     shift_ends: List[int],
+    workload_shrank: bool = False,
 ) -> Dict[str, Any]:
     """
     Solve a large group by splitting free tasks into time-sorted chunks and
@@ -660,6 +793,7 @@ def _solve_group_chunked(
             start_lb=start_lb,
             shift_ends=shift_ends,
             _chunked=True,
+            workload_shrank=workload_shrank,
         )
 
         # Filter virtual pinned tasks out of results before aggregating
