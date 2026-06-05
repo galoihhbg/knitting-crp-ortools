@@ -1235,17 +1235,26 @@ class TestT10Determinism:
                 f"max_deterministic_time only."
             )
 
-        # Auto-derived det budget tracks the wall budget at 1 effective worker.
+        # Auto-derived det budget = min(max_search_time, DEFAULT_MAX_DET_TIME).
+        # (max_search_time is a Go wall-hint we no longer use AS the budget; the
+        # old det == max_search_time derivation made large hints, e.g. 120, balloon
+        # to ~30 min wall on the knitting phase.  Capped now; still deterministic.)
+        from app.engine.shared import DEFAULT_MAX_DET_TIME
         s_auto = make_solver({"num_search_workers": 8, "max_search_time": 60}, has_hint=False)
-        assert s_auto.parameters.max_deterministic_time == 60.0, (
-            "det budget should auto-derive to max_search_time × 1 worker = 60"
+        assert s_auto.parameters.max_deterministic_time == min(60.0, DEFAULT_MAX_DET_TIME), (
+            "det budget should auto-derive to min(max_search_time, DEFAULT_MAX_DET_TIME)"
         )
-        # Caller-provided det_time still wins.
+        # A smaller wall hint is honored (not raised to the default).
+        s_small = make_solver({"max_search_time": 10}, has_hint=False)
+        assert s_small.parameters.max_deterministic_time == 10.0, (
+            "a max_search_time below the default cap should still be honored"
+        )
+        # Caller-provided det_time always wins (even above the default cap).
         s3 = make_solver(
-            {"num_search_workers": 8, "max_search_time": 60, "max_deterministic_time": 30.0},
+            {"num_search_workers": 8, "max_search_time": 60, "max_deterministic_time": 90.0},
             has_hint=False,
         )
-        assert s3.parameters.max_deterministic_time == 30.0
+        assert s3.parameters.max_deterministic_time == 90.0
 
 
 class TestT9TimePenaltyActive:

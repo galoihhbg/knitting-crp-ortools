@@ -18,6 +18,14 @@ from ortools.sat.python import cp_model
 
 logger = logging.getLogger(__name__)
 
+# Default deterministic-time budget per CP-SAT solve when config omits
+# `max_deterministic_time`.  Deterministic units, NOT wall seconds — on hard
+# models det-time advances much slower than wall, so keep this modest.  This is
+# the primary speed/quality knob: lower = faster (stops earlier at the same
+# FEASIBLE, still byte-reproducible), higher = more optimisation.  Override per
+# run via config `max_deterministic_time`.
+DEFAULT_MAX_DET_TIME: float = 30.0
+
 
 # ---------------------------------------------------------------------------
 # Re-schedule stability — apply_stability_objective + StabilityStats
@@ -434,18 +442,22 @@ def make_solver(config: Dict[str, Any], *, has_hint: bool = False) -> cp_model.C
     call-site readability).
 
     Tuning notes:
-      * `max_deterministic_time` (deterministic units ≈ single-core seconds) is
-        auto-derived as `max_search_time` (1 effective worker) when the caller omits
-        it.  An explicit config value always wins.
+      * `max_deterministic_time` (deterministic units — NOT wall seconds; on hard
+        models det-time can advance ~10-15× slower than wall, so a budget of 120
+        units was observed to take ~1763s wall on a 386-var knitting phase) is the
+        ONLY knob.  An explicit config value always wins.  When omitted it defaults
+        to `DEFAULT_MAX_DET_TIME` (NOT `max_search_time` — that field is a Go-side
+        wall hint we no longer use as the budget; deriving the det budget from it
+        is what made runs balloon to ~30 min).
+      * Determinism needs the budget to be the SAME every run, NOT large.  Lower
+        `max_deterministic_time` for speed (it stops earlier at the same FEASIBLE,
+        still byte-reproducible); raise it only if a phase needs more time to
+        converge.  Tune via config `max_deterministic_time`.
       * Do NOT set `max_time_in_seconds` (stays at the CP-SAT default of +inf) — a
         finite wall cap is non-deterministic.
-      * If a phase still looks non-deterministic, raise `max_deterministic_time` so it
-        converges within budget — do NOT raise `num_search_workers` (breaks determinism)
-        and do NOT add a wall-clock cap.
+      * Do NOT raise `num_search_workers` (breaks determinism).
     """
     solver = cp_model.CpSolver()
-
-    wall_budget_s = int(config.get("max_search_time", 60))
 
     # Determinism requires single-worker search (see docstring §1).  We force it
     # regardless of the caller's num_search_workers so /solve and /re-schedule are
@@ -453,13 +465,18 @@ def make_solver(config: Dict[str, Any], *, has_hint: bool = False) -> cp_model.C
     # production payload, with equal-or-better lateness.
     effective_workers = 1
 
-    # max_deterministic_time is the ONLY stop criterion for ALL phases.
-    # Auto-derive from the wall budget at 1 effective worker (det units ≈ seconds);
-    # an explicit config value always wins.  max_time_in_seconds is intentionally
-    # left unset (CP-SAT default +inf): a wall-clock stop would be non-deterministic.
+    # max_deterministic_time is the ONLY stop criterion for ALL phases.  Honor an
+    # explicit config value; otherwise use DEFAULT_MAX_DET_TIME — capped by any
+    # smaller max_search_time the caller sent so tiny test payloads stay quick.
+    # max_time_in_seconds is intentionally left unset (CP-SAT default +inf): a
+    # wall-clock stop would be non-deterministic.
     det_budget = config.get("max_deterministic_time")
     if det_budget is None:
-        det_budget = float(wall_budget_s) * effective_workers
+        wall_hint = config.get("max_search_time")
+        det_budget = (
+            min(float(wall_hint), DEFAULT_MAX_DET_TIME)
+            if wall_hint is not None else DEFAULT_MAX_DET_TIME
+        )
     solver.parameters.max_deterministic_time = float(det_budget)
 
     solver.parameters.relative_gap_limit = 0.01

@@ -7,7 +7,8 @@ the scheduling problem into four independent CP-SAT models:
   Phase 1 — Knitting:    machine allocation + workforce capacity
   Phase 2 — Linking:     waits for knitting via start_lb (no shared CP-SAT vars)
   Phase 3 — Washing:     group-isolated batching (one model per color+substance)
-  Phase 4 — Downstream:  ironing, packing, any other ops; waits for washing
+  Phase 4 — Ironing:     waits for washing via start_lb
+  Phase 5 — Packing:     waits for ironing; also any other downstream op
 
 Each phase receives only the tasks and resources relevant to it. Dependencies
 between phases are passed as plain integers (start/end times), not shared
@@ -137,15 +138,15 @@ class Pipeline:
         if p3.status not in ("feasible", "empty"):
             return _phase_failure_result(p3.status, p3_tasks, all_resources, self.config, global_horizon)
 
-        # ── Phase 4: Downstream ───────────────────────────────────────────
-        # All end times so downstream can depend on any upstream task
+        # ── Phase 4: Ironing ──────────────────────────────────────────────
+        # Downstream split into ironing → packing so each CP-SAT model stays
+        # small (one combined "downstream" model solving ironing+packing together
+        # was heavy and could time out / report infeasible).  Same cross-phase
+        # handoff as knit→link→wash: integers (end_times), no shared CP-SAT vars.
         all_end_times = {**combined_end_times, **p3.end_times}
 
-        p4_tasks = [
-            t for t in self.tasks
-            if t.get("operation", "").lower() not in UPSTREAM_OPS
-        ]
-        p4_hint = _hint_for_phase(self.reschedule_hint, self.partitioned_hint.get("downstream"))
+        p4_tasks = [t for t in self.tasks if t.get("operation", "").lower() in _PHASE4_OP_SET]
+        p4_hint = _hint_for_phase(self.reschedule_hint, self.partitioned_hint.get("ironing"))
         p4: Phase4Result = solve_downstream(
             p4_tasks, all_resources, self.config,
             p3_end_times=all_end_times,
@@ -153,19 +154,45 @@ class Pipeline:
             reschedule_hint=p4_hint,
             workload_shrank=self.workload_shrank,
         )
-        logger.info(f"✅ Phase 4 complete: {len(p4.assignments)} assignments, status={p4.status}")
+        logger.info(f"✅ Phase 4 (Ironing) complete: {len(p4.assignments)} assignments, status={p4.status}")
+
+        # ── Phase 5: Packing (+ any other downstream op) ──────────────────
+        # Packing waits for ironing via end_times (start_lb).  Anything downstream
+        # that is NOT ironing lands here, preserving the old "any other op" catch-all.
+        all_end_times_iron = {**all_end_times, **p4.end_times}
+        p5_tasks = [
+            t for t in self.tasks
+            if t.get("operation", "").lower() not in UPSTREAM_OPS
+            and t.get("operation", "").lower() not in _PHASE4_OP_SET
+        ]
+        p5_hint = _hint_for_phase(self.reschedule_hint, self.partitioned_hint.get("downstream"))
+        p5: Phase4Result = solve_downstream(
+            p5_tasks, all_resources, self.config,
+            p3_end_times=all_end_times_iron,
+            horizon=global_horizon,
+            reschedule_hint=p5_hint,
+            workload_shrank=self.workload_shrank,
+        )
+        logger.info(f"✅ Phase 5 (Packing) complete: {len(p5.assignments)} assignments, status={p5.status}")
 
         # ── Aggregate results ─────────────────────────────────────────────
-        all_assignments = p1.assignments + p2.assignments + p3.assignments + p4.assignments
-        all_overloads = p1.overloads + p2.overloads + p3.overloads + p4.overloads
+        all_assignments = (
+            p1.assignments + p2.assignments + p3.assignments
+            + p4.assignments + p5.assignments
+        )
+        all_overloads = (
+            p1.overloads + p2.overloads + p3.overloads
+            + p4.overloads + p5.overloads
+        )
         total_time = (
-            p1.solve_time_seconds + p2.solve_time_seconds
-            + p3.solve_time_seconds + p4.solve_time_seconds
+            p1.solve_time_seconds + p2.solve_time_seconds + p3.solve_time_seconds
+            + p4.solve_time_seconds + p5.solve_time_seconds
         )
 
         # Objective: sum of per-phase objective values where available
         obj_vals = [
-            v for v in [p1.objective_value, p2.objective_value, p4.objective_value]
+            v for v in [p1.objective_value, p2.objective_value,
+                        p4.objective_value, p5.objective_value]
             if v is not None
         ]
         combined_obj = sum(obj_vals) if obj_vals else None
@@ -186,6 +213,8 @@ class Pipeline:
 _PHASE1_OP_SET = {"knitting", "capacity_block"}
 _PHASE2_OP_SET = {"linking"}
 _PHASE3_OP_SET = {"washing"}
+_PHASE4_OP_SET = {"iron", "ironing"}  # Phase 5 (packing + rest) takes everything else downstream
+                                      # (payloads use op "Iron"→"iron"; accept "ironing" too)
 
 
 def _detect_workload_shrink(
@@ -238,7 +267,8 @@ def partition_hint_for_pipeline(
           "knitting":   [PreviousAssignment dicts],
           "linking":    [...],
           "washing":    { (color, substance): [...], ... },
-          "downstream": [...],
+          "ironing":    [...],
+          "downstream": [...],   # packing + any other downstream op
         }
 
     The previous_assignments are matched to the current task list by task_id.
@@ -246,12 +276,13 @@ def partition_hint_for_pipeline(
     maps to via existing tasks (best-effort); otherwise they are dropped so a
     later fallback in apply_stability_objective can still match them by order.
 
-    Always returns the full 4-key skeleton so callers can `.get()` safely.
+    Always returns the full skeleton so callers can `.get()` safely.
     """
     result: Dict[str, Any] = {
         "knitting": [],
         "linking": [],
         "washing": {},
+        "ironing": [],
         "downstream": [],
     }
     if not reschedule_hint:
@@ -293,6 +324,8 @@ def partition_hint_for_pipeline(
             result["linking"].append(prev)
         elif op in _PHASE3_OP_SET:
             result["washing"].setdefault(wash_key, []).append(prev)
+        elif op in _PHASE4_OP_SET:
+            result["ironing"].append(prev)
         elif op:
             result["downstream"].append(prev)
 
