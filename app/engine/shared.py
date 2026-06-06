@@ -407,7 +407,12 @@ def compute_global_horizon(
     return min(base, _safe)
 
 
-def make_solver(config: Dict[str, Any], *, has_hint: bool = False) -> cp_model.CpSolver:
+def make_solver(
+    config: Dict[str, Any],
+    *,
+    has_hint: bool = False,
+    relative_gap: Optional[float] = None,
+) -> cp_model.CpSolver:
     """
     Configured CpSolver factory.
 
@@ -479,7 +484,14 @@ def make_solver(config: Dict[str, Any], *, has_hint: bool = False) -> cp_model.C
         )
     solver.parameters.max_deterministic_time = float(det_budget)
 
-    solver.parameters.relative_gap_limit = 0.01
+    # Default 1% gap keeps the expensive knitting phase fast (it stops as soon as
+    # it is provably within 1% of optimum).  Small/cheap phases that must close a
+    # SUB-1% improvement — e.g. load-balancing interchangeable downstream machines,
+    # where spreading saves <1% of an objective dominated by absolute start-times —
+    # pass a tighter `relative_gap` so that gain is not swallowed by the tolerance.
+    solver.parameters.relative_gap_limit = (
+        0.01 if relative_gap is None else float(relative_gap)
+    )
     solver.parameters.num_search_workers = effective_workers
     solver.parameters.random_seed = int(config.get("random_seed", 42))
 

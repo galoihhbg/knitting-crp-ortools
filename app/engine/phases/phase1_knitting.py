@@ -183,6 +183,18 @@ def apply_knitting_keep_lex(
 
         keep_lit = model.NewBoolVar(f"keep_{t_id}")
         model.Add(tv["start"] == prev_start).OnlyEnforceIf(keep_lit)
+        # Also pin the previous MACHINE when still compatible.  Pinning start ALONE
+        # left a machine symmetry: interchangeable tasks (same group + same start,
+        # e.g. two batches of one order) could swap machines at equal objective
+        # cost, so the FIRST re-schedule flipped them vs the cold solve and stability
+        # was only reached at run 3.  Pinning the machine too makes knitting a fixed
+        # point in ONE re-schedule.  The two-pass max-keep drops this keep if pinning
+        # the machine is infeasible, so it never forces INFEASIBLE.
+        prev_machine = prev.get("machine_id", "")
+        for lit, r_id in zip(tv.get("literals") or [], tv.get("r_ids") or []):
+            if r_id == prev_machine:
+                model.Add(lit == 1).OnlyEnforceIf(keep_lit)
+                break
         result["keep_lits"].append(keep_lit)
         result["eligible_ids"].append(t_id)
 
@@ -254,6 +266,13 @@ def _log_task_diagnostics(tasks: List[Dict[str, Any]], horizon: int) -> None:
         logger.warning(msg) if "⚠️" in msg or "ℹ️" in msg else logger.error(msg)
 
 
+# Default rolling-wave size (free knitting tasks per wave) when config omits
+# `knitting_chunk_size`.  NOT a hard 150: it is a starting point — calibrate per
+# deployment so each wave reaches OPTIMAL (a wave that returns FEASIBLE is the
+# stall pathology and is logged loudly).  Lower = more waves, each easier/OPTIMAL.
+_DEFAULT_KNIT_CHUNK: int = 90
+
+
 @dataclass
 class Phase1Result:
     status: str
@@ -263,6 +282,9 @@ class Phase1Result:
     end_times: Dict[str, int] = field(default_factory=dict)
     solve_time_seconds: float = 0.0
     objective_value: Optional[float] = None
+    # Raw CP-SAT status name ("OPTIMAL"/"FEASIBLE"/…) of the final solve — used by
+    # the rolling-wave driver to detect a wave that stalled at FEASIBLE (guardrail).
+    solver_status_name: str = ""
 
 
 def solve_knitting(
@@ -276,6 +298,8 @@ def solve_knitting(
     workload_shrank: bool = False,  # accepted for pipeline-call uniformity; knitting
                                     # intentionally ignores it (stability > compaction:
                                     # it stays pinned on shrink, see the keep block below)
+    _wave: bool = False,            # internal: True when called for one rolling wave
+                                    # (prevents recursive re-chunking)
 ) -> Phase1Result:
     """
     Solve the knitting phase in isolation.
@@ -296,6 +320,21 @@ def solve_knitting(
 
     if horizon is None:
         horizon = compute_horizon(knitting_tasks, config, resources=resources)
+
+    # ── Rolling-wave (cuốn chiếu) for large payloads ─────────────────────────
+    # Solving all knitting in ONE model stalls at FEASIBLE and burns unbounded
+    # wall-time at scale (deterministic-time does not bound wall-time).  Split the
+    # free tasks into EDD-sorted waves small enough to reach OPTIMAL single-worker
+    # (still fully deterministic), pinning each finished wave as fixed intervals
+    # for the next.  Opt-in by size so small payloads / tests are byte-unchanged.
+    free_knitting = [t for t in knitting_tasks if not t.get("is_pinned")]
+    chunk_size = int(config.get("knitting_chunk_size", _DEFAULT_KNIT_CHUNK))
+    if not _wave and chunk_size > 0 and len(free_knitting) > chunk_size:
+        return _solve_knitting_chunked(
+            knitting_tasks, resources, config, horizon, reschedule_hint,
+            all_pipeline_tasks, chunk_size,
+        )
+
     resource_map: Dict[str, Dict[str, Any]] = {r["id"]: r for r in resources}
 
     _log_task_diagnostics(knitting_tasks, horizon)
@@ -506,6 +545,174 @@ def solve_knitting(
         end_times=end_times,
         solve_time_seconds=solver.WallTime(),
         objective_value=solver.ObjectiveValue() if status_str == "feasible" else None,
+        solver_status_name=solver.StatusName(status_code),
+    )
+
+
+def _make_knitting_vp(asgn: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert a solved wave assignment into a virtual-pinned knitting task.
+
+    Registers a FIXED interval on the assigned machine so the next wave's
+    build_resource_model (machine NoOverlap) and workforce cumulative both
+    account for capacity already consumed.  operation='knitting' + is_pinned so
+    _workforce_cumulative counts it (demand 1) exactly like a real knitting task.
+    """
+    s, e, m = asgn["start_time"], asgn["end_time"], asgn["machine_id"]
+    return {
+        "task_id":                 f"__vp_{asgn['task_id']}",
+        "operation":               "knitting",
+        "is_pinned":               True,
+        "pinned_machine_id":       m,
+        "pinned_start_time":       s,
+        "pinned_end_time":         e,
+        "compatible_resource_ids": [m],
+        "duration":                max(0, e - s),
+        "qty":                     asgn.get("quantity", 1),
+        "due_at_min":              999_999,
+        "start_after_min":         0,
+        "final_depends_on":        [],
+        "original_depends_on":     [],
+        "original_order_id":       "",
+        "group_id":                "",
+        "design_item_id":          "",
+        "color_config":            "",
+        "color":                   "",
+        "substance":               "",
+        "is_slice":                False,
+        "is_batch":                False,
+        "sub_tasks":               None,
+        "demand":                  1,
+        "worker_req":              1,
+        "material_demands":        {},
+    }
+
+
+def _solve_knitting_chunked(
+    knitting_tasks: List[Dict[str, Any]],
+    resources: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    horizon: int,
+    reschedule_hint: Optional[Dict[str, Any]],
+    all_pipeline_tasks: Optional[List[Dict[str, Any]]],
+    chunk_size: int,
+) -> Phase1Result:
+    """Rolling-wave knitting: EDD-sorted whole-order waves, each solved single-
+    worker (deterministic) with previous waves pinned as fixed intervals.
+
+    Mirrors washing's `_solve_group_chunked`.  Determinism holds (each wave is
+    single-worker + fixed det budget + sorted; the wave sequence is deterministic;
+    the virtual-pin handoff is deterministic).  Re-schedule stability holds because
+    `apply_knitting_keep_lex` runs per wave (the hint is filtered to each wave's
+    task_ids inside solve_knitting).
+    """
+    pinned = [t for t in knitting_tasks if t.get("is_pinned")]
+    free = [t for t in knitting_tasks if not t.get("is_pinned")]
+
+    # Group whole orders together (never split an order's slices across waves, so
+    # slice-sync stays intact) and order them EDD-first (earliest due date), then
+    # earliest start_after, then highest priority, then order_id for a stable tie.
+    by_order: Dict[str, List[Dict[str, Any]]] = {}
+    for t in free:
+        oid = t.get("original_order_id", "") or t["task_id"]
+        by_order.setdefault(oid, []).append(t)
+
+    def _order_key(oid: str):
+        ts = by_order[oid]
+        return (
+            min(int(x.get("due_at_min") or horizon) for x in ts),
+            min(int(x.get("start_after_min", 0)) for x in ts),
+            -max(int(x.get("priority", 0)) for x in ts),
+            oid,
+        )
+
+    waves: List[List[Dict[str, Any]]] = []
+    cur: List[Dict[str, Any]] = []
+    for oid in sorted(by_order, key=_order_key):
+        if cur and len(cur) + len(by_order[oid]) > chunk_size:
+            waves.append(cur)
+            cur = []
+        cur.extend(by_order[oid])
+    if cur:
+        waves.append(cur)
+
+    logger.info(
+        f"🌀 Phase 1 (Knitting) rolling-wave: {len(free)} free + {len(pinned)} pinned "
+        f"→ {len(waves)} waves (≤{chunk_size} tasks/wave, EDD-sorted)"
+    )
+
+    virtual_pinned: List[Dict[str, Any]] = []
+    assignments: List[Dict[str, Any]] = []
+    overloads: List[Dict[str, Any]] = []
+    start_times: Dict[str, int] = {}
+    end_times: Dict[str, int] = {}
+    total_time = 0.0
+    n_nonoptimal = 0
+    pinned_ids = {t["task_id"] for t in pinned}
+    pinned_collected = False
+
+    for wi, wave in enumerate(waves):
+        wave_tasks = pinned + virtual_pinned + wave
+        res = solve_knitting(
+            wave_tasks, resources, config,
+            horizon=horizon,
+            reschedule_hint=reschedule_hint,
+            all_pipeline_tasks=all_pipeline_tasks,
+            _wave=True,
+        )
+        if res.status not in ("feasible", "empty"):
+            logger.error(
+                f"❌ Phase 1 knitting wave {wi + 1}/{len(waves)} status={res.status} "
+                f"— aborting rolling-wave"
+            )
+            return res
+
+        # Guardrail (a): a wave that did NOT reach OPTIMAL is the stall pathology.
+        if res.solver_status_name != "OPTIMAL":
+            n_nonoptimal += 1
+            logger.warning(
+                f"⚠️ Phase 1 knitting wave {wi + 1}/{len(waves)} status="
+                f"{res.solver_status_name} (NOT OPTIMAL, {len(wave)} tasks, "
+                f"{res.solve_time_seconds:.1f}s) — lower config.knitting_chunk_size."
+            )
+        else:
+            logger.info(
+                f"   ✅ knitting wave {wi + 1}/{len(waves)} OPTIMAL "
+                f"({len(wave)} tasks, {res.solve_time_seconds:.1f}s)"
+            )
+
+        wave_ids = {t["task_id"] for t in wave}
+        for a in res.assignments:
+            tid = a["task_id"]
+            if tid.startswith("__vp_"):
+                continue
+            # this wave's free tasks, plus the originally-pinned tasks once
+            if tid in wave_ids or (not pinned_collected and tid in pinned_ids):
+                assignments.append(a)
+                start_times[tid] = a["start_time"]
+                end_times[tid] = a["end_time"]
+        overloads.extend(o for o in res.overloads if o.get("task_id") in wave_ids)
+        pinned_collected = True
+        total_time += res.solve_time_seconds
+
+        # Handoff: pin this wave's solved tasks as fixed intervals for later waves.
+        for a in res.assignments:
+            if a["task_id"] in wave_ids and not a["task_id"].startswith("__vp_"):
+                virtual_pinned.append(_make_knitting_vp(a))
+
+    if n_nonoptimal:
+        logger.warning(
+            f"⚠️ Phase 1 knitting rolling-wave: {n_nonoptimal}/{len(waves)} waves did "
+            f"NOT reach OPTIMAL — reduce config.knitting_chunk_size for full "
+            f"determinism + quality (waves must be OPTIMAL)."
+        )
+    return Phase1Result(
+        status="feasible",
+        assignments=assignments,
+        overloads=overloads,
+        start_times=start_times,
+        end_times=end_times,
+        solve_time_seconds=total_time,
+        solver_status_name="OPTIMAL" if n_nonoptimal == 0 else "FEASIBLE",
     )
 
 

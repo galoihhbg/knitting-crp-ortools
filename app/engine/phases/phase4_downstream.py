@@ -108,7 +108,8 @@ def solve_downstream(
     # Re-schedule: skip flow/sync (they outweigh stability pin) — see phase1.
     # EXCEPTION — workload shrank: re-enable so survivors re-pack (no gaps); the
     # soft anchor is one-sided (late_only) this run so it won't fight compaction.
-    if not reschedule_hint or workload_shrank:
+    cold = not reschedule_hint or workload_shrank
+    if cold:
         obj_terms += apply_order_flow_objective(model, task_vars, downstream_tasks, horizon)
         obj_terms += apply_slice_sync_objective(model, task_vars, downstream_tasks, horizon)
 
@@ -148,7 +149,16 @@ def solve_downstream(
         logger.error(f"❌ Phase 4 MODEL_INVALID: {validation}")
         return Phase4Result(status="model_invalid")
 
-    solver = make_solver(config, has_hint=bool(reschedule_hint))
+    # Cold solve: tighten the gap to 0 so the solver pursues the true optimum and
+    # balances load across interchangeable machines (independent packing/ironing
+    # tasks otherwise serialise onto one machine — the <1% balance gain is swallowed
+    # by the default 1% gap). On reschedule keep the 1% gap so the larger stability
+    # anchors (machine-swap penalty) win and pinned tasks are not re-optimised away.
+    solver = make_solver(
+        config,
+        has_hint=bool(reschedule_hint),
+        relative_gap=0.0 if cold else None,
+    )
     status_code = solver.Solve(model)
 
     logger.info(

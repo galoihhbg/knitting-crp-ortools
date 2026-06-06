@@ -1256,6 +1256,27 @@ class TestT10Determinism:
         )
         assert s3.parameters.max_deterministic_time == 90.0
 
+    def test_t10_3_relative_gap_default_and_override(self):
+        """make_solver defaults to a 1% relative gap (keeps the expensive knitting
+        phase fast) but honors a tighter `relative_gap` override.
+
+        The override is what lets the downstream phase balance interchangeable
+        machines on a cold solve: spreading packing/ironing across two machines is
+        a sub-1% objective improvement that the default 1% gap swallows, so the
+        solver would otherwise stop at a serial solution and label it OPTIMAL.
+
+        Mutation guard: if anyone hard-codes relative_gap_limit = 0.01 (ignoring the
+        override) the second assertion fails and downstream re-serialises."""
+        from app.engine.shared import make_solver
+        s_default = make_solver({"max_search_time": 60})
+        assert abs(s_default.parameters.relative_gap_limit - 0.01) < 1e-12, (
+            "default relative gap must stay 1% so knitting is not slowed"
+        )
+        s_tight = make_solver({"max_search_time": 60}, relative_gap=0.0)
+        assert s_tight.parameters.relative_gap_limit == 0.0, (
+            "an explicit relative_gap=0.0 must be honored (cold downstream load-balance)"
+        )
+
 
 class TestT9TimePenaltyActive:
 
