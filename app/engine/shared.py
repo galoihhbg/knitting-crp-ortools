@@ -784,10 +784,18 @@ def apply_soft_deadlines(
     task_vars: Dict[str, Dict[str, Any]],
     task_map: Dict[str, Dict[str, Any]],
     horizon: int,
+    deadline_override: Optional[Dict[str, int]] = None,
 ) -> List[Any]:
     """
     Create a lateness IntVar (= max(0, end - due_at)) per non-pinned, non-dummy task.
     Returns weighted objective terms to be summed into model.Minimize().
+
+    deadline_override: optional task_id → deadline (minutes).  When provided for a
+    task, lateness is measured against this value instead of its raw due_at_min.
+    Phase 3 passes the lead-adjusted washing deadline (due − downstream_lead) here,
+    because washing is mid-pipeline: finishing washing at due_at_min already leaves
+    no time for the ironing/packing that follow.  Other callers pass nothing, so
+    their behaviour is unchanged.
 
     Objective hierarchy per task (descending magnitude):
       1. lateness × weight × 100   — minimise total tardiness (primary)
@@ -811,6 +819,8 @@ def apply_soft_deadlines(
 
         priority = int(task.get("priority", 5))
         due_at = int(task.get("due_at_min", horizon))
+        if deadline_override and t_id in deadline_override:
+            due_at = int(deadline_override[t_id])
         weight = 10 ** (6 - priority)
 
         max_lateness = max(0, horizon - due_at)

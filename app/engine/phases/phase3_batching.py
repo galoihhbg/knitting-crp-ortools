@@ -71,6 +71,7 @@ def solve_washing(
     horizon: Optional[int] = None,
     reschedule_hint: Optional[Dict[str, Any]] = None,
     workload_shrank: bool = False,
+    all_pipeline_tasks: Optional[List[Dict[str, Any]]] = None,
 ) -> Phase3Result:
     """
     Solve the washing phase using per-group model isolation.
@@ -81,6 +82,10 @@ def solve_washing(
         config:       Solver config.
         p2_end_times: task_id → end minute from Phase 2.
         shift_ends:   Shift boundary points (virtual minutes).
+        all_pipeline_tasks: the FULL task list (all phases).  Used only to compute
+            downstream lead so each washing task's deadline is due − lead (washing
+            is mid-pipeline).  None → lead derived from the washing tasks alone
+            (lead = 0 for them, i.e. deadline == raw due_at_min).
     """
     washing_tasks = [t for t in tasks if t.get("operation", "").lower() in PHASE3_OPS]
     if not washing_tasks:
@@ -93,6 +98,19 @@ def solve_washing(
 
     # Compute start lower-bounds from Phase 2
     start_lb = _compute_start_lb(washing_tasks, p2_end_times)
+
+    # Lead-adjusted deadline per washing task.  Washing sits in the MIDDLE of the
+    # pipeline (ironing + packing follow), so "washing end ≤ due_at_min" is already
+    # too late for the order.  deadline = max(0, due − downstream_lead), where the
+    # lead is the longest-duration path from this task through its downstream tasks
+    # (reversed final_depends_on DAG).  Drives both the co-location gate and the
+    # soft lateness penalty.  No flag for "short-term" orders is needed: the
+    # deadline arithmetic itself decides which tasks must not be batched late.
+    lead = _compute_downstream_lead(all_pipeline_tasks or washing_tasks)
+    wash_deadline: Dict[str, int] = {
+        t["task_id"]: max(0, int(t.get("due_at_min", horizon)) - lead.get(t["task_id"], 0))
+        for t in washing_tasks
+    }
 
     # Group by (color, substance)
     groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
@@ -135,6 +153,7 @@ def solve_washing(
             shift_ends=shift_ends,
             reschedule_hint=group_hint,
             workload_shrank=workload_shrank,
+            wash_deadline=wash_deadline,
         )
         all_assignments.extend(result["assignments"])
         all_overloads.extend(result["overloads"])
@@ -168,7 +187,9 @@ def _solve_group(
     _chunked: bool = False,
     reschedule_hint: Optional[Dict[str, Any]] = None,
     workload_shrank: bool = False,
+    wash_deadline: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
+    wash_deadline = wash_deadline or {}
     # Split pinned vs free tasks.
     # Pinned tasks have fixed start/end and must NOT consume batch slots or
     # receive shift-boundary constraints (they are already scheduled and immovable).
@@ -181,6 +202,15 @@ def _solve_group(
     free_tasks   = [t for t in group_tasks if not t.get("is_pinned")]
     n            = len(free_tasks)
     all_task_ids = [t["task_id"] for t in group_tasks]
+
+    # Per-task duration and lead-adjusted deadline lookups (used by the co-location
+    # gate and the keep-override).  _deadline falls back to the raw due when no
+    # lead-adjusted value was supplied (e.g. virtual-pinned handoff tasks).
+    _dur     = {t["task_id"]: max(0, int(t.get("duration", 0))) for t in group_tasks}
+    _due_raw = {t["task_id"]: int(t.get("due_at_min", horizon)) for t in group_tasks}
+
+    def _deadline(t_id: str) -> int:
+        return wash_deadline.get(t_id, _due_raw.get(t_id, horizon))
 
     # Compute K from free tasks only
     _raw_qtys   = {t["task_id"]: max(0, int(t.get("qty") or 0)) for t in free_tasks}
@@ -224,6 +254,7 @@ def _solve_group(
                 group_key, pinned_tasks, free_tasks,
                 resources, config, horizon, capacity, start_lb, shift_ends,
                 workload_shrank=workload_shrank,
+                wash_deadline=wash_deadline,
             )
 
     logger.info(
@@ -334,37 +365,70 @@ def _solve_group(
                 model.Add(tv["end"] <= S).OnlyEnforceIf(b)
                 model.Add(tv["start"] >= S).OnlyEnforceIf(b.Not())
 
-    if actual_free_qty <= capacity and len(free_scheduled_ids) > 1:
-        # Intersection of compatible machines across all free tasks.
-        # Non-empty → all tasks can physically share one machine.
+    # ── Deadline-driven co-location filter (Part 1: the kẹp fix) ─────────────
+    # HARD co-location forces every member into one slot whose start is bounded
+    # below by the LATEST ready-time in the set (batch_start ≥ max start_lb).  If
+    # one member is slow-to-be-ready (late linking) it drags the whole batch late.
+    # A task must NOT be force-co-located if doing so would push it past its own
+    # lead-adjusted deadline.  We compute the co-locatable subset by iteratively
+    # dropping, highest-start_lb first, any member that would be late at the set's
+    # current max start_lb — so dropping a late dragger lowers the max and lets the
+    # remaining tasks re-qualify (avoids over-splitting tasks that were only "late"
+    # because of the dragger).  Dropped tasks keep their free slot variables and
+    # take an early slot on their own.  This is asymmetric by construction: a
+    # slow-but-loose-deadline order stays eligible and may still join an early
+    # batch (the allowed direction); only would-be-late members are released.
+    def _coloc_eligible(ids: List[str]) -> List[str]:
+        coloc = list(ids)
+        while len(coloc) > 1:
+            m = max(group_start_lb.get(t_id, 0) for t_id in coloc)
+            dragged = [t_id for t_id in coloc if m + _dur[t_id] > _deadline(t_id)]
+            if not dragged:
+                break
+            drop = max(dragged, key=lambda t_id: (group_start_lb.get(t_id, 0), t_id))
+            coloc.remove(drop)
+        return coloc
+
+    coloc_ids = _coloc_eligible(free_scheduled_ids)
+    coloc_qty = sum(task_qtys[t_id] for t_id in coloc_ids)
+    if len(coloc_ids) < len(free_scheduled_ids):
+        logger.info(
+            f"   🎯 Group {group_key}: {len(free_scheduled_ids) - len(coloc_ids)} "
+            f"task(s) released from co-location to meet deadline; "
+            f"{len(coloc_ids)} remain co-locatable"
+        )
+
+    if coloc_qty <= capacity and len(coloc_ids) > 1:
+        # Intersection of compatible machines across the co-locatable tasks.
+        # Non-empty → they can physically share one machine.
         common_machines: Optional[set] = None
-        for t_id in free_scheduled_ids:
+        for t_id in coloc_ids:
             t_m = set(task_vars[t_id].get("r_ids") or [])
             common_machines = t_m if common_machines is None else common_machines & t_m
         common_machines = common_machines or set()
 
         group_machine_ids: set = set()
-        for t_id in free_scheduled_ids:
+        for t_id in coloc_ids:
             group_machine_ids.update(task_vars[t_id].get("r_ids") or [])
         n_machines = len(group_machine_ids)
 
         if common_machines:
             # ── Slot co-location (same batch cycle) ──────────────────────────
-            t0 = free_scheduled_ids[0]
-            for t_other in free_scheduled_ids[1:]:
+            t0 = coloc_ids[0]
+            for t_other in coloc_ids[1:]:
                 for k in range(K):
                     model.Add(x[t0][k] == x[t_other][k])
 
             # ── Machine co-location (same machine) ───────────────────────────
-            # 1. Restrict every task to only machines in the intersection.
-            for t_id in free_scheduled_ids:
+            # 1. Restrict every co-located task to only machines in the intersection.
+            for t_id in coloc_ids:
                 t_rids = task_vars[t_id].get("r_ids") or []
                 t_lits = task_vars[t_id].get("literals") or []
                 for i, m_id in enumerate(t_rids):
                     if i < len(t_lits) and m_id not in common_machines:
                         model.AddBoolAnd([t_lits[i].Not()])
 
-            # 2. Force all tasks to match t0's machine choice.
+            # 2. Force all co-located tasks to match t0's machine choice.
             t0_rids = task_vars[t0].get("r_ids") or []
             t0_lits = task_vars[t0].get("literals") or []
             t0_ml = {
@@ -372,7 +436,7 @@ def _solve_group(
                 for i in range(min(len(t0_rids), len(t0_lits)))
                 if t0_rids[i] in common_machines
             }
-            for t_other in free_scheduled_ids[1:]:
+            for t_other in coloc_ids[1:]:
                 t_other_rids = task_vars[t_other].get("r_ids") or []
                 t_other_lits = task_vars[t_other].get("literals") or []
                 t_other_ml = {
@@ -387,24 +451,24 @@ def _solve_group(
 
             logger.info(
                 f"   🔒 Group {group_key}: co-located (slot + machine) "
-                f"(free_qty={actual_free_qty}≤cap={capacity}, "
+                f"(coloc_qty={coloc_qty}≤cap={capacity}, "
                 f"common_machines={len(common_machines)})"
             )
-        elif n_machines >= len(free_scheduled_ids):
-            # No single machine can hold all tasks, but enough machines exist
-            # for each task — force same slot (sequential batches still pack tightly).
-            t0 = free_scheduled_ids[0]
-            for t_other in free_scheduled_ids[1:]:
+        elif n_machines >= len(coloc_ids):
+            # No single machine can hold all co-located tasks, but enough machines
+            # exist for each — force same slot (sequential batches still pack tightly).
+            t0 = coloc_ids[0]
+            for t_other in coloc_ids[1:]:
                 for k in range(K):
                     model.Add(x[t0][k] == x[t_other][k])
             logger.info(
                 f"   🔒 Group {group_key}: slot co-located (no common machine, "
-                f"{n_machines} machines ≥ {len(free_scheduled_ids)} tasks)"
+                f"{n_machines} machines ≥ {len(coloc_ids)} tasks)"
             )
         else:
             logger.info(
                 f"   ⚡ Group {group_key}: NOT co-located "
-                f"(only {n_machines} machines < {len(free_scheduled_ids)} tasks — will serialize)"
+                f"(only {n_machines} machines < {len(coloc_ids)} tasks — will serialize)"
             )
 
     # ── Batch end times (Condition 1: same-slot tasks end together) ─────────
@@ -433,6 +497,10 @@ def _solve_group(
         r_id for t_id in free_scheduled_ids
         for r_id in (task_vars[t_id].get("r_ids") or [])
     })
+    # slot_on_m literals collected per machine so we can derive, after the loop,
+    # machine_ever_used[m] = OR_k slot_on_m[k] (see machine-consolidation term in
+    # the objective below).  Keyed by m_id (group_machine_ids is sorted → det.).
+    machine_slot_lits: Dict[str, List] = {}
     for m_id in group_machine_ids:
         machine_batch_ivs: List = []
         for k in range(K):
@@ -454,6 +522,7 @@ def _solve_group(
             slot_on_m = model.NewBoolVar(f"slot_on_{m_id}_{k}")
             model.AddBoolOr(prods).OnlyEnforceIf(slot_on_m)
             model.AddBoolAnd([p.Not() for p in prods]).OnlyEnforceIf(slot_on_m.Not())
+            machine_slot_lits.setdefault(m_id, []).append(slot_on_m)
 
             # Duration of the batch cycle on this machine
             batch_dur_km = model.NewIntVar(0, horizon, f"batch_dur_{m_id}_{k}")
@@ -485,8 +554,44 @@ def _solve_group(
     for k in range(K):
         obj_terms.append(batch_ends[k] * 1)
 
+    # ── Machine-consolidation cost ────────────────────────────────────────────
+    # Penalise the NUMBER of distinct machines ever used (machine_ever_used[m] =
+    # OR_k slot_on_m[k]).  Without this, the objective rewards early starts/ends so
+    # the solver runs ≥2 batch slots PARALLEL on separate machines (both finish
+    # early) even when SEQUENTIAL on one machine is fine — wasting electricity.
+    #
+    # The competitor that decides parallel-vs-sequential is the per-task earliest-
+    # start tie-breaker in apply_soft_deadlines (`start × start_coeff`,
+    # start_coeff = max(1, weight//100)) PLUS batch_starts/ends (×1).  Both the
+    # start tie-breaker AND the lateness/is_late penalties scale with a task's
+    # weight = 10**(6-priority), so a FLAT machine_w cannot simultaneously beat the
+    # start tie-breaker of a priority-3 group (needs > ~1300) and stay below the
+    # lateness floor of a priority-5 group (1000/min) — the bands don't overlap.
+    #
+    # Fix: scale machine_w to the group's LOWEST-priority (largest, most easily
+    # delayed → most vulnerable to lateness) task:
+    #   machine_w = 5 * min_weight,   min_weight = min_t 10**(6-priority_t).
+    # • < is_late floor (min_weight*10) and ≪ lateness/min (min_weight*100) → a
+    #   flipped-late task always costs far more than a saved machine → NEVER trades
+    #   a machine for tardiness, at ANY priority (safe by construction).
+    # • > start_coeff (=min_weight//100) by 500× → beats the start tie-breaker for
+    #   small groups (few short batches), consolidating the wasteful cases, while a
+    #   large group's start-mass (∝ N²) still dwarfs it → large groups stay parallel.
+    # • ≪ re-schedule machine-swap weight (50_000 at default p3) → never overrides
+    #   stability on a warm re-solve.
+    _prio_of = {t["task_id"]: int(t.get("priority", 5)) for t in group_tasks}
+    _free_prios = [_prio_of.get(t_id, 5) for t_id in free_scheduled_ids]
+    min_weight = min((10 ** (6 - p) for p in _free_prios), default=10 ** (6 - 5))
+    machine_w = 5 * min_weight
+    for m_id in sorted(machine_slot_lits):
+        used_m = model.NewBoolVar(f"mach_used_{group_key}_{m_id}")
+        model.AddMaxEquality(used_m, machine_slot_lits[m_id])
+        obj_terms.append(used_m * machine_w)
+
     task_map = {t["task_id"]: t for t in group_tasks}
-    obj_terms += apply_soft_deadlines(model, task_vars, task_map, horizon)
+    obj_terms += apply_soft_deadlines(
+        model, task_vars, task_map, horizon, deadline_override=wash_deadline
+    )
 
     # workload_shrank is detected at the pipeline level (before hint partitioning
     # drops the removed tasks) and threaded in.  On a shrink (orders removed) the
@@ -552,6 +657,13 @@ def _solve_group(
                 if tid not in x:
                     continue
                 tv = task_vars[tid]
+                # Keep-override (Part 3): never re-pin a task to a previous slot
+                # whose start would miss its lead-adjusted deadline.  Releasing it
+                # entirely (no warm-start hint, no hard keep, no soft anchor) lets
+                # it slide to an early slot — the deadline WINS the stability keep,
+                # so a re-schedule can't clamp an urgent order at a stale late slot.
+                if p_start + _dur[tid] > _deadline(tid):
+                    continue
                 if not workload_shrank:
                     for k in range(K):
                         model.AddHint(x[tid][k], 1 if k == slot_idx else 0)
@@ -745,6 +857,7 @@ def _solve_group_chunked(
     start_lb: Dict[str, int],
     shift_ends: List[int],
     workload_shrank: bool = False,
+    wash_deadline: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """
     Solve a large group by splitting free tasks into time-sorted chunks and
@@ -794,6 +907,7 @@ def _solve_group_chunked(
             shift_ends=shift_ends,
             _chunked=True,
             workload_shrank=workload_shrank,
+            wash_deadline=wash_deadline,
         )
 
         # Filter virtual pinned tasks out of results before aggregating
@@ -939,6 +1053,52 @@ def _fallback_end_times(
             duration = max(0, int(t.get("duration", 0)))
             result[t_id] = lb + duration
     return result
+
+
+def _compute_downstream_lead(all_tasks: List[Dict[str, Any]]) -> Dict[str, int]:
+    """
+    lead[t] = the longest total duration that must still run AFTER task t finishes,
+    following the final_depends_on dependency graph downstream (i.e. iron + pack
+    for a washing task).  Washing is mid-pipeline, so the order's true latest
+    washing-completion is due_at_min − lead[t], not due_at_min.
+
+    Implementation: build the reversed graph (dependency → dependents), then
+    lead[t] = max over direct dependents c of tail(c), where
+    tail(c) = duration(c) + max(tail of c's dependents, 0)   (longest path, not sum).
+    Deterministic (pure arithmetic over the task list); cycle-safe via a recursion
+    stack guard.  A task with no downstream work has lead 0.
+    """
+    by_id = {t["task_id"]: t for t in all_tasks}
+    children: Dict[str, List[str]] = {}
+    for t in all_tasks:
+        for dep in (t.get("final_depends_on") or []):
+            children.setdefault(dep, []).append(t["task_id"])
+
+    tail_memo: Dict[str, int] = {}
+
+    def tail(tid: str, stack: set) -> int:
+        if tid in tail_memo:
+            return tail_memo[tid]
+        if tid in stack:
+            return 0  # cycle guard (graph is expected to be a DAG)
+        stack.add(tid)
+        dur = max(0, int(by_id.get(tid, {}).get("duration", 0)))
+        best_child = 0
+        for c in children.get(tid, []):
+            best_child = max(best_child, tail(c, stack))
+        stack.discard(tid)
+        val = dur + best_child
+        tail_memo[tid] = val
+        return val
+
+    lead: Dict[str, int] = {}
+    for t in all_tasks:
+        tid = t["task_id"]
+        best = 0
+        for c in children.get(tid, []):
+            best = max(best, tail(c, set()))
+        lead[tid] = best
+    return lead
 
 
 def _compute_start_lb(

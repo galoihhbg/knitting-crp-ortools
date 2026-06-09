@@ -129,6 +129,7 @@ class Pipeline:
             horizon=global_horizon,
             reschedule_hint=p3_hint,
             workload_shrank=self.workload_shrank,
+            all_pipeline_tasks=self.tasks,
         )
         logger.info(
             f"✅ Phase 3 complete: {len(p3.assignments)} assignments, "

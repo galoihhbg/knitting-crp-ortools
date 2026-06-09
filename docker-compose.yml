@@ -29,7 +29,7 @@ services:
       - ./logs:/app/logs
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - WEBHOOK_URL=http://api:8082/capacity-planning/complete
+      - WEBHOOK_URL=http://api-vn:8082/capacity-planning/complete
       - PORT=8083
     networks:
       - app-network
