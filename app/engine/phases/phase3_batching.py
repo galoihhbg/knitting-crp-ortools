@@ -131,6 +131,13 @@ def solve_washing(
         reschedule_hint.get("_washing_groups") if reschedule_hint else None
     )
 
+    # Cross-group machine occupancy.  Groups are solved sequentially (sorted), each
+    # in an isolated model that cannot see the others.  We accumulate every batch
+    # cycle window each group places on a machine and feed it to all LATER groups
+    # as reserved_windows, so the per-machine NoOverlap forbids two groups from
+    # double-booking the same washing machine at overlapping times.
+    reserved_windows: Dict[str, set] = {}
+
     for group_key, group_tasks in sorted(groups.items()):
         group_hint = None
         if reschedule_hint and washing_groups_hint:
@@ -154,12 +161,22 @@ def solve_washing(
             reschedule_hint=group_hint,
             workload_shrank=workload_shrank,
             wash_deadline=wash_deadline,
+            reserved_windows=reserved_windows,
         )
         all_assignments.extend(result["assignments"])
         all_overloads.extend(result["overloads"])
         all_batches.extend(result["batches"])
         all_end_times.update(result["end_times"])
         total_solve_time += result["solve_time"]
+
+        # Reserve this group's placed batch cycles for all later groups.  Dedup by
+        # (machine, start, end): batch-mates share one window → one reservation.
+        for a in result["assignments"]:
+            m = a.get("machine_id")
+            s = a.get("start_time")
+            e = a.get("end_time")
+            if m and s is not None and e is not None and int(e) > int(s):
+                reserved_windows.setdefault(m, set()).add((int(s), int(e)))
 
     return Phase3Result(
         status="feasible" if all_assignments or not washing_tasks else "infeasible",
@@ -188,6 +205,7 @@ def _solve_group(
     reschedule_hint: Optional[Dict[str, Any]] = None,
     workload_shrank: bool = False,
     wash_deadline: Optional[Dict[str, int]] = None,
+    reserved_windows: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     wash_deadline = wash_deadline or {}
     # Split pinned vs free tasks.
@@ -255,6 +273,7 @@ def _solve_group(
                 resources, config, horizon, capacity, start_lb, shift_ends,
                 workload_shrank=workload_shrank,
                 wash_deadline=wash_deadline,
+                reserved_windows=reserved_windows,
             )
 
     logger.info(
@@ -501,6 +520,47 @@ def _solve_group(
     # machine_ever_used[m] = OR_k slot_on_m[k] (see machine-consolidation term in
     # the objective below).  Keyed by m_id (group_machine_ids is sorted → det.).
     machine_slot_lits: Dict[str, List] = {}
+
+    # ── Committed (fully-pinned) batch windows per machine ────────────────────
+    # The free batch-slot intervals above are the ONLY members of the per-machine
+    # AddNoOverlap below, so a free batch could land ON TOP of a committed batch
+    # already running on that machine (those committed intervals live only in the
+    # cap>1 AddCumulative of build_resource_model, which permits overlap up to
+    # capacity → double-booking).  Inject one FIXED interval per committed
+    # (machine, start, end) WINDOW into the NoOverlap set so each washing machine
+    # runs one cycle at a time, committed cycles included.
+    #
+    # Grouped by (start, end) — one interval per window, NOT per task.  A
+    # multi-task committed batch shares a single window; a per-task interval would
+    # make those batch-mates overlap each other → self-conflict → infeasible.
+    pinned_windows: Dict[str, set] = {}
+    for t in pinned_tasks:
+        ps = t.get("pinned_start_time")
+        pe = t.get("pinned_end_time")
+        if ps is None or pe is None or int(pe) <= int(ps):
+            continue
+        m_eff = t.get("pinned_machine_id") or next(
+            iter(t.get("compatible_resource_ids") or []), None
+        )
+        if m_eff is None:
+            continue
+        pinned_windows.setdefault(m_eff, set()).add((int(ps), int(pe)))
+
+    # Cross-group machine reservations.  Phase 3 solves each (color, substance)
+    # group in its OWN isolated model, so the per-machine NoOverlap below sees only
+    # THIS group's intervals.  Two different groups could otherwise place batches on
+    # the same washing machine at overlapping times (a real double-booking observed
+    # in production: White/Cotton vs Mocha/Cotton both on W_WASHING_02).  solve_washing
+    # accumulates the (machine, start, end) windows already taken by earlier-solved
+    # groups and passes them here; we fold them into pinned_windows so they occupy
+    # the machine in the NoOverlap (one washing cycle at a time, across groups too).
+    # These are NOT added to build_resource_model's AddCumulative — they are not
+    # tasks of this group, only machine-occupancy blockers for the NoOverlap.
+    for m_eff, wins in (reserved_windows or {}).items():
+        for (ps, pe) in wins:
+            if pe > ps:
+                pinned_windows.setdefault(m_eff, set()).add((int(ps), int(pe)))
+
     for m_id in group_machine_ids:
         machine_batch_ivs: List = []
         for k in range(K):
@@ -533,6 +593,17 @@ def _solve_group(
                 slot_on_m, f"batch_iv_{m_id}_{k}",
             )
             machine_batch_ivs.append(batch_iv)
+
+        # Committed batch windows on this machine (sorted → deterministic build
+        # order).  Fixed intervals, no new BoolVars.  Even a machine with a single
+        # free slot now gets a NoOverlap once a committed window is present, which
+        # is exactly the previously-uncovered case (1 free iv → len==1 → skipped).
+        for (ps, pe) in sorted(pinned_windows.get(m_id, ())):
+            machine_batch_ivs.append(
+                model.NewFixedSizeIntervalVar(
+                    ps, pe - ps, f"committed_iv_{m_id}_{ps}_{pe}"
+                )
+            )
 
         if len(machine_batch_ivs) > 1:
             model.AddNoOverlap(machine_batch_ivs)
@@ -858,6 +929,7 @@ def _solve_group_chunked(
     shift_ends: List[int],
     workload_shrank: bool = False,
     wash_deadline: Optional[Dict[str, int]] = None,
+    reserved_windows: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Solve a large group by splitting free tasks into time-sorted chunks and
@@ -908,6 +980,7 @@ def _solve_group_chunked(
             _chunked=True,
             workload_shrank=workload_shrank,
             wash_deadline=wash_deadline,
+            reserved_windows=reserved_windows,
         )
 
         # Filter virtual pinned tasks out of results before aggregating
