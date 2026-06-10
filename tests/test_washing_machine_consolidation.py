@@ -251,3 +251,53 @@ def test_guard_clean_single_slot_consolidates():
     )
     starts = {a0["start_time"] for a0 in a}
     assert len(starts) == 1, "Both tasks should share one batch start (one slot)"
+
+
+# ─────────────────── One-slot-one-machine (hard constraint) ────────────────
+
+def _slot_machines(assignments: List[Dict]) -> Dict[str, set]:
+    """batch_slot_id → set of machines used by that slot."""
+    out: Dict[str, set] = {}
+    for a in assignments:
+        out.setdefault(a["batch_slot_id"], set()).add(a["machine_id"])
+    return out
+
+
+def test_no_slot_straddles_two_machines():
+    """A single batch slot (one washing cycle) must run on exactly ONE machine.
+
+    Scenario forces 2 machines: 6 qty-1 tasks, capacity=2 → 3 slots; due=130 makes
+    sequential-on-one-machine (3×60=180) late, so the solver parallelises across
+    WA+WB.  Each slot's qty (≤2) fits one machine, so NONE may straddle.
+
+    Mutation: drop `model.Add(sum(lits) <= 1)` → a slot may split across WA+WB
+    (free objective tie) → a slot maps to 2 machines → this assert fails.
+    """
+    _, a = _solve(
+        "NOSTRADDLE",
+        [_task(f"W{i}", 60, 130, ["WA", "WB"], 1) for i in range(6)],
+        ["WA", "WB"],
+        capacity=2,
+    )
+    straddlers = {sid: ms for sid, ms in _slot_machines(a).items() if len(ms) > 1}
+    assert not straddlers, f"Slot(s) straddle >1 machine: {straddlers}"
+    assert _machines_used(a) == 2, "Scenario should still parallelise across 2 machines"
+
+
+def test_disjoint_coloc_stays_feasible_under_hard_cap():
+    """GUARD for the hard-cap EXCEPTION: when co-located tasks share NO common
+    machine, the slot-only co-location branch deliberately puts them in the same
+    slot on DIFFERENT machines.  The one-slot-one-machine cap is skipped there
+    (slot_machine_cap_ok=False), so this must stay FEASIBLE.
+
+    Mutation: apply Σ_m slot_on_m[k] ≤ 1 unconditionally (drop the gate) → the
+    forced same-slot/different-machine tasks make the model INFEASIBLE.
+    """
+    r, a = _solve(
+        "DISJOINT_COLOC",
+        [_task("W1", 60, 5000, ["WA"], 1), _task("W2", 60, 5000, ["WB"], 1)],
+        ["WA", "WB"],
+        capacity=3,
+    )
+    assert r["status"] in ("feasible", "optimal"), f"disjoint co-location went {r['status']}"
+    assert {a0["task_id"] for a0 in a} == {"W1", "W2"}, "both tasks must be scheduled"

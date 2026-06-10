@@ -417,6 +417,14 @@ def _solve_group(
             f"{len(coloc_ids)} remain co-locatable"
         )
 
+    # One-slot-one-machine is enforced as a hard constraint below (a washing batch
+    # physically runs on a single machine).  The ONE exception is the disjoint
+    # slot-only co-location branch, which deliberately forces co-located tasks that
+    # share NO common machine into the same slot on DIFFERENT machines — there a
+    # Σ_m slot_on_m[k] ≤ 1 would be infeasible.  This flag is cleared only on that
+    # branch so the hard constraint is skipped for the group in that case.
+    slot_machine_cap_ok = True
+
     if coloc_qty <= capacity and len(coloc_ids) > 1:
         # Intersection of compatible machines across the co-locatable tasks.
         # Non-empty → they can physically share one machine.
@@ -476,6 +484,9 @@ def _solve_group(
         elif n_machines >= len(coloc_ids):
             # No single machine can hold all co-located tasks, but enough machines
             # exist for each — force same slot (sequential batches still pack tightly).
+            # This intentionally spreads one slot across machines → the
+            # one-slot-one-machine hard constraint must NOT apply to this group.
+            slot_machine_cap_ok = False
             t0 = coloc_ids[0]
             for t_other in coloc_ids[1:]:
                 for k in range(K):
@@ -520,6 +531,10 @@ def _solve_group(
     # machine_ever_used[m] = OR_k slot_on_m[k] (see machine-consolidation term in
     # the objective below).  Keyed by m_id (group_machine_ids is sorted → det.).
     machine_slot_lits: Dict[str, List] = {}
+    # slot_on_m literals collected per SLOT k → drives the per-slot machine-spread
+    # penalty in the objective (one slot must not straddle several machines when it
+    # fits one).  Keyed by k (range(K) order → deterministic).
+    slot_machine_lits: Dict[int, List] = {}
 
     # ── Committed (fully-pinned) batch windows per machine ────────────────────
     # The free batch-slot intervals above are the ONLY members of the per-machine
@@ -583,6 +598,7 @@ def _solve_group(
             model.AddBoolOr(prods).OnlyEnforceIf(slot_on_m)
             model.AddBoolAnd([p.Not() for p in prods]).OnlyEnforceIf(slot_on_m.Not())
             machine_slot_lits.setdefault(m_id, []).append(slot_on_m)
+            slot_machine_lits.setdefault(k, []).append(slot_on_m)
 
             # Duration of the batch cycle on this machine
             batch_dur_km = model.NewIntVar(0, horizon, f"batch_dur_{m_id}_{k}")
@@ -658,6 +674,29 @@ def _solve_group(
         used_m = model.NewBoolVar(f"mach_used_{group_key}_{m_id}")
         model.AddMaxEquality(used_m, machine_slot_lits[m_id])
         obj_terms.append(used_m * machine_w)
+
+    # ── One-slot-one-machine (HARD) ─────────────────────────────────────────────
+    # machine_w above counts only DISTINCT machines EVER used by the group, so once
+    # a large group lights a 2nd machine for parallelism, spreading any OTHER slot
+    # across that machine too is FREE (used_m already 1).  A single slot whose qty
+    # fits one machine (qty ≤ capacity always — per-slot cap == machine batch cap,
+    # L338) could then split across machines at zero objective cost (observed:
+    # wash_batch_5, 50 qty = cap, split 30/20 over W_WASHING_01+02).
+    #
+    # A SOFT penalty fails exactly here: in a heavily-late group the lateness mass
+    # (~10^8) dwarfs any safe per-slot weight, and the cold solve never reaches
+    # OPTIMAL, so the solver leaves the tie unbroken.  A HARD cap is the right tool:
+    # forbidding the split costs nothing to trade away — a split slot shares one
+    # batch_start so consolidating finishes at the SAME minute (no lateness), and a
+    # slot ≤ cap always fits ONE machine whereas a split needs BOTH machines free in
+    # that window (harder, not easier → never the only feasible option).  Physically
+    # a washing batch runs on a single machine.  Σ_m slot_on_m[k] ≤ 1 per slot.
+    # Skipped only for the disjoint slot-only co-location branch (see above).
+    if slot_machine_cap_ok:
+        for k in range(K):
+            lits = slot_machine_lits.get(k)
+            if lits:
+                model.Add(sum(lits) <= 1)
 
     task_map = {t["task_id"]: t for t in group_tasks}
     obj_terms += apply_soft_deadlines(
