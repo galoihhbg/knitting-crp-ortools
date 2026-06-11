@@ -43,7 +43,16 @@ class Pipeline:
     ) -> None:
         self.config = config
         self.resources = resources
-        self.tasks = _sanitize_dummy_tasks(tasks)
+        # Determinism leg 3 (pairs with num_search_workers=1 + PYTHONHASHSEED=0):
+        # normalise task order by the STABLE key `task_id` at ingest.  build_resource_model
+        # creates CP-SAT start/interval/machine vars + NoOverlap/Cumulative in task-list
+        # order, and the fixed-seed search keys off that creation order — so without this,
+        # the same logical request produces a different schedule whenever Go serialises
+        # `tasks` in a different order (measured: shuffling tasks moved 2–8/90 tasks).
+        # task_id — NOT due/priority — because task_id is invariant across re-schedules:
+        # sorting by due would reshuffle the build order whenever a due changes, churning
+        # unrelated tasks.  task_id gives both determinism AND re-schedule stability.
+        self.tasks = sorted(_sanitize_dummy_tasks(tasks), key=lambda t: t["task_id"])
         self.material_capacities = material_capacities or {}
         self.translation_map: Dict[str, str] = _build_translation_map(self.tasks)
         self.reschedule_hint = reschedule_hint
