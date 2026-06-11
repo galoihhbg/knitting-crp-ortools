@@ -717,6 +717,140 @@ def _solve_knitting_chunked(
 
 
 # ---------------------------------------------------------------------------
+# Cold-only left-shift post-pass (idle compaction without re-solving)
+# ---------------------------------------------------------------------------
+
+def _knitting_workforce_ok(
+    new_start: Dict[str, int],
+    new_end: Dict[str, int],
+    knitting_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> bool:
+    """True iff the compacted schedule keeps (concurrent knitting + active
+    capacity_block demand) ≤ max_factory_machines at every instant — the same
+    AddCumulative invariant `_workforce_cumulative` enforces in the model.
+
+    Half-open intervals [start, end): an interval ending at t does not overlap one
+    starting at t, so ties process end-events (negative delta) before start-events.
+    """
+    MAXM = int(config.get("max_factory_machines", 100))
+    events: List[Any] = []
+    for t_id, s in new_start.items():
+        events.append((s, 1))
+        events.append((new_end[t_id], -1))
+    for t in knitting_tasks:
+        if t.get("operation", "").lower() != "capacity_block":
+            continue
+        demand = int(t.get("demand", 0))
+        if demand <= 0:
+            continue
+        pe = t.get("pinned_end_time")
+        if pe is None:
+            continue
+        pe = int(pe)
+        ps = t.get("pinned_start_time")
+        ps = int(ps) if ps is not None else pe - int(t.get("duration", 0))
+        events.append((ps, demand))
+        events.append((pe, -demand))
+    events.sort()  # (time, delta): ends (negative) before starts at equal time
+    cur = 0
+    for _, d in events:
+        cur += d
+        if cur > MAXM:
+            return False
+    return True
+
+
+def left_shift_cold_knitting(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> int:
+    """COLD-only post-pass on the FINAL pipeline output: pull each knitting task to its
+    earliest feasible start on its OWN machine, preserving per-machine order.
+
+    Runs AFTER every phase (downstream is already scheduled), so it leaves all
+    non-knitting assignments byte-identical and only rewrites knitting start/end in
+    place.  Returns the number of tasks moved.
+
+    Why this is safe — knitting stalls at FEASIBLE so the span objective leaves
+    machines idle even when a task could run earlier on the same machine with NO
+    constraint forcing the gap.  Knitting has no intra-phase precedence / wait_offsets
+    (verified on real payloads), so the only binds are machine no-overlap, release
+    (`start_after_min`) and the workforce cumulative cap:
+      * no-overlap & release  — preserved by construction (start = max(release, prev_end));
+      * workforce             — validated by `_knitting_workforce_ok`; if a shift would
+                                ever exceed the cap the schedule is left UNCHANGED;
+      * downstream precedence  — every knitting task only moves EARLIER, so any
+                                downstream task D with D.start ≥ old_knit_end still
+                                satisfies D.start ≥ new_knit_end (the bound only relaxes);
+      * end-to-end lateness    — knitting ends move earlier (tardiness ≤) and every
+                                downstream task is left untouched ⇒ total lateness is
+                                monotonically non-increasing.
+
+    Pinned (in-progress) tasks are immovable anchors.  Deterministic O(n log n).
+    NOT applied on re-schedule (knitting is hard-kept there — would fight the keep).
+    """
+    info = {t["task_id"]: t for t in all_tasks}
+    by_machine: Dict[str, List[Dict[str, Any]]] = {}
+    for a in assignments:
+        t = info.get(a["task_id"])
+        if t is None or t.get("operation", "").lower() != "knitting":
+            continue
+        by_machine.setdefault(a["machine_id"], []).append(a)
+    if not by_machine:
+        return 0
+
+    new_start: Dict[str, int] = {}
+    new_end: Dict[str, int] = {}
+    for _m, items in by_machine.items():
+        items.sort(key=lambda a: (a["start_time"], a["end_time"], a["task_id"]))
+        prev_end = 0
+        for a in items:
+            t_id = a["task_id"]
+            if info[t_id].get("is_pinned"):
+                # in-progress / frozen — immovable anchor, keep solver position
+                new_start[t_id] = a["start_time"]
+                new_end[t_id] = a["end_time"]
+                prev_end = a["end_time"]
+                continue
+            sa = int(info[t_id].get("start_after_min", 0))
+            dur = int(a["end_time"]) - int(a["start_time"])
+            ns = max(sa, prev_end)
+            new_start[t_id] = ns
+            new_end[t_id] = ns + dur
+            prev_end = ns + dur
+
+    knitting_tasks = [t for t in all_tasks
+                      if t.get("operation", "").lower() in ("knitting", "capacity_block")]
+    if not _knitting_workforce_ok(new_start, new_end, knitting_tasks, config):
+        logger.warning(
+            "⚠️ Cold knitting left-shift SKIPPED: compaction would exceed workforce cap "
+            "— keeping solver schedule unchanged."
+        )
+        return 0
+
+    moved = 0
+    for a in assignments:
+        t_id = a["task_id"]
+        if t_id not in new_start:
+            continue
+        if a["start_time"] != new_start[t_id]:
+            moved += 1
+        a["start_time"] = new_start[t_id]
+        a["end_time"] = new_end[t_id]
+        due = int(info[t_id].get("due_at_min", new_end[t_id] + 1))
+        a["status"] = "LATE" if new_end[t_id] > due else "ON_TIME"
+
+    if moved:
+        logger.info(
+            f"   ⬅️ Cold knitting left-shift: pulled {moved} task(s) to earliest "
+            f"feasible start (same-machine idle compaction, downstream untouched)."
+        )
+    return moved
+
+
+# ---------------------------------------------------------------------------
 # Workforce constraints (AddCumulative with capacity_block + gap-filler)
 # ---------------------------------------------------------------------------
 

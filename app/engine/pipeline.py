@@ -21,7 +21,12 @@ Returns the same dict format as the legacy Engine.solve():
 import logging
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .phases.phase1_knitting import PHASE1_OPS, Phase1Result, solve_knitting
+from .phases.phase1_knitting import (
+    PHASE1_OPS,
+    Phase1Result,
+    left_shift_cold_knitting,
+    solve_knitting,
+)
 from .shared import compute_global_horizon, diagnose_infeasibility
 from .phases.phase2_linking import PHASE2_OPS, Phase2Result, solve_linking
 from .phases.phase3_batching import PHASE3_OPS, Phase3Result, solve_washing
@@ -190,6 +195,16 @@ class Pipeline:
             p1.assignments + p2.assignments + p3.assignments
             + p4.assignments + p5.assignments
         )
+
+        # Cold-only knitting idle compaction (post-pass on the FINAL output).
+        # Knitting stalls at FEASIBLE, so the span objective leaves machines idle
+        # even when a task could run earlier on the same machine.  This pulls each
+        # cold knitting task to its earliest feasible start (same machine, in order);
+        # it runs AFTER every phase so downstream stays byte-identical and end-to-end
+        # lateness is monotonically non-increasing (knitting only moves earlier).
+        # Skipped on re-schedule — knitting is hard-kept there.
+        if not self.reschedule_hint:
+            left_shift_cold_knitting(all_assignments, self.tasks, self.config)
         all_overloads = (
             p1.overloads + p2.overloads + p3.overloads
             + p4.overloads + p5.overloads
