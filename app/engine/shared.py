@@ -546,6 +546,41 @@ def compute_affinity_penalty(
 
 
 # ---------------------------------------------------------------------------
+# Pinned-window normalisation
+# ---------------------------------------------------------------------------
+
+def normalize_pinned_window(task: Dict[str, Any]) -> None:
+    """Fill in a partially-specified pin so it can be fully anchored.
+
+    An in-progress task may arrive pinned with only ONE endpoint set — in
+    production the Go side sends `pinned_end_time` with `pinned_start_time=None`
+    for work already running.  `is_fully_pinned` (build_resource_model) and the
+    washing committed-window reservation (phase3) both require BOTH endpoints, so
+    a one-sided pin is treated as time-free: the solver floats it off its real
+    machine slot and a new task gets booked on top of it (overlap).
+
+    Infer the missing endpoint from `duration` (the segment length — verified
+    against fully-specified pins where pinned_end - pinned_start == duration), so
+    the task becomes fully pinned at [origin, end] and its slot is reserved.
+    Mutates the task in place; idempotent; a no-op for free tasks, fully-specified
+    pins, or non-positive duration (cannot infer a real window).
+    """
+    if not task.get("is_pinned"):
+        return
+    ps = task.get("pinned_start_time")
+    pe = task.get("pinned_end_time")
+    if (ps is None) == (pe is None):
+        return  # both set (already full) or both None (no anchor possible)
+    dur = int(task.get("duration", 0) or 0)
+    if dur <= 0:
+        return  # cannot infer a window without a positive duration
+    if ps is None:
+        task["pinned_start_time"] = int(pe) - dur
+    else:
+        task["pinned_end_time"] = int(ps) + dur
+
+
+# ---------------------------------------------------------------------------
 # Core model builder
 # ---------------------------------------------------------------------------
 
@@ -603,6 +638,15 @@ def build_resource_model(
         seen_ids.add(t["task_id"])
         deduped.append(t)
     tasks = deduped
+
+    # ── Anchor partially-specified pins ─────────────────────────────────────
+    # An in-progress task may be pinned with only one endpoint (e.g. Go sends
+    # pinned_end_time with pinned_start_time=None).  Infer the missing endpoint
+    # from duration so it is treated as fully pinned below and its machine slot
+    # is reserved in NoOverlap/Cumulative — otherwise the solver floats it off
+    # its real slot and a new task gets booked on top of it.
+    for t in tasks:
+        normalize_pinned_window(t)
 
     # ── Step 1: create start/end IntVars ────────────────────────────────────
     for t in tasks:
