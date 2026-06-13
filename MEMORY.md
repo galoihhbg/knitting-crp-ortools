@@ -66,3 +66,4 @@ DO NOT delete historical context if it is still relevant. Compress older complet
 - [x] Phase 1: Wire random_seed, root-cause classifier, ghost-task guard, overload diagnostic, dynamic weights
 - [x] Phase 2: Benchmark harness, soft pipeline offsets, boolean exclusion workforce mode
 - [x] Phase 3: Webhook retry + structured logging, enhanced /health, E2E test suite (22 tests)
+- [x] EDD knitting warm-start (2026-06-12): cold-path AddHint seed via `_edd_warm_start_assignments` + `apply_stability_hints_only` (zero constraints/objective; workforce-aware greedy, pins/blocks/unavailability respected). Real-solve: −75% tot-late, −4 late orders (626-task payload), determinism intact, +53% phase-1 wall. Flag `enable_edd_knitting_hint` (default True). Tests: tests/test_edd_knitting_hint.py (8). Validate-under-caps PHA-V passed (workforce OK, material no-worse; creel constraint currently disabled in phase1).

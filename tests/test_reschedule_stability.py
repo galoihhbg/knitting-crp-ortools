@@ -1370,6 +1370,13 @@ def tight_due_payload(symmetric_payload) -> Dict[str, Any]:
         if t.get("operation") == "knitting":
             t["due_at_min"] = 100
             t["priority"] = 3
+    # The EDD warm-start hint anchors cold solves to the same incumbent across
+    # seeds/workers — it stabilises so well that the mutation guard's natural
+    # drift (≥1 task moves on perturbed seed WITHOUT a keep) disappears and the
+    # fixture can no longer demonstrate that reified-keep adds value.  These
+    # tests study the keep mechanism in isolation, so disable the extra
+    # stabiliser here.
+    p["config"]["enable_edd_knitting_hint"] = False
     return p
 
 

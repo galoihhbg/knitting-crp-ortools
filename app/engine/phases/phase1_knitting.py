@@ -9,6 +9,7 @@ Handles:
 Output: start_times + end_times for all knitting tasks, used by Phase 2 as
 lower bounds via final_depends_on and wait_offsets resolution.
 """
+import bisect
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -463,6 +464,21 @@ def solve_knitting(
             f"dropped_pinned={keep_info['n_dropped_pinned']} "
             f"dropped_other={keep_info['n_dropped_other']}"
         )
+    elif config.get("enable_edd_knitting_hint", True):
+        # Cold solve: EDD warm-start (hints-only, zero objective/constraints).
+        # Cold knitting hay dừng ở FEASIBLE với đảo-due trên máy; seed bằng
+        # incumbent earliest-due-date để solver khởi đầu từ lịch đã đúng thứ tự
+        # due rồi tự cải thiện — xem _edd_warm_start_assignments.
+        edd_prev = _edd_warm_start_assignments(knitting_tasks, resource_map, config)
+        if edd_prev:
+            _, edd_stats = apply_stability_hints_only(
+                model, task_vars, knitting_tasks,
+                {"previous_assignments": edd_prev, "match_by_order_fallback": False},
+                horizon,
+            )
+            logger.info(
+                f"   🧭 Phase1 EDD warm-start: hinted {edd_stats.n_hinted}/{len(edd_prev)} cold tasks"
+            )
 
     validation = model.Validate()
     if validation:
@@ -719,6 +735,135 @@ def _solve_knitting_chunked(
 # ---------------------------------------------------------------------------
 # Cold-only left-shift post-pass (idle compaction without re-solving)
 # ---------------------------------------------------------------------------
+
+def _edd_warm_start_assignments(
+    knitting_tasks: List[Dict[str, Any]],
+    resource_map: Dict[str, Dict[str, Any]],
+    config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Lịch EDD-greedy dùng làm AddHint warm-start cho cold solve (KHÔNG phải nghiệm).
+
+    Vì sao: cold knitting thường dừng ở FEASIBLE với 6–15% cặp đảo-due trên cùng
+    máy (đo trên payload thật); seed search bằng một incumbent earliest-due-date
+    gỡ 79–85% tổng phút trễ đơn trong replay offline.  Hint đi qua
+    apply_stability_hints_only → ZERO ràng buộc/objective mới: model vẫn enforce
+    no-overlap/workforce/release, nên hint tồi chỉ làm chậm search chứ không thể
+    làm hỏng lịch.
+
+    Greedy: task theo (due_at_min, task_id); mỗi task chọn máy compatible có
+    start khả thi sớm nhất (đuôi máy, available_at_min, unavailability, cửa sổ
+    pinned), rồi đẩy phải tới khi occupancy toàn cục (knitting chạy đồng thời +
+    demand capacity_block đang hoạt động) ≤ max_factory_machines — đúng bất biến
+    của _knitting_workforce_ok.  Deterministic (sort theo khóa ổn định).
+    """
+    MAXM = int(config.get("max_factory_machines", 100))
+
+    # Cửa sổ bận cố định per machine: unavailability + pinned knitting.
+    fixed_busy: Dict[str, List[Any]] = {}
+    for r_id, res in resource_map.items():
+        wins = []
+        for w in res.get("unavailability", []) or []:
+            ws, we = int(w["start"]), int(w["end"])
+            if we > ws:
+                wins.append((ws, we))
+        fixed_busy[r_id] = wins
+
+    # Occupancy toàn cục: event (time, delta), giữ sorted để sweep sớm-thoát.
+    occ: List[Any] = []
+
+    def _occ_add(s: int, e: int, dem: int = 1) -> None:
+        bisect.insort(occ, (s, dem))
+        bisect.insort(occ, (e, -dem))
+
+    def _occ_fits(s: int, e: int) -> bool:
+        cur = 0
+        for tm, dl in sorted(occ + [(s, 1), (e, -1)]):
+            cur += dl
+            if cur > MAXM:
+                return False
+            if tm > e:
+                break
+        return True
+
+    def _next_release(t0: int) -> int:
+        for tm, dl in occ:
+            if dl < 0 and tm > t0:
+                return tm
+        return t0 + 1
+
+    movable: List[Dict[str, Any]] = []
+    for t in knitting_tasks:
+        op = t.get("operation", "").lower()
+        if op == "capacity_block":
+            dem = int(t.get("demand", 0) or 0)
+            pe = t.get("pinned_end_time")
+            if dem > 0 and pe is not None:
+                ps = t.get("pinned_start_time")
+                ps = int(ps) if ps is not None else int(pe) - int(t.get("duration", 0) or 0)
+                _occ_add(ps, int(pe), dem)
+            continue
+        if op != "knitting":
+            continue
+        if t.get("is_pinned"):
+            ps, pe = t.get("pinned_start_time"), t.get("pinned_end_time")
+            if ps is not None and pe is not None:
+                _occ_add(int(ps), int(pe))
+                m = t.get("pinned_machine_id")
+                if m in fixed_busy:
+                    fixed_busy[m].append((int(ps), int(pe)))
+            continue
+        movable.append(t)
+
+    for wins in fixed_busy.values():
+        wins.sort()
+
+    machine_tail: Dict[str, int] = {
+        r_id: int(res.get("available_at_min", 0) or 0)
+        for r_id, res in resource_map.items()
+    }
+
+    out: List[Dict[str, Any]] = []
+    movable.sort(key=lambda t: (int(t.get("due_at_min", 0) or 0) or 10**9, t["task_id"]))
+    for t in movable:
+        dur = max(0, int(t.get("duration", 0) or 0))
+        release = int(t.get("start_after_min", 0) or 0)
+        compatible = [m for m in (t.get("compatible_resource_ids") or []) if m in machine_tail]
+        if not compatible:
+            continue
+
+        def _machine_start(m: str) -> int:
+            st = max(machine_tail[m], release)
+            moved = True
+            while moved:
+                moved = False
+                for ws, we in fixed_busy[m]:
+                    if st < we and st + dur > ws:
+                        st = we
+                        moved = True
+            return st
+
+        best_m = min(compatible, key=lambda m: (_machine_start(m), m))
+        st = _machine_start(best_m)
+        while dur > 0 and not _occ_fits(st, st + dur):
+            st = _next_release(st)
+            moved = True
+            while moved:  # đẩy qua workforce có thể rơi vào cửa sổ bận của máy
+                moved = False
+                for ws, we in fixed_busy[best_m]:
+                    if st < we and st + dur > ws:
+                        st = we
+                        moved = True
+        if dur > 0:
+            _occ_add(st, st + dur)
+        machine_tail[best_m] = st + dur
+        out.append({
+            "task_id": t["task_id"],
+            "machine_id": best_m,
+            "start_time": st,
+            "end_time": st + dur,
+        })
+    return out
+
 
 def _knitting_workforce_ok(
     new_start: Dict[str, int],
