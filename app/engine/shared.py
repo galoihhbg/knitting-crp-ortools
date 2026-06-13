@@ -581,6 +581,37 @@ def normalize_pinned_window(task: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Monotone end caps (Pareto guard for two-pass refinement solves)
+# ---------------------------------------------------------------------------
+
+def apply_end_caps(
+    model: cp_model.CpModel,
+    task_vars: Dict[str, Dict[str, Any]],
+    end_caps: Dict[str, int],
+) -> int:
+    """Cap mỗi task: end ≤ end của pass trước (Pareto guard).
+
+    Pass 2 của một solve tinh-chỉnh (vd. nới floor linking theo same-qty) chỉ
+    được phép ra lịch điểm-theo-điểm KHÔNG MUỘN HƠN pass 1 — nhờ đó không task
+    nào (và không đơn nào) có thể trễ hơn baseline, theo cấu trúc chứ không phải
+    may rủi.  Nghiệm pass 1 luôn thỏa mọi cap nên model vẫn khả thi.
+
+    Pinned tasks bị bỏ qua: end của chúng là hằng số giống hệt giữa hai pass;
+    thêm cap chỉ thừa, và một pin lệch (dữ liệu xấu) sẽ làm cả model INFEASIBLE.
+
+    Returns: số cap đã thêm.
+    """
+    n = 0
+    for t_id, cap in end_caps.items():
+        tv = task_vars.get(t_id)
+        if tv is None or tv.get("is_pinned"):
+            continue
+        model.Add(tv["end"] <= int(cap))
+        n += 1
+    return n
+
+
+# ---------------------------------------------------------------------------
 # Core model builder
 # ---------------------------------------------------------------------------
 

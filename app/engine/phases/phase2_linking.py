@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 from ortools.sat.python import cp_model
 
 from app.engine.shared import (
+    apply_end_caps,
     apply_order_flow_objective,
     apply_slice_sync_objective,
     apply_soft_deadlines,
@@ -28,6 +29,108 @@ from app.engine.shared import (
 logger = logging.getLogger(__name__)
 
 PHASE2_OPS = frozenset({"linking"})
+
+
+def balance_linking_load(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    resources: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> int:
+    """COLD-only post-pass: cân tải nhân công linking bằng cách ĐỔI NHÃN MÁY.
+
+    Bài toán thực địa: linking workers nghỉ quá nhiều và tải lệch nặng (một thợ
+    ôm 3000+ phút, thợ khác 0) — đo trên payload thật: stdev tải máy ~965, 4/20
+    máy không việc.  Nguồn gốc: solver chỉ tối ưu trễ-hạn + slice-sync, không có
+    động lực trải việc; các máy linking HOÁN ĐỔI ĐƯỢC (design/color rỗng) nên nó
+    dồn việc lên ít máy tuỳ tiện.
+
+    Cách gỡ an toàn tuyệt đối: GIỮ NGUYÊN [start, end] của mọi task linking, chỉ
+    gán lại máy bằng greedy "tô màu interval" — duyệt theo start, đặt mỗi task lên
+    máy hợp-lệ (trong compatible_resource_ids, rảnh trong [start,end], ngoài cửa
+    sổ unavailability, sau available_at_min) có TẢI HIỆN TẠI THẤP NHẤT.  Vì thời
+    gian không đổi:
+      * downstream byte-identical (chúng phụ thuộc end-time, không phụ thuộc máy);
+      * lateness không đổi; KHÔNG đơn nào trễ hơn (zero regression theo cấu trúc);
+      * no-overlap giữ nguyên (chỉ chọn máy không đè); luôn khả thi vì số máy ≥
+        đỉnh đồng thời (gán cũ đã chứng minh ≤ số máy).
+    Đo: stdev tải 965→40, 0 thợ ngồi không (mọi máy ~tải đều).
+
+    Pinned linking (đang chạy) là mỏ neo bất động — giữ nguyên máy.  Deterministic
+    O(n log n).  KHÔNG chạy khi re-schedule (máy là một phần của stability ở đó).
+    Mutates `assignments` in place (machine_id).  Returns số task được đổi máy.
+    """
+    info = {t["task_id"]: t for t in all_tasks}
+    link_machine_ids = [
+        r["id"] for r in resources if r.get("operation", "").lower() in PHASE2_OPS
+    ]
+    if len(link_machine_ids) < 2:
+        return 0
+    res_by_id = {r["id"]: r for r in resources}
+
+    def _unavail(m_id: str) -> List[Any]:
+        return [
+            (int(w["start"]), int(w["end"]))
+            for w in res_by_id.get(m_id, {}).get("unavailability", []) or []
+            if int(w["end"]) > int(w["start"])
+        ]
+
+    def _avail_at(m_id: str) -> int:
+        return int(res_by_id.get(m_id, {}).get("available_at_min", 0) or 0)
+
+    link_assigns = [
+        a for a in assignments
+        if info.get(a["task_id"], {}).get("operation", "").lower() in PHASE2_OPS
+        and a.get("machine_id")
+    ]
+    if len(link_assigns) < 2:
+        return 0
+
+    busy: Dict[str, List[Any]] = {m: list(_unavail(m)) for m in link_machine_ids}
+    load: Dict[str, int] = {m: 0 for m in link_machine_ids}
+
+    def _free(m_id: str, s: int, e: int) -> bool:
+        if s < _avail_at(m_id):
+            return False
+        return not any(s < be and e > bs for bs, be in busy[m_id])
+
+    # Pinned linking tasks are immovable: pre-place them on their current machine.
+    movable: List[Dict[str, Any]] = []
+    for a in link_assigns:
+        t = info.get(a["task_id"], {})
+        if t.get("is_pinned"):
+            m = a["machine_id"]
+            busy.setdefault(m, []).append((a["start_time"], a["end_time"]))
+            load[m] = load.get(m, 0) + (a["end_time"] - a["start_time"])
+        else:
+            movable.append(a)
+
+    changed = 0
+    # Deterministic order: by start, then end, then task_id.
+    for a in sorted(movable, key=lambda x: (x["start_time"], x["end_time"], x["task_id"])):
+        s, e = a["start_time"], a["end_time"]
+        t = info.get(a["task_id"], {})
+        compat = set(t.get("compatible_resource_ids") or []) & set(link_machine_ids)
+        cands = [m for m in link_machine_ids if m in compat] if compat else list(link_machine_ids)
+        eligible = [m for m in cands if _free(m, s, e)]
+        if not eligible:
+            # Keep current machine (must remain feasible there — it was before).
+            m = a["machine_id"]
+        else:
+            m = min(eligible, key=lambda x: (load[x], x))
+        if m != a["machine_id"]:
+            changed += 1
+        a["machine_id"] = m
+        busy.setdefault(m, []).append((s, e))
+        load[m] = load.get(m, 0) + (e - s)
+
+    if changed:
+        used = sum(1 for m in link_machine_ids if load.get(m, 0) > 0)
+        logger.info(
+            f"⚖️ Linking load-balance: re-assigned {changed} task(s) → "
+            f"{used}/{len(link_machine_ids)} machines used (timing unchanged)."
+        )
+    return changed
 
 
 @dataclass
@@ -51,6 +154,8 @@ def solve_linking(
     horizon: Optional[int] = None,
     reschedule_hint: Optional[Dict[str, Any]] = None,
     workload_shrank: bool = False,
+    start_lb_override: Optional[Dict[str, int]] = None,
+    end_caps: Optional[Dict[str, int]] = None,
 ) -> Phase2Result:
     """
     Solve the linking phase.
@@ -62,6 +167,10 @@ def solve_linking(
         p1_start_times:  task_id -> start minute from Phase 1.
         p1_end_times:    task_id -> end minute from Phase 1.
         translation_map: sub-task / original-order ID → batch task ID.
+        start_lb_override: dùng floor này thay vì _compute_start_lb (pass 2 của
+            same-qty relink — xem pipeline).  None → floor index như cũ.
+        end_caps:        task_id → end tối đa (end của pass 1).  Pareto guard:
+            pass 2 không được ra lịch muộn hơn pass 1 ở bất kỳ task nào.
     """
     linking_tasks = [t for t in tasks if t.get("operation", "").lower() in PHASE2_OPS]
     if not linking_tasks:
@@ -72,7 +181,11 @@ def solve_linking(
         horizon = compute_horizon(linking_tasks, config, resources=resources)
 
     # Compute start lower-bounds from Phase 1
-    start_lb = _compute_start_lb(linking_tasks, p1_start_times, p1_end_times, translation_map)
+    start_lb = (
+        start_lb_override
+        if start_lb_override is not None
+        else _compute_start_lb(linking_tasks, p1_start_times, p1_end_times, translation_map)
+    )
 
     resource_map: Dict[str, Dict[str, Any]] = {r["id"]: r for r in resources}
     model = cp_model.CpModel()
@@ -98,6 +211,10 @@ def solve_linking(
                 for t in no_resource_tasks
             ],
         )
+
+    if end_caps:
+        n_caps = apply_end_caps(model, task_vars, end_caps)
+        logger.info(f"   🔒 Phase 2: {n_caps} Pareto end-cap(s) applied (two-pass refinement).")
 
     task_map = {t["task_id"]: t for t in linking_tasks}
     obj_terms = apply_soft_deadlines(model, task_vars, task_map, horizon)
@@ -207,5 +324,110 @@ def _compute_start_lb(
 
         if current_lb > 0:
             lb[t_id] = current_lb
+
+    return lb
+
+
+def compute_sameqty_start_lb(
+    tasks: List[Dict[str, Any]],
+    p1_start_times: Dict[str, int],
+    p1_end_times: Dict[str, int],
+    translation_map: Dict[str, str],
+    all_pipeline_tasks: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    """Floor same-qty: panel knitting cùng (component, qty) là thay-thế-được.
+
+    Luật vật-lý (chốt với domain): hai panel chỉ đổi chỗ cho nhau khi cùng
+    component (group_id) VÀ cùng quantity — tuyệt đối không mix khác-qty
+    (một panel qty-20 KHÔNG phủ được hai slice cần panel qty-10).
+
+    Go ghép cứng linking SLICE_k ↔ panel BATCH_<comp>_k theo index; khi thứ tự
+    dệt xong không trùng thứ tự index, một slice phải chờ "đúng panel số k"
+    trong khi một panel cùng-loại-cùng-qty đã xong nằm chờ.  Floor này gỡ đúng
+    chỗ đó: trong mỗi bucket (component, qty) của một parent, slice được floor
+    theo panel-xong-thứ-k (FIFO theo end time) thay vì panel-số-hiệu-k.
+
+    Per-order completion không đổi (song ánh slice↔panel ⇒ slice cuối vẫn chờ
+    panel cuối) nhưng các slice GIỮA được nới sớm hơn → máy linking rảnh sớm →
+    đơn khác + hạ nguồn hưởng.  Dùng làm start_lb_override cho pass 2, LUÔN
+    kèm end_caps (Pareto guard) — không bao giờ dùng trần.
+
+    WaitOffsets được merge y hệt _compute_start_lb (max wins).
+    Deps không phải knitting (hoặc không resolve được) đóng góp end trực tiếp
+    như floor index — không bucket hóa thứ mình không hiểu.
+    """
+    task_meta = {t["task_id"]: t for t in all_pipeline_tasks}
+
+    def _resolve(raw_id: str) -> Optional[str]:
+        if raw_id in p1_end_times:
+            return raw_id
+        translated = translation_map.get(raw_id, raw_id)
+        if translated in p1_end_times:
+            return translated
+        return None
+
+    def _knit_bucket(raw_id: str, resolved: str):
+        """(group_id, qty) nếu dep là knitting có metadata; None → đối xử như index."""
+        kt = task_meta.get(resolved) or task_meta.get(raw_id)
+        if not kt or kt.get("operation", "").lower() != "knitting":
+            return None
+        group = kt.get("group_id") or ""
+        if not group:
+            return None
+        return (group, int(round(float(kt.get("qty", 0) or 0))))
+
+    # Gom theo parent (một đơn linking); bucket chỉ có nghĩa trong một parent.
+    by_parent: Dict[str, List[Dict[str, Any]]] = {}
+    for t in tasks:
+        by_parent.setdefault(t.get("parent_task_id") or t["task_id"], []).append(t)
+
+    lb: Dict[str, int] = {}
+    for parent, slices in sorted(by_parent.items()):
+        # Panel ends per bucket (dedup theo resolved id), sort tăng dần.
+        bucket_ends: Dict[tuple, Dict[str, int]] = {}
+        for t in slices:
+            for dep_id in (t.get("final_depends_on") or []):
+                resolved = _resolve(dep_id)
+                if not resolved:
+                    continue
+                key = _knit_bucket(dep_id, resolved)
+                if key is not None:
+                    bucket_ends.setdefault(key, {})[resolved] = p1_end_times[resolved]
+        bucket_sorted = {k: sorted(v.values()) for k, v in bucket_ends.items()}
+        ptr: Dict[tuple, int] = {}
+
+        # FIFO: slice có floor-index sớm nhất nhận panel-xong sớm nhất của bucket.
+        def _index_floor(t: Dict[str, Any]) -> int:
+            ends = [
+                p1_end_times[r]
+                for r in (_resolve(d) for d in (t.get("final_depends_on") or []))
+                if r is not None
+            ]
+            return max(ends) if ends else 0
+
+        for t in sorted(slices, key=lambda x: (_index_floor(x), x["task_id"])):
+            t_id = t["task_id"]
+            current_lb = 0
+            for dep_id in (t.get("final_depends_on") or []):
+                resolved = _resolve(dep_id)
+                if not resolved:
+                    continue
+                key = _knit_bucket(dep_id, resolved)
+                if key is None:
+                    current_lb = max(current_lb, p1_end_times[resolved])
+                    continue
+                ends = bucket_sorted[key]
+                k = ptr.get(key, 0)
+                ptr[key] = k + 1
+                current_lb = max(current_lb, ends[min(k, len(ends) - 1)])
+
+            wait_offsets = t.get("wait_offsets") or t.get("WaitOffsets") or {}
+            for raw_batch_id, offset in wait_offsets.items():
+                resolved = _resolve(raw_batch_id)
+                if resolved and resolved in p1_start_times:
+                    current_lb = max(current_lb, p1_start_times[resolved] + int(offset))
+
+            if current_lb > 0:
+                lb[t_id] = current_lb
 
     return lb

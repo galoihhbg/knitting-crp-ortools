@@ -28,7 +28,14 @@ from .phases.phase1_knitting import (
     solve_knitting,
 )
 from .shared import compute_global_horizon, diagnose_infeasibility
-from .phases.phase2_linking import PHASE2_OPS, Phase2Result, solve_linking
+from .phases.phase2_linking import (
+    PHASE2_OPS,
+    Phase2Result,
+    _compute_start_lb as _compute_linking_start_lb,
+    balance_linking_load,
+    compute_sameqty_start_lb,
+    solve_linking,
+)
 from .phases.phase3_batching import PHASE3_OPS, Phase3Result, solve_washing
 from .phases.phase4_downstream import UPSTREAM_OPS, Phase4Result, solve_downstream
 
@@ -127,10 +134,90 @@ class Pipeline:
         if p2.status not in ("feasible", "empty"):
             return _phase_failure_result(p2.status, p2_tasks, all_resources, self.config, global_horizon)
 
-        # ── Phase 3: Washing ──────────────────────────────────────────────
-        # Merge Phase 1+2 end times so washing tasks can depend on either
-        combined_end_times = {**p1.end_times, **p2.end_times}
+        # ── Phases 3→5: Washing → Ironing → Packing ───────────────────────
+        chain = self._solve_phases_3_to_5(
+            all_resources, global_horizon, {**p1.end_times, **p2.end_times}
+        )
+        if isinstance(chain, dict):
+            return chain  # phase-failure result
+        p3, p4, p5 = chain
 
+        # ── Same-qty re-link refinement (two-pass, cold solve only) ───────
+        # Panel knitting cùng (component, qty) là thay-thế-được; floor same-qty
+        # nới các slice GIỮA của mỗi đơn (per-order completion bất biến) → máy
+        # linking rảnh sớm → hạ nguồn hưởng.  Pass 2 chạy với Pareto end-caps
+        # (end ≤ pass-1 per task linking) + verify điểm-theo-điểm TOÀN pipeline:
+        # sai một task là giữ nguyên pass 1 — không-regression theo cấu trúc.
+        if (
+            not self.reschedule_hint
+            and p2.status == "feasible"
+            and self.config.get("enable_sameqty_relink", True)
+        ):
+            refined = self._try_sameqty_relink(
+                p2_tasks, all_resources, global_horizon, p1, p2, p3, p4, p5,
+            )
+            if refined is not None:
+                p2, p3, p4, p5 = refined
+
+        # ── Aggregate results ─────────────────────────────────────────────
+        all_assignments = (
+            p1.assignments + p2.assignments + p3.assignments
+            + p4.assignments + p5.assignments
+        )
+
+        # Cold-only knitting idle compaction (post-pass on the FINAL output).
+        # Knitting stalls at FEASIBLE, so the span objective leaves machines idle
+        # even when a task could run earlier on the same machine.  This pulls each
+        # cold knitting task to its earliest feasible start (same machine, in order);
+        # it runs AFTER every phase so downstream stays byte-identical and end-to-end
+        # lateness is monotonically non-increasing (knitting only moves earlier).
+        # Skipped on re-schedule — knitting is hard-kept there.
+        if not self.reschedule_hint:
+            left_shift_cold_knitting(all_assignments, self.tasks, self.config)
+            # Linking worker load-balance: machine-relabel only (timing unchanged),
+            # so downstream stays byte-identical and no order can finish later.
+            # Fixes severe linking-worker idle/imbalance (measured stdev 965→40).
+            # Skipped on re-schedule — machine assignment is part of stability there.
+            if self.config.get("enable_linking_balance", True):
+                balance_linking_load(all_assignments, self.tasks, all_resources, self.config)
+        all_overloads = (
+            p1.overloads + p2.overloads + p3.overloads
+            + p4.overloads + p5.overloads
+        )
+        total_time = (
+            p1.solve_time_seconds + p2.solve_time_seconds + p3.solve_time_seconds
+            + p4.solve_time_seconds + p5.solve_time_seconds
+        )
+
+        # Objective: sum of per-phase objective values where available
+        obj_vals = [
+            v for v in [p1.objective_value, p2.objective_value,
+                        p4.objective_value, p5.objective_value]
+            if v is not None
+        ]
+        combined_obj = sum(obj_vals) if obj_vals else None
+
+        return {
+            "status": "feasible",
+            "assignments": all_assignments,
+            "overloads": all_overloads,
+            "objective_value": combined_obj,
+            "solve_time_seconds": total_time,
+        }
+
+    def _solve_phases_3_to_5(
+        self,
+        all_resources: List[Dict[str, Any]],
+        global_horizon: int,
+        combined_end_times: Dict[str, int],
+    ):
+        """Washing → Ironing → Packing trên end-times đã cho (P1+P2 merged).
+
+        Returns (p3, p4, p5) khi thành công, hoặc dict failure-result (giữ đúng
+        hành vi cũ của run()).  Tách riêng để two-pass refinement gọi lại được
+        với linking end-times của pass 2.
+        """
+        # ── Phase 3: Washing ──────────────────────────────────────────────
         p3_tasks = [t for t in self.tasks if t.get("operation", "").lower() in PHASE3_OPS]
         shift_ends: List[int] = [int(s) for s in self.config.get("shift_ends_min", [])]
         # Phase 3 is group-isolated; pass the full hint (with washing-group partition
@@ -190,45 +277,95 @@ class Pipeline:
         )
         logger.info(f"✅ Phase 5 (Packing) complete: {len(p5.assignments)} assignments, status={p5.status}")
 
-        # ── Aggregate results ─────────────────────────────────────────────
-        all_assignments = (
-            p1.assignments + p2.assignments + p3.assignments
-            + p4.assignments + p5.assignments
-        )
+        return p3, p4, p5
 
-        # Cold-only knitting idle compaction (post-pass on the FINAL output).
-        # Knitting stalls at FEASIBLE, so the span objective leaves machines idle
-        # even when a task could run earlier on the same machine.  This pulls each
-        # cold knitting task to its earliest feasible start (same machine, in order);
-        # it runs AFTER every phase so downstream stays byte-identical and end-to-end
-        # lateness is monotonically non-increasing (knitting only moves earlier).
-        # Skipped on re-schedule — knitting is hard-kept there.
-        if not self.reschedule_hint:
-            left_shift_cold_knitting(all_assignments, self.tasks, self.config)
-        all_overloads = (
-            p1.overloads + p2.overloads + p3.overloads
-            + p4.overloads + p5.overloads
-        )
-        total_time = (
-            p1.solve_time_seconds + p2.solve_time_seconds + p3.solve_time_seconds
-            + p4.solve_time_seconds + p5.solve_time_seconds
-        )
+    def _try_sameqty_relink(
+        self,
+        p2_tasks: List[Dict[str, Any]],
+        all_resources: List[Dict[str, Any]],
+        global_horizon: int,
+        p1: Phase1Result,
+        p2: Phase2Result,
+        p3: "Phase3Result",
+        p4: "Phase4Result",
+        p5: "Phase4Result",
+    ):
+        """Pass 2: linking với floor same-qty + Pareto caps, rồi 3→5 lại.
 
-        # Objective: sum of per-phase objective values where available
-        obj_vals = [
-            v for v in [p1.objective_value, p2.objective_value,
-                        p4.objective_value, p5.objective_value]
-            if v is not None
+        Nhận pass 2 CHỈ KHI mọi task (linking + toàn hạ nguồn) có end ≤ end
+        pass 1 và có ít nhất một task sớm hơn thật.  Mọi nhánh khác → None
+        (giữ pass 1).  Không bao giờ làm lịch xấu đi — guard theo cấu trúc.
+        """
+        linking_tasks = [
+            t for t in p2_tasks if t.get("operation", "").lower() in PHASE2_OPS
         ]
-        combined_obj = sum(obj_vals) if obj_vals else None
+        if not linking_tasks:
+            return None
 
-        return {
-            "status": "feasible",
-            "assignments": all_assignments,
-            "overloads": all_overloads,
-            "objective_value": combined_obj,
-            "solve_time_seconds": total_time,
-        }
+        lb_index = _compute_linking_start_lb(
+            linking_tasks, p1.start_times, p1.end_times, self.translation_map
+        )
+        lb_sameqty = compute_sameqty_start_lb(
+            linking_tasks, p1.start_times, p1.end_times, self.translation_map, self.tasks
+        )
+        slack = sum(
+            1 for k, v in lb_index.items() if lb_sameqty.get(k, v) < v
+        )
+        if slack == 0:
+            logger.info("🔁 Same-qty re-link: floor identical to index — skipped (no slack).")
+            return None
+
+        logger.info(f"🔁 Same-qty re-link: {slack} linking task(s) have earlier same-qty floor — pass 2…")
+        p2b: Phase2Result = solve_linking(
+            p2_tasks, all_resources, self.config,
+            p1_start_times=p1.start_times,
+            p1_end_times=p1.end_times,
+            translation_map=self.translation_map,
+            horizon=global_horizon,
+            reschedule_hint=None,
+            workload_shrank=False,
+            start_lb_override=lb_sameqty,
+            end_caps=p2.end_times,
+        )
+        if p2b.status != "feasible":
+            logger.warning(f"🔁 Same-qty re-link: pass 2 status={p2b.status} — keeping pass 1.")
+            return None
+        if all(p2b.end_times.get(k) == v for k, v in p2.end_times.items()):
+            logger.info("🔁 Same-qty re-link: pass 2 changed nothing — keeping pass 1.")
+            return None
+
+        chain = self._solve_phases_3_to_5(
+            all_resources, global_horizon, {**p1.end_times, **p2b.end_times}
+        )
+        if isinstance(chain, dict):
+            logger.warning("🔁 Same-qty re-link: downstream re-solve failed — keeping pass 1.")
+            return None
+        p3b, p4b, p5b = chain
+
+        # ── Pareto verify: điểm-theo-điểm trên TOÀN bộ task của phases 2–5 ──
+        ends1: Dict[str, int] = {**p2.end_times, **p3.end_times, **p4.end_times, **p5.end_times}
+        ends2: Dict[str, int] = {**p2b.end_times, **p3b.end_times, **p4b.end_times, **p5b.end_times}
+        if set(ends1) != set(ends2):
+            logger.warning("🔁 Same-qty re-link: task set mismatch — keeping pass 1.")
+            return None
+        regressed = [k for k, v in ends1.items() if ends2[k] > v]
+        improved = sum(1 for k, v in ends1.items() if ends2[k] < v)
+        if regressed:
+            logger.info(
+                f"🔁 Same-qty re-link: {len(regressed)} task(s) would finish later "
+                f"(e.g. {regressed[0]}) — keeping pass 1 (Pareto guard)."
+            )
+            return None
+        if improved == 0:
+            logger.info("🔁 Same-qty re-link: no task improved — keeping pass 1.")
+            return None
+
+        total_gain = sum(v - ends2[k] for k, v in ends1.items())
+        logger.info(
+            f"✨ Same-qty re-link ACCEPTED: {improved} task(s) earlier, 0 later, "
+            f"total {total_gain} task-min pulled forward."
+        )
+        return p2b, p3b, p4b, p5b
 
 
 # ---------------------------------------------------------------------------

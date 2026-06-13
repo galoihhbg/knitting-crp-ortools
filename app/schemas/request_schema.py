@@ -82,11 +82,23 @@ class SolverConfig(BaseModel):
     # Washing tasks must complete before, or start at/after, each boundary
     # because the backend strips breaks from the timeline and washing cannot be interrupted.
     shift_ends_min: List[int] = Field(default_factory=list)
+    # Two-pass same-qty re-link refinement (cold solve only).  Pass 2 relaxes the
+    # linking floor so a slice may consume the earliest-finished knitting panel of
+    # the SAME (component, qty) bucket instead of its index-paired panel, under
+    # per-task Pareto end-caps + a whole-pipeline pointwise verify: the refined
+    # schedule is accepted only if NO task finishes later than pass 1.
+    enable_sameqty_relink: bool = True
     # Cold-solve knitting EDD warm-start (hints-only AddHint seed; zero new
     # constraints/objective terms).  Cold knitting routinely stops at FEASIBLE
     # with due-inversions on the machines; an earliest-due-date incumbent seed
     # removed 79-85% of total order lateness in offline replays.
     enable_edd_knitting_hint: bool = True
+    # Linking worker load-balance post-pass (cold solve only).  Re-assigns linking
+    # tasks across interchangeable linking machines to even out per-worker load,
+    # keeping every task's [start, end] fixed — downstream byte-identical, no order
+    # finishes later.  Fixes severe worker idle/imbalance (machine-load stdev 965→40
+    # on real payloads).
+    enable_linking_balance: bool = True
 
 
 class PreviousAssignment(BaseModel):
