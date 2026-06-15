@@ -52,9 +52,13 @@ class Pipeline:
         tasks: List[Dict[str, Any]],
         material_capacities: Optional[Dict[str, int]] = None,
         reschedule_hint: Optional[Dict[str, Any]] = None,
+        dyelot_stock: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.config = config
         self.resources = resources
+        # Top-level dyelot stock for the (future) dyelot post-pass.  Carried as-is;
+        # no CP-SAT model reads it.  Empty list when absent.
+        self.dyelot_stock = dyelot_stock or []
         # Determinism leg 3 (pairs with num_search_workers=1 + PYTHONHASHSEED=0):
         # normalise task order by the STABLE key `task_id` at ingest.  build_resource_model
         # creates CP-SAT start/interval/machine vars + NoOverlap/Cumulative in task-list

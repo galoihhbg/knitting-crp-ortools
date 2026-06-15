@@ -25,10 +25,30 @@ class Machine(BaseModel):
     color_config: str
 
 
+class YarnConsumption(BaseModel):
+    """Sợi tiêu thụ cho một task (chuẩn bị cho post-pass dyelot — chưa tiêu thụ).
+
+    is_main: True = sợi chính (được cấp dyelot); False = sợi phụ (không cấp dyelot).
+    Default True để tương thích payload cũ chưa có cờ — khi đó mọi entry là sợi chính.
+    """
+    vi: str
+    kg: float
+    # slots = số creel position (cone) task lắp cho vi (Go MinSlots). Dùng cho
+    # creel-up gross trong dyelot allocator; 0/absent = payload cũ → bỏ creel-up.
+    slots: int = 0
+    is_main: bool = True
+
+
 class SolverTask(BaseModel):
     task_id: str = Field(alias="task_id")
     original_order_id: str = Field(alias="original_order_id")
     group_id: str = Field(alias="group_id")
+    # Đơn (sales-order) mà task này thuộc về — khóa gom dyelot: mọi batch/panel
+    # cùng order_group_id PHẢI dùng chung 1 dyelot per VI (tránh lệch màu khi ghép
+    # thành 1 sản phẩm).  Một đơn có thể bị rolling-wave tách thành nhiều batch
+    # (vd BATCH_0-665 + BATCH_0-666 cùng đơn "W9xTMuuLxR-1-200-200").  Để trống ""
+    # khi payload cũ chưa gửi — khi đó dyelot gom theo original_order_id như cũ.
+    order_group_id: str = Field(default="", alias="order_group_id")
     operation: str = Field(alias="operation")
     qty: float = Field(alias="qty")
     total_qty: float = Field(alias="total_qty")
@@ -56,6 +76,7 @@ class SolverTask(BaseModel):
     pinned_end_time: Optional[int] = Field(default=None, alias="pinned_end_time")
     demand: int = Field(default=1, alias="demand")
     material_demands: Dict[str, int] = Field(default_factory=dict, alias="material_demands")
+    main_yarn_consumption: List[YarnConsumption] = Field(default_factory=list)
 
     class Config:
         populate_by_name = True
@@ -134,6 +155,14 @@ class RescheduleHint(BaseModel):
     match_by_order_fallback: bool = True
 
 
+class DyelotStock(BaseModel):
+    """Tồn kho theo dyelot (chuẩn bị cho post-pass dyelot — chưa tiêu thụ)."""
+    vi: str
+    dyelot: str
+    remaining_kg: float
+    packing_size: float
+
+
 class SolverPayload(BaseModel):
     job_id: str
     config: SolverConfig
@@ -144,4 +173,5 @@ class SolverPayload(BaseModel):
         default_factory=dict,
         description="Per-material creel capacity: material_code → total available rolls/slots",
     )
+    dyelot_stock: List[DyelotStock] = Field(default_factory=list)
     reschedule_hint: Optional[RescheduleHint] = None

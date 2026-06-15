@@ -93,6 +93,11 @@ class Engine:
         else:
             logger.info("📦 material_capacities: not present in payload — material constraints disabled")
 
+        # Top-level dyelot stock — carried through to the dyelot post-pass at the
+        # end of Pipeline.run().  Not consumed by any CP-SAT model (additive data
+        # only).  Empty list when the Go backend does not send the field.
+        self.dyelot_stock = payload.get("dyelot_stock") or []
+
     def solve(self) -> Dict[str, Any]:
         if not self.tasks:
             return {"status": "feasible", "assignments": [], "overloads": []}
@@ -107,5 +112,18 @@ class Engine:
             self.tasks,
             self.material_capacities,
             reschedule_hint=self.reschedule_hint,
+            dyelot_stock=self.dyelot_stock,
         )
-        return pipeline.run()
+        result = pipeline.run()
+
+        # Dyelot allocation post-pass (orchestration; no scheduling CP-SAT touched).
+        # Runs after knitting is scheduled: reads the knitting machine-sequence from
+        # the assignments + per-task main_yarn_consumption + dyelot_stock, and emits
+        # one flush-optimized dyelot per (order, VI).  Skipped (returns empty) when
+        # the payload carries no dyelot_stock.
+        from .dyelot_allocator import allocate_dyelots
+        dyelot_out = allocate_dyelots(
+            self.tasks, result.get("assignments", []), self.dyelot_stock, self.config
+        )
+        result.update(dyelot_out)
+        return result

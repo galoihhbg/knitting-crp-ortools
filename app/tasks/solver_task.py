@@ -128,6 +128,11 @@ def optimize_schedule(self, payload: dict):
             "status": result["status"],
             "assignments": clean_assignments,
             "overloads": clean_overloads,
+            # Dyelot allocation post-pass output (empty lists when no dyelot_stock).
+            "order_dyelot_assignment": result.get("order_dyelot_assignment", []),
+            "dyelot_flush_points": result.get("dyelot_flush_points", []),
+            "dyelot_unassigned": result.get("dyelot_unassigned", []),
+            "dyelot_shortage": result.get("dyelot_shortage", []),
         }
 
         try:
