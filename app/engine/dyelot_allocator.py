@@ -81,7 +81,14 @@ def allocate_dyelots(
       dyelot_flush_points:     [{machine, vi, after_task, before_task,
                                  order_after, order_before}]
       dyelot_unassigned:       [{order, vi, reason}]
-      dyelot_shortage:         [{vi, demand_kg, stock_kg}]
+      dyelot_shortage:         [{vi, demand_kg (gross), net_demand_kg, stock_kg,
+                                 single_lot_deficit_kg, topups:[{dyelot, add_kg}],
+                                 new_lot_kg}]
+                                topups[] = ALTERNATIVES — "add add_kg to THIS dyelot
+                                alone" (dyelots are never merged, so a real top-up
+                                replenishes exactly one lot); single_lot_deficit_kg is
+                                the cheapest of them. new_lot_kg = instead import ONE
+                                fresh dyelot of this size.
 
     Never raises on an infeasible VI — an order that cannot be placed is reported
     in dyelot_unassigned (a procurement signal), not crashed.
@@ -165,8 +172,14 @@ def allocate_dyelots(
             for order in sorted(order_kg):
                 unassigned.append({"order": order, "vi": vi,
                                    "reason": "no_dyelot_stock"})
+            # No stock at all → the whole demand must be procured as a fresh lot;
+            # no existing dyelot to top up.
             shortage.append({"vi": vi, "demand_kg": round(demand_kg, 3),
-                             "stock_kg": 0.0})
+                             "net_demand_kg": round(demand_kg, 3),
+                             "stock_kg": 0.0,
+                             "single_lot_deficit_kg": round(demand_kg, 3),
+                             "topups": [],
+                             "new_lot_kg": round(demand_kg, 3)})
             logger.warning(f"🎨 VI {vi}: {len(order_kg)} order(s) consume it but "
                            f"dyelot_stock is empty → shortage.")
             continue
@@ -183,9 +196,36 @@ def allocate_dyelots(
             # waste (e.g. 3039: net 403/403 but gross 413) is reported, not hidden.
             stock_kg = sum(float(l.get("remaining_kg", 0)) for l in lots)
             gross_demand_kg = res["gross_demand_g"] / _KG_SCALE
+            # single_lot_deficit_kg = minimal extra capacity to assign EVERY order
+            # to one dyelot (bin-packing aware). For a fragmentation-only shortage
+            # (total stock ≥ gross demand) this is small/zero even though a large
+            # order was stranded; it is the honest "add this much to clear".
+            deficit_kg = res.get("deficit_g", 0) / _KG_SCALE
+            # net_demand_kg is the actual consumed-into-product demand (no
+            # whole-roll / creel-up inflation). The Go side classifies
+            # material-shortage vs dyelot-fragmentation on NET vs stock — gross
+            # (demand_kg) over-counts and would mislabel a fragmentation case as
+            # a material buy near the boundary (e.g. 3039 net 403 ≤ stock 423 but
+            # gross 440 > 423).
+            # Procurement options to clear it (pick ONE downstream — dyelots are
+            # never merged):
+            #   topups[]    — ALTERNATIVES: "add add_kg to THIS dyelot alone".
+            #                 single_lot_deficit_kg = the cheapest of these.
+            #   new_lot_kg  — instead, import ONE fresh dyelot of this size.
+            topups_g = res.get("topups_g") or []
+            topups = [{"dyelot": lots[d].get("dyelot"),
+                       "add_kg": round(topups_g[d] / _KG_SCALE, 3)}
+                      for d in range(len(lots))
+                      if d < len(topups_g) and topups_g[d] is not None
+                      and topups_g[d] > 0]
+            new_lot_kg = res.get("new_lot_g", 0) / _KG_SCALE
             shortage.append({"vi": vi,
                              "demand_kg": round(gross_demand_kg, 3),
-                             "stock_kg": round(stock_kg, 3)})
+                             "net_demand_kg": round(demand_kg, 3),
+                             "stock_kg": round(stock_kg, 3),
+                             "single_lot_deficit_kg": round(deficit_kg, 3),
+                             "topups": topups,
+                             "new_lot_kg": round(new_lot_kg, 3)})
 
     logger.info(
         f"🎨 Dyelot allocator: {len(assignments)} (order,VI) assigned, "
@@ -198,6 +238,89 @@ def allocate_dyelots(
         "dyelot_unassigned": unassigned,
         "dyelot_shortage": shortage,
     }
+
+
+def _vi_gross_demand_g(orders, demand_g, pk_g, machine_order) -> int:
+    """Reuse-aware gross (grams) the VI physically pulls, lot-blind. On each
+    machine the orders sharing it draw from ONE creel, so that machine pulls
+    max(ceil(Σnet_m / pk), max_slots_m) rolls; summed across machines (each mounts
+    its own cones). Orders with no machine breakdown fall back to whole-order
+    rolls. Used for the dyelot_shortage report (vs net stock)."""
+    pk = min(pk_g)
+    machines = sorted(machine_order, key=str)
+    with_machine = set()
+    g = 0
+    for m in machines:
+        mo = machine_order[m]
+        oz = [o for o in orders if o in mo]
+        if not oz:
+            continue
+        with_machine.update(oz)
+        net_m = sum(_g(mo[o][0]) for o in oz)
+        max_slots = max((int(mo[o][1]) for o in oz), default=0)
+        g += max((net_m + pk - 1) // pk, max_slots) * pk
+    missing = [o for o in orders if o not in with_machine]
+    if missing:
+        net_miss = sum(demand_g[o] for o in missing)
+        g += ((net_miss + pk - 1) // pk) * pk
+    return g
+
+
+def _cap_slack_g(demand_g, pk_g, machine_order) -> int:
+    """A guaranteed-sufficient upper bound (grams) on the extra capacity any single
+    lot could ever need / be charged: net total + one roll per (machine,order) run
+    (whole-roll waste) + the creel-up of every run. Always ≥ the true gross of
+    placing EVERYTHING on one lot, so it safely bounds expandable-bin Vars and the
+    per-(machine,lot) roll Vars (the earlier Σnet+max_pk bound under-counted the
+    gross and made the new-lot solve spuriously infeasible)."""
+    runs = 0
+    tslots = 0
+    for m in machine_order:
+        for _o, run in machine_order[m].items():
+            runs += 1
+            tslots += int(run[1])
+    return sum(demand_g.values()) + (runs + tslots) * max(pk_g)
+
+
+def _add_roll_capacity(model, x, orders, n_lots, demand_g, cap_g, pk_g,
+                       machine_order, extra=None) -> None:
+    """Add reuse-aware capacity: per (machine, lot) the orders of a lot SHARE the
+    creel on that machine (a cone's residual feeds the next order — Go's
+    free-pool), so the rolls mounted on machine m for lot d cover the SUM of those
+    orders' net AND the widest creel (max slots). Rolls are summed ACROSS machines
+    (each machine mounts its own cones from the lot) and bounded by the lot stock
+    (cap_g[d], or cap_g[d]+extra[d] when expandable). This removes the per-ORDER
+    creel-up over-count (orders sharing a machine no longer each pay the slots
+    floor) while still charging an order that knits on several machines its creel
+    on each."""
+    machines = sorted(machine_order, key=str)
+    with_machine = {o for m in machines for o in machine_order[m] if o in demand_g}
+    missing = [o for o in orders if o not in with_machine]
+    # When lots are expandable, a lot may grow far past Σnet (gross > net), so the
+    # per-(machine,lot) roll Var ub must cover the worst-case slack, not just Σnet.
+    bump = _cap_slack_g(demand_g, pk_g, machine_order) if extra is not None else 0
+    for d in range(n_lots):
+        ub = (cap_g[d] + bump) // pk_g[d] + 1
+        lot_rolls = []
+        for m in machines:
+            mo = machine_order[m]
+            oz = [o for o in orders if o in mo]
+            if not oz:
+                continue
+            r = model.NewIntVar(0, ub, f"r_{d}_{m}")
+            model.Add(r * pk_g[d] >= sum(_g(mo[o][0]) * x[o][d] for o in oz))
+            for o in oz:
+                s = int(mo[o][1])
+                if s > 0:
+                    model.Add(r * pk_g[d] >= s * pk_g[d] * x[o][d])  # creel floor
+            lot_rolls.append(r)
+        if missing:
+            r = model.NewIntVar(0, ub, f"rm_{d}")
+            model.Add(r * pk_g[d] >= sum(demand_g[o] * x[o][d] for o in missing))
+            lot_rolls.append(r)
+        if lot_rolls:
+            cap = cap_g[d] + (extra[d] if extra is not None else 0)
+            model.Add(sum(lot_rolls) * pk_g[d] <= cap)
 
 
 def _solve_vi(
@@ -252,34 +375,8 @@ def _solve_vi(
     # packing_size is missing / rounds to 0).
     pk_g = [max(_g(l.get("packing_size", 0)), 1) for l in lots]
 
-    def _gross_g(o: str, d: int) -> int:
-        """Physically-pullable grams for order o on lot d: per machine run, the
-        net rounded UP to whole rolls of lot d, floored at slots·packing (the
-        creel-up — a run must mount `slots` cones). Falls back to whole-order
-        roll rounding when the order has no per-machine breakdown."""
-        p = pk_g[d]
-        total = 0
-        seen = False
-        for mach in sorted(machine_order, key=str):
-            run = machine_order[mach].get(o)
-            if run is None:
-                continue
-            seen = True
-            net_g_run = _g(run[0])
-            slots = int(run[1])
-            rolls = (net_g_run + p - 1) // p   # whole rolls to cover the net
-            if slots > rolls:
-                rolls = slots                  # creel-up: mount all slots' cones
-            total += rolls * p
-        if not seen:
-            return ((demand_g[o] + p - 1) // p) * p
-        return total
-
-    # Lower-bound gross demand for the VI: each order charged on its CHEAPEST lot
-    # (least roll/creel-up waste).  Reported in dyelot_shortage so Go sees the
-    # physically-pullable kg, not the net kg — an order can be dropped for capacity
-    # even when net demand == net stock once whole-roll/creel-up waste is counted.
-    gross_demand_g = sum(min(_gross_g(o, d) for d in range(n_lots)) for o in orders)
+    # Reuse-aware GROSS (C) — see _add_roll_capacity / _vi_gross_demand_g.
+    gross_demand_g = _vi_gross_demand_g(orders, demand_g, pk_g, machine_order)
 
     model = cp_model.CpModel()
 
@@ -290,9 +387,8 @@ def _solve_vi(
         model.Add(sum(x[o]) + una[o] == 1)        # 1 dyelot per order per VI
         model.Add(assigned[o] == 1 - una[o])
 
-    # Capacity — GROSS (whole-roll) charge, residual creel-flow still ignored.
-    for d in range(n_lots):
-        model.Add(sum(_gross_g(o, d) * x[o][d] for o in orders) <= cap_g[d])
+    # Capacity — reuse-aware per-(machine, lot) roll model (C).
+    _add_roll_capacity(model, x, orders, n_lots, demand_g, cap_g, pk_g, machine_order)
 
     # used[d]: 1 iff lot d carries any order.  Drives tier-3 (min lots) + tier-4.
     used = [model.NewBoolVar(f"used_{vi}_{d}") for d in range(n_lots)]
@@ -366,10 +462,12 @@ def _solve_vi(
                                       "reason": f"solver_{solver.StatusName(status)}"})
         return out
 
+    any_unassigned = False
     for o in orders:
         if solver.Value(una[o]):
             out["unassigned"].append({"order": o, "vi": vi,
                                       "reason": "capacity_shortage"})
+            any_unassigned = True
             continue
         for d in range(n_lots):
             if solver.Value(x[o][d]):
@@ -384,4 +482,80 @@ def _solve_vi(
                 "after_task": ta, "before_task": tb,
                 "order_after": oa, "order_before": ob,
             })
+
+    # When an order was dropped, compute the MINIMAL extra single-lot capacity
+    # that would let EVERY order land on one dyelot (expandable-bin). This is the
+    # honest "how much to add to clear the error": for a tight bin-packing it is
+    # tiny (e.g. ~0.5kg → 1 roll) even though a whole 130kg order was stranded,
+    # and it is 0 when a feasible single-lot packing exists but the heuristic
+    # over-concentrated. Go surfaces it as the procurement top-up instead of the
+    # inflated cohort estimate. Only run the extra solve when needed.
+    if any_unassigned:
+        # Procurement options to clear the shortage (all honest minima under the
+        # SAME reuse-aware capacity as the main solve). Dyelots are never merged,
+        # so each option replenishes exactly ONE lot:
+        #   topups_g[d] — extra kg to add to dyelot d ALONE (a standalone choice);
+        #                 None when that lot can't be the single sink.
+        #   deficit_g   — the CHEAPEST single-lot top-up (min over topups_g).
+        #   new_lot_g   — size of ONE fresh dyelot to import instead.
+        topups_g = [_topup_one_lot_g(d, orders, n_lots, demand_g, cap_g, pk_g,
+                                     machine_order, config)
+                    for d in range(n_lots)]
+        out["topups_g"] = topups_g
+        feasible = [g for g in topups_g if g is not None]
+        out["deficit_g"] = min(feasible) if feasible else 0
+        out["new_lot_g"] = _new_lot_g(
+            orders, n_lots, demand_g, cap_g, pk_g, machine_order, config)
     return out
+
+
+def _topup_one_lot_g(d_fill, orders, n_lots, demand_g, cap_g, pk_g,
+                     machine_order, config) -> Optional[int]:
+    """Minimal extra capacity (grams) added to dyelot `d_fill` ALONE (all other
+    lots fixed at their current stock) so that a one-dyelot-per-order assignment of
+    ALL orders becomes feasible. This is a STANDALONE option — dyelots are never
+    merged, so a real top-up replenishes exactly one lot — not a spread across
+    several. Returns None if even an unbounded single-lot top-up can't host the
+    orders (should not happen: lot d_fill can absorb everything)."""
+    m = cp_model.CpModel()
+    x = {o: [m.NewBoolVar(f"tx_{o}_{d}") for d in range(n_lots)] for o in orders}
+    ub = _cap_slack_g(demand_g, pk_g, machine_order)
+    fill = m.NewIntVar(0, ub, "fill")
+    extra = [fill if d == d_fill else 0 for d in range(n_lots)]  # only d_fill grows
+    for o in orders:
+        m.Add(sum(x[o]) == 1)  # every order must land on exactly one lot
+    _add_roll_capacity(m, x, orders, n_lots, demand_g, cap_g, pk_g,
+                       machine_order, extra=extra)
+    m.Minimize(fill)
+    s = make_solver(config)
+    st = s.Solve(m)
+    if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return None
+    return int(s.Value(fill))
+
+
+def _new_lot_g(orders, n_lots, demand_g, cap_g, pk_g,
+               machine_order, config) -> int:
+    """Minimal size (grams) of ONE fresh dyelot which, added alongside the
+    existing lots, makes a one-dyelot-per-order assignment of ALL orders feasible.
+    Same expandable-bin model but the free capacity lives ONLY on a new
+    (n_lots+1)-th lot — the 'import a new dyelot of this size' answer. The new lot
+    inherits the smallest existing roll size (whole-roll charge stays consistent)."""
+    nl = n_lots + 1
+    cap2 = cap_g + [0]
+    pk2 = pk_g + [min(pk_g)]
+    m = cp_model.CpModel()
+    x = {o: [m.NewBoolVar(f"nx_{o}_{d}") for d in range(nl)] for o in orders}
+    ub = _cap_slack_g(demand_g, pk2, machine_order)  # safe bound (gross ≥ Σnet)
+    new = m.NewIntVar(0, ub, "new_lot")
+    extra = [0] * n_lots + [new]          # only the fresh lot is expandable
+    for o in orders:
+        m.Add(sum(x[o]) == 1)
+    _add_roll_capacity(m, x, orders, nl, demand_g, cap2, pk2,
+                       machine_order, extra=extra)
+    m.Minimize(new)
+    s = make_solver(config)
+    st = s.Solve(m)
+    if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return 0
+    return int(s.Value(new))

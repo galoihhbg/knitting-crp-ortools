@@ -180,8 +180,44 @@ def test_shortage_reported_no_crash():
     assert any(s["vi"] == VI for s in res["dyelot_shortage"])
     sh = next(s for s in res["dyelot_shortage"] if s["vi"] == VI)
     assert sh["demand_kg"] == 150.0 and sh["stock_kg"] == 100.0
+    # net_demand_kg is the consumed-into-product demand (Go classifies on this).
+    assert sh["net_demand_kg"] == 150.0
+    # Minimal extra capacity to place all 3 orders (one lot each, sharing L1):
+    # 150 demand − 100 stock = 50 kg.
+    assert sh["single_lot_deficit_kg"] == 50.0
     # The two placeable orders are still assigned (≤100 kg), nothing crashed.
     assert len(res["order_dyelot_assignment"]) == 2
+
+
+def test_single_lot_deficit_fragmentation():
+    """Total stock ≥ demand but no single lot can host an order → capacity_shortage
+    with a SMALL deficit (the honest 'add this much to clear'), not the whole
+    stranded order's demand."""
+    VI = "V"
+    tasks = [
+        _knit_task("u1", "A", {VI: 5.0}),
+        _knit_task("u2", "B", {VI: 5.0}),
+    ]
+    assigns = [_assign("u1", "M1", 0), _assign("u2", "M1", 100)]
+    # Two lots 6 + 4 = 10 kg total == 10 kg demand, but {5,5} cannot be packed
+    # one-lot-each: one order fits the 6-lot, the other (5) exceeds the 4-lot.
+    stock = [
+        {"vi": VI, "dyelot": "L6", "remaining_kg": 6.0, "packing_size": 1.0},
+        {"vi": VI, "dyelot": "L4", "remaining_kg": 4.0, "packing_size": 1.0},
+    ]
+    res = allocate_dyelots(tasks, assigns, stock, CFG)
+
+    assert len(res["dyelot_unassigned"]) == 1
+    sh = next(s for s in res["dyelot_shortage"] if s["vi"] == VI)
+    assert sh["stock_kg"] == 10.0
+    # Cheapest single-lot top-up = +1 kg (grow L4 4→5 to host the stranded order).
+    assert sh["single_lot_deficit_kg"] == 1.0
+    # topups are ALTERNATIVES (replenish ONE lot, never a spread): either grow L4
+    # by 1 kg, OR grow L6 by 4 kg (both 5-kg orders pile on L6's shared creel).
+    tu = {t["dyelot"]: t["add_kg"] for t in sh["topups"]}
+    assert tu == {"L4": 1.0, "L6": 4.0}
+    # OR import a fresh 5 kg dyelot to host one stranded order.
+    assert sh["new_lot_kg"] == 5.0
 
 
 def test_no_stock_vi_reported_as_shortage():
@@ -192,7 +228,13 @@ def test_no_stock_vi_reported_as_shortage():
     res = allocate_dyelots(tasks, assigns, stock, CFG)
     assert res["order_dyelot_assignment"] == []
     assert {"order": "A", "vi": "VNOSTOCK", "reason": "no_dyelot_stock"} in res["dyelot_unassigned"]
-    assert any(s["vi"] == "VNOSTOCK" and s["stock_kg"] == 0.0 for s in res["dyelot_shortage"])
+    sh = next(s for s in res["dyelot_shortage"] if s["vi"] == "VNOSTOCK")
+    assert sh["stock_kg"] == 0.0
+    # Zero stock → the whole demand must be procured as fresh lot(s); no existing
+    # dyelot to top up.
+    assert sh["single_lot_deficit_kg"] == 10.0
+    assert sh["topups"] == []
+    assert sh["new_lot_kg"] == 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -283,14 +325,15 @@ def test_spread_not_cram_no_false_unassigned():
 
 
 # ---------------------------------------------------------------------------
-# 8. Roll-rounding prevents over-subscription (RC2) — net would fit both,
-#    gross does not.  lot=50, packing=10; order1 net=41 (→50 gross),
-#    order2 net=5 (→10 gross): 50+10=60 > 50, so they CANNOT both share it.
-#    Under the old NET capacity (41+5=46 ≤ 50) both were assigned and Go later
-#    found the lot physically short.
+# 8. Orders sharing a machine SHARE the creel (reuse, C). Sequential orders on
+#    one machine draw from the same mounted cones, so the rolls cover their
+#    SUMMED net, not each rounded up independently. lot=50, pk=10; A net=41,
+#    B net=5 on M1 sequentially: Σnet=46 → 5 rolls = 50 ≤ 50 → BOTH fit (A leaves
+#    9 kg residual on the creel, B draws 5 of it). The old per-order gross
+#    (50+10=60) wrongly blocked this — exactly the phantom over-count.
 # ---------------------------------------------------------------------------
 
-def test_roll_rounding_blocks_oversubscription():
+def test_machine_shared_creel_packs_both():
     VI = "V"
     tasks = [
         _knit_task("u1", "A", {VI: 41.0}),
@@ -301,9 +344,9 @@ def test_roll_rounding_blocks_oversubscription():
 
     res = allocate_dyelots(tasks, assigns, stock, CFG)
 
-    # Net (46) would pack both; gross (50+10=60) cannot → exactly one placed.
-    assert len(res["order_dyelot_assignment"]) == 1
-    assert len(res["dyelot_unassigned"]) == 1
+    # Reuse: 5 rolls (50 kg) cover Σnet 46 → both placed, lot exactly full.
+    assert len(res["order_dyelot_assignment"]) == 2
+    assert res["dyelot_unassigned"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -327,21 +370,21 @@ def test_genuine_shortage_preserved():
     assert res["order_dyelot_assignment"] == []
     assert len(res["dyelot_unassigned"]) == 2
     sh = next(s for s in res["dyelot_shortage"] if s["vi"] == VI)
-    # demand_kg is GROSS now: each order 55 net → 60 gross (whole 10 kg rolls).
-    assert sh["demand_kg"] == 120.0 and sh["stock_kg"] == 50.0
+    # demand_kg is reuse-aware GROSS: both orders share M1's creel → Σnet 110 →
+    # 11 rolls = 110 kg (not 60+60=120 per-order).
+    assert sh["demand_kg"] == 110.0 and sh["stock_kg"] == 50.0
 
 
 # ---------------------------------------------------------------------------
-# 12. Gross-overflow shortage IS reported even when NET demand fits stock
-#     exactly (the BATCH_0-665 / VI-3039 production case: net 403 == stock 403
-#     but gross 413 > 403, so one order is dropped — must NOT be a silent
-#     unassigned with no shortage row).
+# 12. Reuse packs orders even when net == stock exactly. Sequential orders on one
+#     machine share the mounted roll (the first order's residual feeds the next),
+#     so there is NO phantom gross overflow. A net 8 + B net 2 on M1, lot 10,
+#     pk 10 → 1 roll (10 kg) covers both → both placed, NO shortage. (This is the
+#     VI-3039 / W9xTMuuLxR production case: with reuse the demand fits the stock.)
 # ---------------------------------------------------------------------------
 
-def test_gross_overflow_emits_shortage_when_net_fits():
+def test_reuse_packs_when_net_equals_stock():
     VI = "V"
-    # Two orders, net 8 + 2 == stock 10 exactly; packing 10 → each rounds up to a
-    # whole 10 kg roll → gross 10 + 10 = 20 > 10, so exactly one is unplaceable.
     tasks = [
         _knit_task("u1", "A", {VI: 8.0}),
         _knit_task("u2", "B", {VI: 2.0}),
@@ -351,11 +394,9 @@ def test_gross_overflow_emits_shortage_when_net_fits():
 
     res = allocate_dyelots(tasks, assigns, stock, CFG)
 
-    assert len(res["order_dyelot_assignment"]) == 1
-    assert len(res["dyelot_unassigned"]) == 1
-    # The fix: a shortage row appears although net (10) == stock (10).
-    sh = next(s for s in res["dyelot_shortage"] if s["vi"] == VI)
-    assert sh["demand_kg"] == 20.0 and sh["stock_kg"] == 10.0
+    assert len(res["order_dyelot_assignment"]) == 2
+    assert res["dyelot_unassigned"] == []
+    assert all(s["vi"] != VI for s in res["dyelot_shortage"])
 
 
 # ---------------------------------------------------------------------------
@@ -442,15 +483,13 @@ def test_determinism_synthetic_spread():
 
 
 # ---------------------------------------------------------------------------
-# 12. Creel-up (slots) blocks over-subscription (RC2, creel floor) — net fits,
-#     gross with the slots floor does not. lot=50, packing=10; A net=20 slots=5
-#     (→ max(2,5)·10 = 50 gross), B net=10 slots=2 (→ max(1,2)·10 = 20 gross):
-#     50+20=70 > 50, so they CANNOT share it. Under plain net (20+10=30 ≤ 50)
-#     both packed and Go later found the lot physically short — exactly the
-#     dyelot-at-net-edge bug.
+# 12b. Orders sharing a machine share the creel INCLUDING its width (max slots):
+#     the cones mounted for the widest order are reused by the rest, charged once.
+#     A net=20 slots=5, B net=10 slots=2 on M1 sequentially, lot=50 pk=10 →
+#     max(ceil(30/10), 5) = 5 rolls = 50 ≤ 50 → BOTH fit (not 50+20=70 per-order).
 # ---------------------------------------------------------------------------
 
-def test_creel_up_slots_blocks_oversubscription():
+def test_machine_shared_creel_with_slots():
     VI = "V"
     tasks = [
         _knit_task("u1", "A", {VI: 20.0}, slots={VI: 5}),
@@ -461,8 +500,8 @@ def test_creel_up_slots_blocks_oversubscription():
 
     res = allocate_dyelots(tasks, assigns, stock, CFG)
 
-    assert len(res["order_dyelot_assignment"]) == 1
-    assert len(res["dyelot_unassigned"]) == 1
+    assert len(res["order_dyelot_assignment"]) == 2
+    assert res["dyelot_unassigned"] == []
 
 
 # ---------------------------------------------------------------------------
