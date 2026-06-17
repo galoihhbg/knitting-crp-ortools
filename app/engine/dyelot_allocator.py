@@ -73,6 +73,7 @@ def allocate_dyelots(
     knitting_assignments: List[Dict[str, Any]],
     dyelot_stock: Optional[List[Dict[str, Any]]],
     config: Dict[str, Any],
+    vi_packing: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Allocate one dyelot per (order, VI), flush-optimized, per VI independently.
 
@@ -173,13 +174,24 @@ def allocate_dyelots(
                 unassigned.append({"order": order, "vi": vi,
                                    "reason": "no_dyelot_stock"})
             # No stock at all → the whole demand must be procured as a fresh lot;
-            # no existing dyelot to top up.
-            shortage.append({"vi": vi, "demand_kg": round(demand_kg, 3),
+            # no existing dyelot to top up. Size the fresh lot by the reuse-aware
+            # GROSS (whole-roll + creel-up), using the vi's default packing size
+            # from Go; fall back to the net floor when no packing is known.
+            order_g = {o: _g(order_kg[o]) for o in order_kg}
+            # Roll size from Go; default 1 kg when a vi has no configured packing
+            # (matches Go's stock-lot fallback) so we still report GROSS, not net.
+            pk = float((vi_packing or {}).get(vi, 0) or 0)
+            if pk <= 0:
+                pk = 1.0
+            gross_g = _vi_gross_demand_g(
+                sorted(order_kg), order_g, [max(_g(pk), 1)], vi_mo.get(vi, {}))
+            new_lot_kg = gross_g / _KG_SCALE
+            shortage.append({"vi": vi, "demand_kg": round(new_lot_kg, 3),
                              "net_demand_kg": round(demand_kg, 3),
                              "stock_kg": 0.0,
-                             "single_lot_deficit_kg": round(demand_kg, 3),
+                             "single_lot_deficit_kg": round(new_lot_kg, 3),
                              "topups": [],
-                             "new_lot_kg": round(demand_kg, 3)})
+                             "new_lot_kg": round(new_lot_kg, 3)})
             logger.warning(f"🎨 VI {vi}: {len(order_kg)} order(s) consume it but "
                            f"dyelot_stock is empty → shortage.")
             continue

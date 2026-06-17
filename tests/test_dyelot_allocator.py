@@ -230,11 +230,31 @@ def test_no_stock_vi_reported_as_shortage():
     assert {"order": "A", "vi": "VNOSTOCK", "reason": "no_dyelot_stock"} in res["dyelot_unassigned"]
     sh = next(s for s in res["dyelot_shortage"] if s["vi"] == "VNOSTOCK")
     assert sh["stock_kg"] == 0.0
-    # Zero stock → the whole demand must be procured as fresh lot(s); no existing
-    # dyelot to top up.
+    # Zero stock + no vi_packing → default 1 kg roll; gross of one 10 kg order on a
+    # single machine with no creel slots = 10 kg (whole 1 kg rolls, no creel-up).
     assert sh["single_lot_deficit_kg"] == 10.0
     assert sh["topups"] == []
     assert sh["new_lot_kg"] == 10.0
+
+
+def test_no_stock_new_lot_is_gross_when_packing_known():
+    """Zero-stock vi WITH a known default packing → fresh-lot size is the
+    reuse-aware GROSS (whole-roll + creel-up), not the net floor. One order, 13 kg
+    net on 2 machines (slots 2) at packing 10 → each machine pulls 2 rolls = 20 kg
+    → gross 40 kg, well above net 13."""
+    tasks = [
+        _knit_task("u1", "A", {"V": 7.0}, slots={"V": 2}),
+        _knit_task("u2", "A", {"V": 6.0}, slots={"V": 2}),
+    ]
+    assigns = [_assign("u1", "M1", 0), _assign("u2", "M2", 0)]
+    stock = [{"vi": "OTHER", "dyelot": "L1", "remaining_kg": 100.0, "packing_size": 1.0}]
+    res = allocate_dyelots(tasks, assigns, stock, CFG, vi_packing={"V": 10.0})
+    sh = next(s for s in res["dyelot_shortage"] if s["vi"] == "V")
+    assert sh["net_demand_kg"] == 13.0
+    # M1: ceil(7/10)=1 but creel floor 2 → 20 kg; M2 likewise 20 kg → 40 kg gross.
+    assert sh["new_lot_kg"] == 40.0
+    assert sh["demand_kg"] == 40.0
+    assert sh["topups"] == []
 
 
 # ---------------------------------------------------------------------------

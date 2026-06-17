@@ -174,4 +174,8 @@ class SolverPayload(BaseModel):
         description="Per-material creel capacity: material_code → total available rolls/slots",
     )
     dyelot_stock: List[DyelotStock] = Field(default_factory=list)
+    # Default roll size (kg) per thread vi, incl. vis with zero current stock.
+    # The dyelot post-pass uses it to size a fresh dyelot for a zero-stock vi
+    # (whole-roll / creel-up gross needs a roll size). Empty → net floor fallback.
+    vi_packing_size: Dict[str, float] = Field(default_factory=dict)
     reschedule_hint: Optional[RescheduleHint] = None

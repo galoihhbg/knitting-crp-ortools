@@ -97,6 +97,9 @@ class Engine:
         # end of Pipeline.run().  Not consumed by any CP-SAT model (additive data
         # only).  Empty list when the Go backend does not send the field.
         self.dyelot_stock = payload.get("dyelot_stock") or []
+        # Default roll size per thread vi (incl. zero-stock vis) — lets the dyelot
+        # post-pass size a fresh lot for a vi with no current stock.
+        self.vi_packing_size: Dict[str, float] = payload.get("vi_packing_size") or {}
 
     def solve(self) -> Dict[str, Any]:
         if not self.tasks:
@@ -123,7 +126,8 @@ class Engine:
         # the payload carries no dyelot_stock.
         from .dyelot_allocator import allocate_dyelots
         dyelot_out = allocate_dyelots(
-            self.tasks, result.get("assignments", []), self.dyelot_stock, self.config
+            self.tasks, result.get("assignments", []), self.dyelot_stock, self.config,
+            vi_packing=self.vi_packing_size,
         )
         result.update(dyelot_out)
         return result
