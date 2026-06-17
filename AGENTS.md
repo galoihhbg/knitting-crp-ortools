@@ -77,6 +77,8 @@ All prior phases (P1–P3) are complete. See `MEMORY.md`.
 | `app/schemas/request_schema.py` | Go → Python contract (DO NOT break aliases) |
 | `app/schemas/response_schema.py` | Python → Go contract |
 | `app/tasks/solver_task.py` | Celery task + webhook callback |
+| `app/engine/dyelot_allocator.py` | Dyelot allocation post-pass (CP-SAT, per-VI) — runs after knitting scheduling |
+| `agent_docs/dyelot_solver_overview.md` | Dyelot post-pass: model, constraints, objective, shortage/procurement output |
 | `tests/test_material_constraints.py` | Material cumulative constraint tests |
 | `docs/PRD-Knitting-CRP-Ortools-MVP.md` | What to build + acceptance criteria |
 | `docs/TechDesign-Knitting-CRP-Ortools-MVP.md` | How to build it + implementation sketches |
