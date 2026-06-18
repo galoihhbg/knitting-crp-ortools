@@ -120,6 +120,21 @@ class SolverConfig(BaseModel):
     # finishes later.  Fixes severe worker idle/imbalance (machine-load stdev 965→40
     # on real payloads).
     enable_linking_balance: bool = True
+    # Panel co-completion (cold solve only).  A linking SLICE_k depends on the
+    # knitting batches of EVERY component (front/back/sleeve …) at the same index;
+    # linking can only start once the LAST of that set finishes.  The solver
+    # otherwise has no incentive to finish a whole panel together, so component
+    # ends drift apart (measured ~1228 min mean spread on a 660-task payload) and
+    # linking waits on the straggler.  This phase-1 objective term minimises each
+    # panel's max component-end (the BOM-ready time that gates linking), pulling the
+    # straggler component earlier so its linking slice can start sooner — WITHOUT
+    # extra machines (a sequencing nudge).  Weighted at the flow/slice-sync scale,
+    # so it is a commensurate secondary term (the dominant lateness penalty, ×10^7
+    # per minute vs panel ×10^4, still wins) — architecturally identical to the
+    # already-shipped apply_order_flow / apply_slice_sync objectives.
+    # Measured on cold payloads (78/322/612 tasks, production budget): component-end
+    # spread −61..−65%, linking starts −11..−25%, total lateness unchanged.
+    enable_panel_sync_objective: bool = True
 
 
 class PreviousAssignment(BaseModel):

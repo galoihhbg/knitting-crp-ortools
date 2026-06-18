@@ -163,6 +163,40 @@ class TestSameQtyFloor:
         # L_s1's c1 dep (K_c1_late, qty 10) is alone in its bucket → floor stays 500.
         assert lb_sameqty["L_s1"] == 500
 
+    def test_waitoffsets_relax_with_reassigned_panel(self):
+        """Regression: WaitOffsets must follow the bucket-reassigned panel, not
+        re-pin to the index panel.
+
+        Old bug: same-qty relaxed only the final_depends_on END but left the
+        WaitOffsets START+offset pinned to the specific index panel, so the floor
+        snapped back to the index value (no-op).  Now both end and start+offset are
+        read from the SAME bucket-assigned panel.
+
+        Crossed fixture + offset 300 on every dep.  L_s1 is reassigned the
+        first-finished panels of each bucket (K_c1_early/K_c2_early, start 0):
+          * end floor        = 100   (earliest panel end)
+          * WaitOffset floor = 0 + 300 = 300   ← uses the REASSIGNED panel's start
+          * result           = max(100, 300) = 300
+        The old re-pin would have used the index panel start (K_c1_late=100) →
+        100 + 300 = 400.  Index floor (no relaxation) is 500.
+        """
+        payload = make_crossed_payload()
+        linking = [t for t in payload["tasks"] if t["operation"] == "Linking"]
+        for t in linking:
+            t["wait_offsets"] = {d: 300 for d in t["final_depends_on"]}
+        starts, ends = self._times(payload)
+        trans = {t["task_id"]: t["task_id"] for t in payload["tasks"]}
+
+        lb_index = _compute_start_lb(linking, starts, ends, trans)
+        lb_sameqty = compute_sameqty_start_lb(
+            linking, starts, ends, trans, payload["tasks"]
+        )
+        assert lb_index == {"L_s1": 500, "L_s2": 500}
+        # 300 (reassigned panel start 0 + 300), NOT 400 (old re-pin), NOT 100 (offset dropped).
+        assert lb_sameqty["L_s1"] == 300
+        assert lb_sameqty["L_s2"] == 500
+        assert all(lb_sameqty[k] <= lb_index[k] for k in lb_index)
+
     def test_unresolvable_or_nonknit_dep_falls_back_to_index(self):
         payload = make_crossed_payload()
         linking = [t for t in payload["tasks"] if t["operation"] == "Linking"]

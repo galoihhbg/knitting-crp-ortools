@@ -115,6 +115,7 @@ class Pipeline:
             reschedule_hint=p1_hint,
             all_pipeline_tasks=self.tasks,
             workload_shrank=self.workload_shrank,
+            translation_map=self.translation_map,
         )
         logger.info(f"✅ Phase 1 complete: {len(p1.assignments)} assignments, status={p1.status}")
 

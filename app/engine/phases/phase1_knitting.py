@@ -18,10 +18,12 @@ from ortools.sat.python import cp_model
 
 from app.engine.shared import (
     apply_order_flow_objective,
+    apply_panel_sync_objective,
     apply_slice_sync_objective,
     apply_soft_deadlines,
     apply_stability_hints_only,
     apply_stability_objective,
+    build_panel_map,
     build_resource_model,
     compute_horizon,
     extract_results,
@@ -299,6 +301,8 @@ def solve_knitting(
     workload_shrank: bool = False,  # accepted for pipeline-call uniformity; knitting
                                     # intentionally ignores it (stability > compaction:
                                     # it stays pinned on shrink, see the keep block below)
+    translation_map: Optional[Dict[str, str]] = None,  # sub-task/order → batch id;
+                                    # used to resolve linking deps for panel co-completion
     _wave: bool = False,            # internal: True when called for one rolling wave
                                     # (prevents recursive re-chunking)
 ) -> Phase1Result:
@@ -333,7 +337,7 @@ def solve_knitting(
     if not _wave and chunk_size > 0 and len(free_knitting) > chunk_size:
         return _solve_knitting_chunked(
             knitting_tasks, resources, config, horizon, reschedule_hint,
-            all_pipeline_tasks, chunk_size,
+            all_pipeline_tasks, chunk_size, translation_map,
         )
 
     resource_map: Dict[str, Dict[str, Any]] = {r["id"]: r for r in resources}
@@ -406,6 +410,23 @@ def solve_knitting(
     obj_terms = list(affinity_terms)
     task_map = {t["task_id"]: t for t in knitting_tasks}
 
+    # Panel co-completion map (cold solve only): each panel (linking consumer) →
+    # its component knitting batches, inverted from linking final_depends_on.
+    # Feeds the panel-sync objective below.
+    panel_meta: Dict[str, Dict[str, Any]] = {}
+    if (
+        not reschedule_hint
+        and all_pipeline_tasks
+        and config.get("enable_panel_sync_objective", True)
+    ):
+        knit_ids = {
+            t["task_id"] for t in knitting_tasks
+            if t.get("operation", "").lower() == "knitting"
+        }
+        _, panel_meta = build_panel_map(
+            all_pipeline_tasks, knit_ids, translation_map
+        )
+
     # Workforce constraints — capacity_block tasks constrain concurrent knitting
     _apply_workforce_constraints(model, task_vars, knitting_tasks, resource_map, config, horizon)
 
@@ -431,6 +452,16 @@ def solve_knitting(
     if not reschedule_hint:
         obj_terms += apply_order_flow_objective(model, task_vars, knitting_tasks, horizon)
         obj_terms += apply_slice_sync_objective(model, task_vars, knitting_tasks, horizon)
+        # B1: pull each panel's component batches to finish together (the max-end
+        # gates its linking slice).  Commensurate scale → nudge, not override.
+        if config.get("enable_panel_sync_objective", True) and panel_meta:
+            panel_terms = apply_panel_sync_objective(model, task_vars, panel_meta, horizon)
+            if panel_terms:
+                logger.info(
+                    f"   🧩 Phase1 panel-sync objective: {len(panel_terms)} panel(s) "
+                    f"co-completion penalised."
+                )
+            obj_terms += panel_terms
 
     # Reified-keep + hints-only on knitting.  apply_stability_objective is
     # NOT called here (it would double-stabilize via soft time penalty +
@@ -611,6 +642,7 @@ def _solve_knitting_chunked(
     reschedule_hint: Optional[Dict[str, Any]],
     all_pipeline_tasks: Optional[List[Dict[str, Any]]],
     chunk_size: int,
+    translation_map: Optional[Dict[str, str]] = None,
 ) -> Phase1Result:
     """Rolling-wave knitting: EDD-sorted whole-order waves, each solved single-
     worker (deterministic) with previous waves pinned as fixed intervals.
@@ -673,6 +705,7 @@ def _solve_knitting_chunked(
             horizon=horizon,
             reschedule_hint=reschedule_hint,
             all_pipeline_tasks=all_pipeline_tasks,
+            translation_map=translation_map,
             _wave=True,
         )
         if res.status not in ("feasible", "empty"):

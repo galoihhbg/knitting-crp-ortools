@@ -1054,6 +1054,118 @@ def apply_slice_sync_objective(
 
 
 # ---------------------------------------------------------------------------
+# Panel co-completion (knitting components of one garment finish together)
+# ---------------------------------------------------------------------------
+
+def build_panel_map(
+    all_pipeline_tasks: List[Dict[str, Any]],
+    knitting_task_ids: Set[str],
+    translation_map: Optional[Dict[str, str]] = None,
+) -> "tuple[Dict[str, str], Dict[str, Dict[str, Any]]]":
+    """Invert linking → knitting deps into per-panel groupings.
+
+    A linking SLICE_k consumes the knitting batch of EVERY component (front/back/
+    sleeve …) at index k via `final_depends_on`.  That set IS the panel: linking
+    cannot start until the LAST of it finishes.  Phase-1 never sees this structure
+    (the edge lives on the linking side), so the knitting solver has no reason to
+    finish a panel's components together — they drift apart and linking waits on
+    the straggler.  This builds the mapping phase-1 needs.
+
+    A knitting batch feeds exactly ONE linking slice (confirmed on real payloads:
+    each component → one linking order), so panels are disjoint.
+
+    Returns
+    -------
+    panel_of:   knit_task_id → panel_key (= the consuming linking task_id)
+    panel_meta: panel_key → {due, priority, index, members:[knit_task_id,…]}
+
+    Deps that don't resolve to a known knitting task (translation/non-knit) are
+    ignored — we never group what we can't identify as a knitting panel piece.
+    """
+    translation_map = translation_map or {}
+
+    def _resolve(raw_id: str) -> Optional[str]:
+        if raw_id in knitting_task_ids:
+            return raw_id
+        t = translation_map.get(raw_id)
+        if t in knitting_task_ids:
+            return t
+        return None
+
+    panel_of: Dict[str, str] = {}
+    panel_meta: Dict[str, Dict[str, Any]] = {}
+    for t in all_pipeline_tasks:
+        if t.get("operation", "").lower() != "linking":
+            continue
+        members = []
+        for dep in (t.get("final_depends_on") or []):
+            r = _resolve(dep)
+            if r is not None:
+                members.append(r)
+        if len(members) < 2:
+            # A 0/1-component "panel" has no spread to close — skip so it adds no
+            # objective term and the warm-start treats it as an ordinary task.
+            continue
+        panel_key = t["task_id"]
+        due = t.get("due_at_min")
+        panel_meta[panel_key] = {
+            "due": int(due) if due is not None else None,
+            "priority": int(t.get("priority", 5)),
+            "index": int(t.get("slice_index", 0)),
+            "members": members,
+        }
+        for k in members:
+            # First writer wins (a batch feeds one slice); ties resolved
+            # deterministically by sorted iteration is not guaranteed here, so
+            # keep the EARLIEST-due consumer if a batch ever appears twice.
+            prev = panel_of.get(k)
+            if prev is None:
+                panel_of[k] = panel_key
+            else:
+                pd = panel_meta[prev]["due"]
+                nd = panel_meta[panel_key]["due"]
+                if nd is not None and (pd is None or nd < pd):
+                    panel_of[k] = panel_key
+    return panel_of, panel_meta
+
+
+def apply_panel_sync_objective(
+    model: cp_model.CpModel,
+    task_vars: Dict[str, Dict[str, Any]],
+    panel_meta: Dict[str, Dict[str, Any]],
+    horizon: int,
+) -> List[Any]:
+    """B1: minimise each panel's max component-end (the BOM-ready time that gates
+    its linking slice).
+
+    For every panel with ≥2 component batches present in this model, create
+    `panel_end ≥ end` of each member and penalise `panel_end`.  Pulling the
+    straggler component earlier lets the linking slice start sooner WITHOUT
+    needing extra machines — it is a sequencing nudge, commensurate with the
+    flow/slice-sync scale so it never overrides true lateness.
+
+    Members not in `task_vars` (e.g. in another rolling wave) are skipped; the
+    term still synchronises whatever subset this model owns.
+    """
+    terms: List[Any] = []
+    lateness_scale = min(max(1, horizon // 1000), 50)
+    for panel_key, meta in sorted(panel_meta.items()):
+        members = [m for m in meta["members"] if m in task_vars]
+        if len(members) < 2:
+            continue
+        prio = int(meta.get("priority", 5))
+        weight = 10 ** (6 - prio)
+        w = (weight * lateness_scale) // 20
+        if w <= 0:
+            continue
+        panel_end = model.NewIntVar(0, horizon, f"panel_end_{panel_key}")
+        for m in members:
+            model.Add(panel_end >= task_vars[m]["end"])
+        terms.append(panel_end * w)
+    return terms
+
+
+# ---------------------------------------------------------------------------
 # Infeasibility diagnosis
 # ---------------------------------------------------------------------------
 

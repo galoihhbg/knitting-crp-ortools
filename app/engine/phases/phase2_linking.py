@@ -245,7 +245,18 @@ def solve_linking(
         logger.error(f"❌ Phase 2 MODEL_INVALID: {validation}")
         return Phase2Result(status="model_invalid")
 
-    solver = make_solver(config, has_hint=bool(reschedule_hint))
+    # Cold solve: tighten the gap to 0 so the solver pulls every linking slice to
+    # its earliest feasible start instead of parking it late.  Linking machines are
+    # interchangeable and lightly loaded, so a slice whose panels finished early can
+    # almost always run early — but moving it earlier saves <1% of the (large,
+    # absolute) objective, which the default 1% gap swallows: measured a slice left
+    # idle 3215 min past its ready time (material done, machine free) until gap→0
+    # pulled it back.  On reschedule keep the 1% gap so the stability anchors win.
+    solver = make_solver(
+        config,
+        has_hint=bool(reschedule_hint),
+        relative_gap=0.0 if not reschedule_hint else None,
+    )
     status_code = solver.Solve(model)
 
     logger.info(
@@ -383,8 +394,13 @@ def compute_sameqty_start_lb(
 
     lb: Dict[str, int] = {}
     for parent, slices in sorted(by_parent.items()):
-        # Panel ends per bucket (dedup theo resolved id), sort tăng dần.
-        bucket_ends: Dict[tuple, Dict[str, int]] = {}
+        # Panel records per bucket: resolved_id → (start, end).  We assign a slice
+        # a WHOLE panel (FIFO by end) and read BOTH its end (final_depends_on floor)
+        # and its start+offset (WaitOffsets floor) from that SAME panel.  Reading
+        # both from one panel is what removes the old re-pin: previously the bucket
+        # relaxed only the end while WaitOffsets re-pinned start+offset to the
+        # specific index panel, capping the floor back to the index value (no-op).
+        bucket_panels: Dict[tuple, Dict[str, tuple]] = {}
         for t in slices:
             for dep_id in (t.get("final_depends_on") or []):
                 resolved = _resolve(dep_id)
@@ -392,8 +408,14 @@ def compute_sameqty_start_lb(
                     continue
                 key = _knit_bucket(dep_id, resolved)
                 if key is not None:
-                    bucket_ends.setdefault(key, {})[resolved] = p1_end_times[resolved]
-        bucket_sorted = {k: sorted(v.values()) for k, v in bucket_ends.items()}
+                    bucket_panels.setdefault(key, {})[resolved] = (
+                        p1_start_times.get(resolved), p1_end_times[resolved]
+                    )
+        # Sort each bucket FIFO by (end, start, id) for a deterministic assignment.
+        bucket_sorted: Dict[tuple, List[tuple]] = {
+            k: sorted(v.values(), key=lambda se: (se[1], se[0] if se[0] is not None else se[1]))
+            for k, v in bucket_panels.items()
+        }
         ptr: Dict[tuple, int] = {}
 
         # FIFO: slice có floor-index sớm nhất nhận panel-xong sớm nhất của bucket.
@@ -408,21 +430,42 @@ def compute_sameqty_start_lb(
         for t in sorted(slices, key=lambda x: (_index_floor(x), x["task_id"])):
             t_id = t["task_id"]
             current_lb = 0
+            wait_offsets = t.get("wait_offsets") or t.get("WaitOffsets") or {}
+            consumed_offsets: set = set()
             for dep_id in (t.get("final_depends_on") or []):
                 resolved = _resolve(dep_id)
                 if not resolved:
                     continue
+                # Offset for THIS component (per-component lead time, uniform across
+                # its panels) — reused when the slice is re-assigned a bucket sibling.
+                off = wait_offsets.get(dep_id)
+                if off is None:
+                    off = wait_offsets.get(resolved)
+                if dep_id in wait_offsets:
+                    consumed_offsets.add(dep_id)
+                if resolved in wait_offsets:
+                    consumed_offsets.add(resolved)
+
                 key = _knit_bucket(dep_id, resolved)
                 if key is None:
+                    # Not a same-qty-relaxable knitting dep — index behaviour.
                     current_lb = max(current_lb, p1_end_times[resolved])
+                    if off is not None and resolved in p1_start_times:
+                        current_lb = max(current_lb, p1_start_times[resolved] + int(off))
                     continue
-                ends = bucket_sorted[key]
+
+                panels = bucket_sorted[key]
                 k = ptr.get(key, 0)
                 ptr[key] = k + 1
-                current_lb = max(current_lb, ends[min(k, len(ends) - 1)])
+                p_start, p_end = panels[min(k, len(panels) - 1)]
+                current_lb = max(current_lb, p_end)
+                if off is not None and p_start is not None:
+                    current_lb = max(current_lb, p_start + int(off))
 
-            wait_offsets = t.get("wait_offsets") or t.get("WaitOffsets") or {}
+            # Any WaitOffsets not paired to a final_depends_on entry → index floor.
             for raw_batch_id, offset in wait_offsets.items():
+                if raw_batch_id in consumed_offsets:
+                    continue
                 resolved = _resolve(raw_batch_id)
                 if resolved and resolved in p1_start_times:
                     current_lb = max(current_lb, p1_start_times[resolved] + int(offset))
