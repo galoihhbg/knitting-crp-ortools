@@ -24,7 +24,16 @@ logger = logging.getLogger(__name__)
 # the primary speed/quality knob: lower = faster (stops earlier at the same
 # FEASIBLE, still byte-reproducible), higher = more optimisation.  Override per
 # run via config `max_deterministic_time`.
-DEFAULT_MAX_DET_TIME: float = 30.0
+#
+# Lowered 30→12 (2026-06): the knitting model is disjunctive (no-overlap +
+# optional machine-assignment + cumulative workforce) → its LP lower bound is
+# frozen at the root (gap 40–84% even on a 16-task instance), so the solver
+# NEVER reaches OPTIMAL no matter the budget — it just burns time chasing an
+# unprovable bound.  Measured: incumbent quality hits the diminishing-returns
+# knee (~5% of the final FEASIBLE objective) around det≈12 on a 60-task wave,
+# while det=30 costs ~2.5× the wall time for a <5% incumbent gain.  12 is the
+# speed/quality sweet spot; raise per-run via config if a payload needs it.
+DEFAULT_MAX_DET_TIME: float = 12.0
 
 
 # ---------------------------------------------------------------------------
@@ -984,6 +993,66 @@ def apply_order_flow_objective(
         span = model.NewIntVar(0, horizon, f"group_span_{gid}")
         model.Add(span == group_end - group_start)
         terms.append(span * flow_w)
+
+    return terms
+
+
+def apply_order_cluster_objective(
+    model: cp_model.CpModel,
+    task_vars: Dict[str, Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+    horizon: int,
+) -> List[Any]:
+    """Gom mỗi SALES-ORDER vào một cửa sổ thời gian liền mạch.
+
+    `apply_order_flow_objective` đã nén span theo `group_id` = COMPONENT batch
+    (mỗi panel-batch chặt), NHƯNG một sales-order gồm nhiều component (KCC + KHL):
+    không gì kéo các component của cùng một đơn về gần nhau → đơn bị knit một phần,
+    bỏ trống vài ca, rồi chạy tiếp ("làm tư hôm trước, mấy ngày sau mới xong").
+    Công nhân theo dõi theo ĐƠN nên WIP dở dang nằm chờ là pain thật.
+
+    Phạt span (max_end − min_start) theo `order_group_id`.  Trọng số nằm DƯỚI
+    lateness (×100) nên solver chỉ gom khi KHÔNG làm trễ đơn: dư slack thì gom
+    miễn phí, deadline chặt thì lateness vẫn thắng (đã chứng minh ép liền mạch
+    lúc chặt sẽ trễ → khi đó số hạng này tự nhường).  Cold-only (caller gate).
+    """
+    terms: List[Any] = []
+    lateness_scale = min(max(1, horizon // 1000), 50)
+    task_map = {t["task_id"]: t for t in tasks}
+
+    # Group by order_group_id (the SALES order), knitting tasks only.
+    groups: Dict[str, List[str]] = {}
+    for t in tasks:
+        og = t.get("order_group_id")
+        t_id = t["task_id"]
+        if og and t_id in task_vars and t.get("operation", "").lower() == "knitting":
+            groups.setdefault(og, []).append(t_id)
+
+    for og, t_ids in sorted(groups.items()):
+        # Need ≥2 tasks for a span to be meaningful; a 1-task order is already tight.
+        if len(t_ids) <= 1:
+            continue
+
+        max_priority = min((int(task_map[tid].get("priority", 5)) for tid in t_ids), default=3)
+        weight = 10 ** (6 - max_priority)
+        # Below order_flow's component span (//20) — a gentle nudge that breaks the
+        # solver's lateness-neutral ties toward whole-order continuity without
+        # disturbing component packing or trading any tardiness.
+        cluster_w = (weight * lateness_scale) // 20
+
+        if cluster_w <= 0:
+            continue
+
+        o_start = model.NewIntVar(0, horizon, f"ord_start_{og}")
+        o_end = model.NewIntVar(0, horizon, f"ord_end_{og}")
+        for tid in t_ids:
+            tv = task_vars[tid]
+            model.Add(o_end >= tv["end"])
+            model.Add(o_start <= tv["start"])
+
+        span = model.NewIntVar(0, horizon, f"ord_span_{og}")
+        model.Add(span == o_end - o_start)
+        terms.append(span * cluster_w)
 
     return terms
 

@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 from ortools.sat.python import cp_model
 
 from app.engine.shared import (
+    apply_order_cluster_objective,
     apply_order_flow_objective,
     apply_panel_sync_objective,
     apply_slice_sync_objective,
@@ -438,7 +439,18 @@ def solve_knitting(
     # PO bounding-box: soft co-location for non-pinned tasks on each machine.
     # Pinned tasks are excluded: their fixed start times may be negative (in-progress)
     # which would force po_start < 0 while po_start ∈ [0, horizon] → instant INFEASIBLE.
-    _apply_po_bounding_box(model, task_vars, knitting_tasks, resource_map, horizon)
+    # Soft per-(order,machine) contiguity penalty (cold only): finish each order
+    # before starting another on a machine ("dứt điểm đơn đó") instead of interleaving.
+    contiguity_w = 0
+    if not reschedule_hint and config.get("enable_knitting_contiguity", True):
+        lateness_scale = min(max(1, horizon // 1000), 50)
+        contiguity_w = max(1, lateness_scale * int(config.get("knitting_contiguity_mult", 4)))
+    _po_terms = _apply_po_bounding_box(
+        model, task_vars, knitting_tasks, resource_map, horizon, contiguity_w=contiguity_w
+    )
+    if contiguity_w and _po_terms:
+        logger.info(f"   🧱 Phase1 knitting contiguity: {len(_po_terms)} (order,machine) span penalties (w={contiguity_w}).")
+        obj_terms += _po_terms
 
     obj_terms += apply_soft_deadlines(model, task_vars, task_map, horizon)
     # Re-schedule path: skip flow/sync objectives — they fight the reified-keep
@@ -452,6 +464,17 @@ def solve_knitting(
     if not reschedule_hint:
         obj_terms += apply_order_flow_objective(model, task_vars, knitting_tasks, horizon)
         obj_terms += apply_slice_sync_objective(model, task_vars, knitting_tasks, horizon)
+        # Whole-order temporal continuity: keep each sales order's components in one
+        # window so an order isn't started, abandoned for shifts, then resumed.
+        # Below lateness → clusters only when free (see apply_order_cluster_objective).
+        if config.get("enable_order_cluster_objective", True):
+            cluster_terms = apply_order_cluster_objective(model, task_vars, knitting_tasks, horizon)
+            if cluster_terms:
+                logger.info(
+                    f"   🧷 Phase1 order-cluster objective: {len(cluster_terms)} sales-order "
+                    f"span(s) penalised for WIP continuity."
+                )
+            obj_terms += cluster_terms
         # B1: pull each panel's component batches to finish together (the max-end
         # gates its linking slice).  Commensurate scale → nudge, not override.
         if config.get("enable_panel_sync_objective", True) and panel_meta:
@@ -1028,6 +1051,146 @@ def left_shift_cold_knitting(
     return moved
 
 
+def _count_fragmented_orders(
+    by_machine: Dict[str, List[Dict[str, Any]]],
+    info: Dict[str, Dict[str, Any]],
+    start_of,
+) -> int:
+    """Number of (order, machine) pairs whose tasks are split into ≥2 time-runs.
+
+    `start_of(task_id)` returns the start time to sort by.  An order interleaved by
+    another order on a machine shows up as the same order appearing in >1 run.
+    """
+    frag = 0
+    for items in by_machine.values():
+        seq = sorted(items, key=lambda a: (start_of(a["task_id"]), a["task_id"]))
+        runs: List[str] = []
+        for a in seq:
+            oid = info[a["task_id"]].get("original_order_id") or a["task_id"]
+            if not runs or runs[-1] != oid:
+                runs.append(oid)
+        from collections import Counter
+        c = Counter(runs)
+        frag += sum(1 for v in c.values() if v > 1)
+    return frag
+
+
+def reorder_contiguous_knitting(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> Optional[Dict[str, Dict[str, int]]]:
+    """COLD-only: re-sequence each machine so an order's knitting tasks run
+    contiguously ("dứt điểm đơn đó") instead of interleaved with other orders.
+
+    Returns ``{"start": {tid: s}, "end": {tid: e}}`` for the knitting tasks IFF the
+    reorder (a) keeps the workforce cap, and (b) strictly reduces the number of
+    fragmented (order, machine) pairs.  Returns ``None`` otherwise — the caller then
+    keeps the solver schedule.
+
+    This does NOT decide acceptance on its own: re-sequencing moves the YIELDING
+    order's tasks LATER, so unlike `left_shift_cold_knitting` it is NOT
+    downstream-safe by construction.  The pipeline runs it as a CANDIDATE, re-solves
+    phases 2–5 on the new ends, and accepts only if total lateness does not increase
+    (see `Pipeline._try_knitting_contiguity`).
+
+    Determinism: orders are sequenced by (earliest original start on the machine,
+    order_id); tasks within an order by (original start, task_id).  Machines that
+    carry a pinned/in-progress knitting task are left untouched (the pin is an
+    immovable anchor and repacking around it is out of scope for the cold path).
+    """
+    info = {t["task_id"]: t for t in all_tasks}
+    by_machine: Dict[str, List[Dict[str, Any]]] = {}
+    for a in assignments:
+        t = info.get(a["task_id"])
+        if t is None or t.get("operation", "").lower() != "knitting":
+            continue
+        by_machine.setdefault(a["machine_id"], []).append(a)
+    if not by_machine:
+        return None
+
+    orig_start = {a["task_id"]: a["start_time"] for items in by_machine.values() for a in items}
+    base_end = {a["task_id"]: a["end_time"] for items in by_machine.values() for a in items}
+    base_frag = _count_fragmented_orders(by_machine, info, lambda tid: orig_start[tid])
+
+    # Per-task latest end that keeps the task's whole downstream chain inside the
+    # order due (chain_min = Σ downstream durations, optimistic re: contention — the
+    # pipeline-wide verify is the real gate).  A task already at/past this (tight or
+    # late) is capped at its baseline end so the reorder never pushes it later.  This
+    # makes the candidate contiguize only the SLACK machines; the rest stay verbatim.
+    chain_min = _compute_downstream_chain_min(all_tasks)
+    cap: Dict[str, int] = {}
+    for items in by_machine.values():
+        for a in items:
+            tid = a["task_id"]
+            due = int(info[tid].get("due_at_min", 0) or 0)
+            safe = (due - int(chain_min.get(tid, 0))) if due else 10**15
+            cap[tid] = max(base_end[tid], safe)
+
+    new_start: Dict[str, int] = dict(orig_start)
+    new_end: Dict[str, int] = dict(base_end)
+    for _m, items in by_machine.items():
+        if any(info[a["task_id"]].get("is_pinned") for a in items):
+            # immovable anchor on this machine — keep solver positions verbatim
+            continue
+        # Group the machine's tasks by order; order the groups EDD-ishly by the
+        # order's earliest original start so the machine's overall sequence (and
+        # thus its left edge) is preserved — only the interleaving is removed.
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for a in items:
+            oid = info[a["task_id"]].get("original_order_id") or a["task_id"]
+            groups.setdefault(oid, []).append(a)
+        order_keys = sorted(
+            groups, key=lambda o: (min(x["start_time"] for x in groups[o]), o)
+        )
+        # Repack from the machine's original earliest start (do not shift left of it,
+        # which would only add early-window concurrency pressure).
+        prev_end = min(a["start_time"] for a in items)
+        cand_s: Dict[str, int] = {}
+        cand_e: Dict[str, int] = {}
+        safe = True
+        for oid in order_keys:
+            for a in sorted(groups[oid], key=lambda x: (x["start_time"], x["task_id"])):
+                t_id = a["task_id"]
+                sa = int(info[t_id].get("start_after_min", 0) or 0)
+                dur = int(a["end_time"]) - int(a["start_time"])
+                ns = max(sa, prev_end)
+                if ns + dur > cap[t_id]:
+                    safe = False
+                    break
+                cand_s[t_id] = ns
+                cand_e[t_id] = ns + dur
+                prev_end = ns + dur
+            if not safe:
+                break
+        if safe:
+            new_start.update(cand_s)
+            new_end.update(cand_e)
+        # else: leave this machine's tasks at their baseline (already in new_*)
+
+    knitting_tasks = [t for t in all_tasks
+                      if t.get("operation", "").lower() in ("knitting", "capacity_block")]
+    if not _knitting_workforce_ok(new_start, new_end, knitting_tasks, config):
+        logger.info(
+            "🧱 Knitting contiguity reorder: candidate exceeds workforce cap — skipped."
+        )
+        return None
+
+    new_frag = _count_fragmented_orders(by_machine, info, lambda tid: new_start[tid])
+    if new_frag >= base_frag:
+        logger.info(
+            f"🧱 Knitting contiguity reorder: no fragmentation gain "
+            f"(base={base_frag}, candidate={new_frag}) — skipped."
+        )
+        return None
+
+    logger.info(
+        f"🧱 Knitting contiguity reorder: candidate cuts fragmented (order,machine) "
+        f"pairs {base_frag}→{new_frag} — verifying downstream…"
+    )
+    return {"start": new_start, "end": new_end}
+
+
 # ---------------------------------------------------------------------------
 # Workforce constraints (AddCumulative with capacity_block + gap-filler)
 # ---------------------------------------------------------------------------
@@ -1265,7 +1428,16 @@ def _apply_po_bounding_box(
     tasks: List[Dict[str, Any]],
     resource_map: Dict[str, Dict[str, Any]],
     horizon: int,
-) -> None:
+    contiguity_w: int = 0,
+) -> List[Any]:
+    """Per-(order, machine) bounding box.  When contiguity_w > 0, also returns a
+    SOFT penalty on each order's per-machine footprint span (po_end − po_start) so
+    the solver finishes one order before starting another on a machine ("dứt điểm
+    đơn đó") instead of interleaving — bosses prefer whole-order completion even
+    when nothing is late.  Soft (not the old hard span==Σdur equality), so a shift
+    break that legitimately splits an order still yields rather than going INFEASIBLE.
+    """
+    terms: List[Any] = []
     # Only group FREE (non-pinned) knitting tasks.
     # Pinned tasks may have pinned_start_time < 0 (in-progress), which would force
     # po_start ≤ negative value while po_start ∈ [0, horizon] → instant INFEASIBLE.
@@ -1312,3 +1484,16 @@ def _apply_po_bounding_box(
             # That equality forces zero gap between PO tasks, which is INFEASIBLE when
             # shift breaks separate tasks (span > sum-of-durations). Co-location is
             # already encouraged via machine affinity scoring in the objective.
+            #
+            # SOFT contiguity: penalise this order's footprint span on this machine.
+            # Interleaving another order in the middle stretches po_end−po_start, so
+            # minimising it makes the solver finish the order contiguously (or move it
+            # off this machine) — fragmentation is otherwise objective-NEUTRAL (the
+            # solver picks an interleaved layout arbitrarily, measured: gap→0 unchanged).
+            # When inactive on this machine po_start/po_end collapse equal → 0 penalty.
+            if contiguity_w > 0:
+                span = model.NewIntVar(0, horizon, f"po_{po_id}_{r_id}_span")
+                model.Add(span == po_end - po_start)
+                terms.append(span * contiguity_w)
+
+    return terms

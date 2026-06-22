@@ -135,6 +135,55 @@ class SolverConfig(BaseModel):
     # Measured on cold payloads (78/322/612 tasks, production budget): component-end
     # spread −61..−65%, linking starts −11..−25%, total lateness unchanged.
     enable_panel_sync_objective: bool = True
+    # Prompt-washing (cold solve only).  Goods that finished linking but sit unwashed
+    # for a long time risk being mislaid (operational WIP risk).  The washing
+    # objective otherwise minimises batch count + machines used (consolidation) and
+    # rewards early starts only weakly (×1), so with loose due dates an early-ready
+    # slice can be bundled into a late batch and wait a long time.  This adds a
+    # per-task penalty on the WAIT = start − material-ready, weighted min_weight//
+    # washing_prompt_weight_divisor: it accumulates across a backlog until it tops the
+    # machine-consolidation cost (so the solver clears a real pile), while staying far
+    # below the lateness band (lateness costs ~10000× more per minute than wait), so
+    # it NEVER trades a missed due date for prompt washing.  Measured (660-task cold):
+    # an early-ready slice's wait dropped from 1550 min to 0, total washing wait −10%,
+    # total lateness unchanged.  Reschedule keeps the previous layout (promptness must
+    # not fight stability).
+    # Knitting order contiguity (cold solve only).  The knitting objective is
+    # otherwise INDIFFERENT to interleaving (gap→0 leaves it unchanged), so the
+    # solver may split an order into several runs on a machine, weaving other orders
+    # through the middle.  Bosses prefer each order finished before the next ("dứt
+    # điểm đơn đó") even when nothing is late.  This adds a SOFT penalty on each
+    # order's per-(order,machine) footprint span (po_end − po_start), weighted
+    # lateness_scale × knitting_contiguity_mult, so interleaving (which stretches the
+    # span) is discouraged — but it yields when the workforce cap + shift windows
+    # genuinely force a split (a HARD contiguity constraint would be INFEASIBLE there).
+    # Measured: fragmented orders 15→12, longest run 5→3, knit makespan −5%, no
+    # added lateness; the residual is structural (concurrent-machine limit).
+    enable_knitting_contiguity: bool = True
+    knitting_contiguity_mult: int = 4
+    # Knitting order-contiguity POST-PASS (cold solve only).  The in-solve penalty
+    # above is provably inert on overloaded payloads: the solver stops at FEASIBLE
+    # while minimising lateness (×10^7) and never optimises the secondary contiguity
+    # term (×10^1), so orders stay interleaved on a machine even where slack would
+    # let each finish before the next ("dứt điểm đơn đó").  A warm-start hint is also
+    # inert (single-worker CP-SAT tries it, then improves past it).  This post-pass
+    # re-sequences each machine so an order's tasks run contiguously, re-runs phases
+    # 2–5 on the new knitting ends, and accepts ONLY if total pipeline lateness
+    # (Σ tardiness AND late-task count) does not increase — re-sequencing pushes the
+    # yielding order later, so it is VERIFIED, not safe-by-construction (cf. the
+    # same-qty relink Pareto verify).  Workforce cap is re-checked before the verify;
+    # machines carrying a pinned/in-progress task are left untouched.  Costs ~1 extra
+    # phases-2–5 pass when a candidate is found.
+    enable_knitting_contiguity_reorder: bool = True
+    enable_washing_prompt: bool = True
+    washing_prompt_weight_divisor: int = 100
+    # FIFO fairness for prompt-washing: a flat wait penalty minimises TOTAL wait but
+    # is symmetric about WHICH item waits, so it can strand one early-ready slice in a
+    # late batch behind later-ready ones.  Scaling each task's wait weight by its
+    # earliness (factor 1..1+span) makes the solver wash earliest-ready material first
+    # (true FIFO).  Measured: an early-ready slice stranded 1550 min → 103, longest
+    # single wait −71%, total wait −22%, lateness unchanged.  0 disables (flat).
+    washing_prompt_fifo_span: int = 50
 
 
 class PreviousAssignment(BaseModel):

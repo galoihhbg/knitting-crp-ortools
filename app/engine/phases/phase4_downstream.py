@@ -111,7 +111,15 @@ def solve_downstream(
     cold = not reschedule_hint or workload_shrank
     if cold:
         obj_terms += apply_order_flow_objective(model, task_vars, downstream_tasks, horizon)
-        obj_terms += apply_slice_sync_objective(model, task_vars, downstream_tasks, horizon)
+        # slice_sync coordinates cross-order slice TIMING for a DOWNSTREAM consumer
+        # (its real job in linking).  Ironing/packing are terminal — nothing consumes
+        # their slice ordering — so here slice_sync only adds objective noise that
+        # misleads the FEASIBLE-stop: measured it pushed cold iron/packing 14 task-min
+        # late, which the first reschedule (which omits flow/sync) then "fixed",
+        # producing the run-1≠run-2 drift.  Default OFF on downstream; the reschedule
+        # path already skips it.  Flag-gated for reversibility.
+        if config.get("enable_downstream_slice_sync", False):
+            obj_terms += apply_slice_sync_objective(model, task_vars, downstream_tasks, horizon)
 
     # ── Intra-phase dependency constraints ──────────────────────────────────
     # final_depends_on may reference tasks within the same Phase 4 model

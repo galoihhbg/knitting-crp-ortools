@@ -675,6 +675,50 @@ def _solve_group(
         model.AddMaxEquality(used_m, machine_slot_lits[m_id])
         obj_terms.append(used_m * machine_w)
 
+    # ── Prompt-washing (wait-past-ready) penalty ──────────────────────────────
+    # Operational WIP risk: goods that finished linking but sit unwashed for a long
+    # time (e.g. into the next day) can be mislaid.  Penalise each task's WAIT =
+    # start − ready_time so the solver lights an EXTRA washing machine to clear a
+    # genuine BACKLOG — the per-task penalty accumulates across many waiting tasks
+    # until the total tops machine_w (one machine) — while still CONSOLIDATING when
+    # waits are short (small total < machine_w → consolidation wins).  No threshold:
+    # the linear-in-wait penalty self-scales with backlog size.
+    #
+    # Banded against the existing weight ladder (start_coeff=min_weight//100 ≪
+    # machine_w=5*min_weight ≪ is_late=10*min_weight ≪ lateness=100*min_weight):
+    # base wait_w = min_weight // divisor (divisor default 100 → ≈ start_coeff).
+    #
+    # FIFO FAIRNESS — a FLAT wait_w minimises TOTAL wait but is SYMMETRIC about
+    # WHICH item waits: swapping two items between two fixed-time slots leaves the
+    # total unchanged, so the solver may strand an EARLY-ready slice in a late batch
+    # behind LATER-ready ones (observed: a slice ready at 1574 dumped into the 3124
+    # batch next to items ready 3046+).  Fix: scale each task's wait weight by its
+    # EARLINESS, factor = 1 + (max_ready − ready)·FIFO_SPAN // max_ready ∈ [1, ~1+SPAN].
+    # Swap delta = (s2−s1)·(w_late − w_early) < 0 ⇒ the solver always puts the
+    # earlier-ready item in the earlier slot (true FIFO: late material waits, not early).
+    #
+    # SAFE vs tardiness by the PER-MINUTE comparison: max wait weight =
+    # wait_w·(1+SPAN) ≈ (min_weight/100)·51, while a minute of lateness costs
+    # ~100·min_weight — still ~200× more — so it never delays a task past its due to
+    # wash something else promptly.  Cold only (re-schedule keeps the previous layout).
+    if not reschedule_hint and config.get("enable_washing_prompt", True):
+        divisor = int(config.get("washing_prompt_weight_divisor", 100))
+        fifo_span = int(config.get("washing_prompt_fifo_span", 50))
+        wait_w = max(1, min_weight // max(1, divisor))
+        _release = {t["task_id"]: int(t.get("start_after_min", 0) or 0) for t in group_tasks}
+        # ready = when the task's material is on hand AND it may start: max of the
+        # dependency floor (linking end) and its own release.
+        ready_of = {
+            t_id: max(int(group_start_lb.get(t_id, 0)), _release.get(t_id, 0))
+            for t_id in free_scheduled_ids
+        }
+        max_ready = max(ready_of.values(), default=0)
+        for t_id in free_scheduled_ids:
+            r = ready_of[t_id]
+            # Earlier-ready (small r) → larger factor → stranding it costs more.
+            factor = 1 + (max_ready - r) * fifo_span // max(1, max_ready)
+            obj_terms.append((task_vars[t_id]["start"] - r) * (wait_w * factor))
+
     # ── One-slot-one-machine (HARD) ─────────────────────────────────────────────
     # machine_w above counts only DISTINCT machines EVER used by the group, so once
     # a large group lights a 2nd machine for parallelism, spreading any OTHER slot

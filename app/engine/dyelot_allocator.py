@@ -253,86 +253,50 @@ def allocate_dyelots(
 
 
 def _vi_gross_demand_g(orders, demand_g, pk_g, machine_order) -> int:
-    """Reuse-aware gross (grams) the VI physically pulls, lot-blind. On each
-    machine the orders sharing it draw from ONE creel, so that machine pulls
-    max(ceil(Σnet_m / pk), max_slots_m) rolls; summed across machines (each mounts
-    its own cones). Orders with no machine breakdown fall back to whole-order
-    rolls. Used for the dyelot_shortage report (vs net stock)."""
+    """GROSS (grams) the VI physically pulls = net POOLED across all machines,
+    rounded UP to whole rolls at the LOT level: ceil(Σnet / pk)·pk, pk = smallest
+    roll size (least waste).
+
+    Go pools residual via the free-pool / creel-state propagation, so a roll is
+    shared across machines AND across orders on a lot — the previous per-machine
+    sum (each machine ceil + a creel-up `slots` floor) over-counted badly (e.g. two
+    machines with ~2 kg net each were charged 2 full creel rolls). Mounted-but-
+    unused cones return to the pool; they are not consumed stock.
+    (machine_order kept for signature stability — pooling makes it unnecessary.)"""
     pk = min(pk_g)
-    machines = sorted(machine_order, key=str)
-    with_machine = set()
-    g = 0
-    for m in machines:
-        mo = machine_order[m]
-        oz = [o for o in orders if o in mo]
-        if not oz:
-            continue
-        with_machine.update(oz)
-        net_m = sum(_g(mo[o][0]) for o in oz)
-        max_slots = max((int(mo[o][1]) for o in oz), default=0)
-        g += max((net_m + pk - 1) // pk, max_slots) * pk
-    missing = [o for o in orders if o not in with_machine]
-    if missing:
-        net_miss = sum(demand_g[o] for o in missing)
-        g += ((net_miss + pk - 1) // pk) * pk
-    return g
+    net = sum(demand_g[o] for o in orders)
+    return ((net + pk - 1) // pk) * pk
 
 
 def _cap_slack_g(demand_g, pk_g, machine_order) -> int:
-    """A guaranteed-sufficient upper bound (grams) on the extra capacity any single
-    lot could ever need / be charged: net total + one roll per (machine,order) run
-    (whole-roll waste) + the creel-up of every run. Always ≥ the true gross of
-    placing EVERYTHING on one lot, so it safely bounds expandable-bin Vars and the
-    per-(machine,lot) roll Vars (the earlier Σnet+max_pk bound under-counted the
-    gross and made the new-lot solve spuriously infeasible)."""
-    runs = 0
-    tslots = 0
-    for m in machine_order:
-        for _o, run in machine_order[m].items():
-            runs += 1
-            tslots += int(run[1])
-    return sum(demand_g.values()) + (runs + tslots) * max(pk_g)
+    """Upper bound (grams) on the extra capacity any single lot may need: with
+    lot-level whole-roll pooling, placing EVERY order on one lot costs at most
+    Σnet + one roll, so Σnet + max(pk) is a safe bound for expandable-bin Vars.
+    (machine_order kept for signature stability; no longer used.)"""
+    return sum(demand_g.values()) + max(pk_g)
 
 
 def _add_roll_capacity(model, x, orders, n_lots, demand_g, cap_g, pk_g,
                        machine_order, extra=None) -> None:
-    """Add reuse-aware capacity: per (machine, lot) the orders of a lot SHARE the
-    creel on that machine (a cone's residual feeds the next order — Go's
-    free-pool), so the rolls mounted on machine m for lot d cover the SUM of those
-    orders' net AND the widest creel (max slots). Rolls are summed ACROSS machines
-    (each machine mounts its own cones from the lot) and bounded by the lot stock
-    (cap_g[d], or cap_g[d]+extra[d] when expandable). This removes the per-ORDER
-    creel-up over-count (orders sharing a machine no longer each pay the slots
-    floor) while still charging an order that knits on several machines its creel
-    on each."""
-    machines = sorted(machine_order, key=str)
-    with_machine = {o for m in machines for o in machine_order[m] if o in demand_g}
-    missing = [o for o in orders if o not in with_machine]
-    # When lots are expandable, a lot may grow far past Σnet (gross > net), so the
-    # per-(machine,lot) roll Var ub must cover the worst-case slack, not just Σnet.
+    """Lot-level whole-roll capacity (Go pools residual across machines via the
+    free-pool / creel-state, so charge per LOT, not per machine): the net assigned
+    to lot d needs ceil(Σnet / pk[d]) whole rolls, which must fit the lot stock
+    (cap_g[d], or cap_g[d]+extra[d] when expandable).
+
+    NO per-machine rounding and NO creel-up floor — mounted-but-unused cones return
+    to the pool, they are not consumed. This matches Go's actual commit (e.g. 9
+    orders / 8 machines, net 390.65 kg → 40 rolls pooled, not 46 per-machine) and
+    stops the over-charge that split lots / reported false shortages.
+    (machine_order kept for signature stability; no longer used.)"""
     bump = _cap_slack_g(demand_g, pk_g, machine_order) if extra is not None else 0
     for d in range(n_lots):
-        ub = (cap_g[d] + bump) // pk_g[d] + 1
-        lot_rolls = []
-        for m in machines:
-            mo = machine_order[m]
-            oz = [o for o in orders if o in mo]
-            if not oz:
-                continue
-            r = model.NewIntVar(0, ub, f"r_{d}_{m}")
-            model.Add(r * pk_g[d] >= sum(_g(mo[o][0]) * x[o][d] for o in oz))
-            for o in oz:
-                s = int(mo[o][1])
-                if s > 0:
-                    model.Add(r * pk_g[d] >= s * pk_g[d] * x[o][d])  # creel floor
-            lot_rolls.append(r)
-        if missing:
-            r = model.NewIntVar(0, ub, f"rm_{d}")
-            model.Add(r * pk_g[d] >= sum(demand_g[o] * x[o][d] for o in missing))
-            lot_rolls.append(r)
-        if lot_rolls:
-            cap = cap_g[d] + (extra[d] if extra is not None else 0)
-            model.Add(sum(lot_rolls) * pk_g[d] <= cap)
+        cap = cap_g[d] + (extra[d] if extra is not None else 0)
+        ub_rolls = (cap_g[d] + bump) // pk_g[d] + 1
+        rolls = model.NewIntVar(0, ub_rolls, f"rolls_{d}")
+        # Enough whole rolls to cover the net pooled onto this lot …
+        model.Add(rolls * pk_g[d] >= sum(demand_g[o] * x[o][d] for o in orders))
+        # … and those rolls must fit the lot's (expandable) stock.
+        model.Add(rolls * pk_g[d] <= cap)
 
 
 def _solve_vi(

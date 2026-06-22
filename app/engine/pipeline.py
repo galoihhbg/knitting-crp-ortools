@@ -25,6 +25,7 @@ from .phases.phase1_knitting import (
     PHASE1_OPS,
     Phase1Result,
     left_shift_cold_knitting,
+    reorder_contiguous_knitting,
     solve_knitting,
 )
 from .shared import compute_global_horizon, diagnose_infeasibility
@@ -146,6 +147,24 @@ class Pipeline:
         if isinstance(chain, dict):
             return chain  # phase-failure result
         p3, p4, p5 = chain
+
+        # ── Knitting order-contiguity refinement (cold solve only) ────────
+        # The solver stalls at FEASIBLE on overloaded payloads, so its secondary
+        # contiguity term never optimises and orders interleave on a machine even
+        # when slack would allow finishing each one before the next ("dứt điểm đơn
+        # đó").  A warm-start hint / in-solve penalty are both inert there
+        # (measured byte-identical).  So re-sequence each machine AFTER the solve,
+        # re-run phases 2–5 on the new knitting ends, and accept ONLY if total
+        # pipeline lateness does not increase — re-sequencing pushes the yielding
+        # order later, so it is verified, not safe-by-construction.
+        if not self.reschedule_hint and self.config.get(
+            "enable_knitting_contiguity_reorder", False
+        ):
+            refined = self._try_knitting_contiguity(
+                p2_tasks, all_resources, global_horizon, p1, p2, p3, p4, p5,
+            )
+            if refined is not None:
+                p1, p2, p3, p4, p5 = refined
 
         # ── Same-qty re-link refinement (two-pass, cold solve only) ───────
         # Panel knitting cùng (component, qty) là thay-thế-được; floor same-qty
@@ -283,6 +302,121 @@ class Pipeline:
         logger.info(f"✅ Phase 5 (Packing) complete: {len(p5.assignments)} assignments, status={p5.status}")
 
         return p3, p4, p5
+
+    def _total_lateness(self, ends: Dict[str, int]) -> Tuple[int, int]:
+        """(Σ tardiness, # late orders) at the ORDER level.
+
+        Every task of an order carries the same ship-date due, so an intermediate
+        task finishing "late" vs that date is meaningless — what matters is when the
+        ORDER completes (its last task).  Tardiness = max(0, max-end-of-order − due).
+        Used to gate the contiguity refinement: a candidate is accepted only if
+        NEITHER figure increases, i.e. no order ships later and none newly slips.
+        """
+        order_end: Dict[str, int] = {}
+        order_due: Dict[str, int] = {}
+        for t in self.tasks:
+            due = t.get("due_at_min")
+            if not due:
+                continue
+            e = ends.get(t["task_id"])
+            if e is None:
+                continue
+            oid = t.get("original_order_id") or t["task_id"]
+            order_end[oid] = max(order_end.get(oid, 0), e)
+            order_due[oid] = int(due)  # uniform per order
+        total = 0
+        n_late = 0
+        for oid, e in order_end.items():
+            late = e - order_due[oid]
+            if late > 0:
+                total += late
+                n_late += 1
+        return total, n_late
+
+    def _try_knitting_contiguity(
+        self,
+        p2_tasks: List[Dict[str, Any]],
+        all_resources: List[Dict[str, Any]],
+        global_horizon: int,
+        p1: Phase1Result,
+        p2: Phase2Result,
+        p3: "Phase3Result",
+        p4: "Phase4Result",
+        p5: "Phase4Result",
+    ):
+        """Re-sequence knitting per machine for order-contiguity, re-run 2→5, and
+        accept ONLY if total pipeline lateness (Σ tardiness AND late-task count)
+        does not increase.  Any failure / regression → None (keep the solver plan).
+        """
+        cand = reorder_contiguous_knitting(p1.assignments, self.tasks, self.config)
+        if cand is None:
+            return None
+        new_start, new_end = cand["start"], cand["end"]
+
+        # Build the candidate Phase-1 result (only knitting tasks moved).
+        p1b_assignments: List[Dict[str, Any]] = []
+        info = {t["task_id"]: t for t in self.tasks}
+        for a in p1.assignments:
+            tid = a["task_id"]
+            if tid in new_start:
+                b = dict(a)
+                b["start_time"] = new_start[tid]
+                b["end_time"] = new_end[tid]
+                due = int(info.get(tid, {}).get("due_at_min", new_end[tid] + 1) or (new_end[tid] + 1))
+                b["status"] = "LATE" if new_end[tid] > due else "ON_TIME"
+                p1b_assignments.append(b)
+            else:
+                p1b_assignments.append(a)
+        p1b = Phase1Result(
+            status="feasible",
+            assignments=p1b_assignments,
+            overloads=p1.overloads,
+            start_times={**p1.start_times, **new_start},
+            end_times={**p1.end_times, **new_end},
+            solve_time_seconds=0.0,
+            solver_status_name=p1.solver_status_name,
+        )
+
+        # Re-solve linking on the new knitting ends, then washing→ironing→packing.
+        p2b: Phase2Result = solve_linking(
+            p2_tasks, all_resources, self.config,
+            p1_start_times=p1b.start_times,
+            p1_end_times=p1b.end_times,
+            translation_map=self.translation_map,
+            horizon=global_horizon,
+            reschedule_hint=None,
+            workload_shrank=False,
+        )
+        if p2b.status != "feasible":
+            logger.info(f"🧱 Knitting contiguity: linking re-solve status={p2b.status} — keeping solver plan.")
+            return None
+        chain = self._solve_phases_3_to_5(
+            all_resources, global_horizon, {**p1b.end_times, **p2b.end_times}
+        )
+        if isinstance(chain, dict):
+            logger.info("🧱 Knitting contiguity: downstream re-solve failed — keeping solver plan.")
+            return None
+        p3b, p4b, p5b = chain
+
+        base_ends = {**p1.end_times, **p2.end_times, **p3.end_times, **p4.end_times, **p5.end_times}
+        cand_ends = {**p1b.end_times, **p2b.end_times, **p3b.end_times, **p4b.end_times, **p5b.end_times}
+        if set(base_ends) != set(cand_ends):
+            logger.info("🧱 Knitting contiguity: task-set mismatch — keeping solver plan.")
+            return None
+        base_late, base_n = self._total_lateness(base_ends)
+        cand_late, cand_n = self._total_lateness(cand_ends)
+        if cand_late > base_late or cand_n > base_n:
+            logger.info(
+                f"🧱 Knitting contiguity: REJECTED — lateness would rise "
+                f"(Σ {base_late}→{cand_late}, late tasks {base_n}→{cand_n}). Keeping solver plan."
+            )
+            return None
+
+        logger.info(
+            f"✨ Knitting contiguity ACCEPTED: orders re-sequenced contiguously, "
+            f"Σ lateness {base_late}→{cand_late}, late tasks {base_n}→{cand_n}."
+        )
+        return p1b, p2b, p3b, p4b, p5b
 
     def _try_sameqty_relink(
         self,
