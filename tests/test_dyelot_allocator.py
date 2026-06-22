@@ -238,10 +238,10 @@ def test_no_stock_vi_reported_as_shortage():
 
 
 def test_no_stock_new_lot_is_gross_when_packing_known():
-    """Zero-stock vi WITH a known default packing → fresh-lot size is the
-    reuse-aware GROSS (whole-roll + creel-up), not the net floor. One order, 13 kg
-    net on 2 machines (slots 2) at packing 10 → each machine pulls 2 rolls = 20 kg
-    → gross 40 kg, well above net 13."""
+    """Zero-stock vi WITH a known default packing → fresh-lot size is the GROSS
+    (whole-roll, pooled across machines), not the net floor. One order, 13 kg net
+    on 2 machines at packing 10 → pooled ceil(13/10)=2 rolls = 20 kg (residual is
+    shared across machines, NOT 2 rolls per machine)."""
     tasks = [
         _knit_task("u1", "A", {"V": 7.0}, slots={"V": 2}),
         _knit_task("u2", "A", {"V": 6.0}, slots={"V": 2}),
@@ -251,9 +251,9 @@ def test_no_stock_new_lot_is_gross_when_packing_known():
     res = allocate_dyelots(tasks, assigns, stock, CFG, vi_packing={"V": 10.0})
     sh = next(s for s in res["dyelot_shortage"] if s["vi"] == "V")
     assert sh["net_demand_kg"] == 13.0
-    # M1: ceil(7/10)=1 but creel floor 2 → 20 kg; M2 likewise 20 kg → 40 kg gross.
-    assert sh["new_lot_kg"] == 40.0
-    assert sh["demand_kg"] == 40.0
+    # Pooled: ceil((7+6)/10)·10 = 20 kg gross (one roll shared across both machines).
+    assert sh["new_lot_kg"] == 20.0
+    assert sh["demand_kg"] == 20.0
     assert sh["topups"] == []
 
 
@@ -525,13 +525,13 @@ def test_machine_shared_creel_with_slots():
 
 
 # ---------------------------------------------------------------------------
-# 13. Creel-up sums per machine run — an order knitting the VI on TWO machines
-#     pays the slots floor on EACH. A: M1 net=5 slots=4, M2 net=5 slots=4 →
-#     gross = max(1,4)·10 + max(1,4)·10 = 80 > 50 lot → unassigned, even though
-#     net (10) and a single-run creel-up (40) would both fit.
+# 13. Residual POOLS across machines (Go free-pool) — an order knitting the VI on
+#     two machines does NOT pay a creel-up roll on each. A: M1 net=5, M2 net=5 →
+#     pooled ceil(10/10)=1 roll = 10 kg ≤ 50, so A is assigned. (The old per-machine
+#     model charged 2 creel rolls/machine = 80 kg and wrongly dropped it.)
 # ---------------------------------------------------------------------------
 
-def test_creel_up_sums_across_machines():
+def test_residual_pools_across_machines():
     VI = "V"
     tasks = [
         _knit_task("u1", "A", {VI: 5.0}, slots={VI: 4}),
@@ -542,8 +542,9 @@ def test_creel_up_sums_across_machines():
 
     res = allocate_dyelots(tasks, assigns, stock, CFG)
 
-    assert res["order_dyelot_assignment"] == []
-    assert len(res["dyelot_unassigned"]) == 1
+    # Pooled gross = 10 kg ≤ 50 → assigned; creel-up no longer sums per machine.
+    assert len(res["order_dyelot_assignment"]) == 1
+    assert res["dyelot_unassigned"] == []
 
 
 # ---------------------------------------------------------------------------
