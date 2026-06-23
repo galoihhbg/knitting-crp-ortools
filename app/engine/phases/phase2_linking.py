@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 from ortools.sat.python import cp_model
 
 from app.engine.shared import (
+    apply_earliness_objective,
     apply_end_caps,
     apply_order_flow_objective,
     apply_slice_sync_objective,
@@ -224,6 +225,11 @@ def solve_linking(
     if not reschedule_hint or workload_shrank:
         obj_terms += apply_order_flow_objective(model, task_vars, linking_tasks, horizon)
         obj_terms += apply_slice_sync_objective(model, task_vars, linking_tasks, horizon)
+        # Linking is all-slices → order_flow skips its group_end, so nothing pulls
+        # linking to finish early; it dawdles to its (too-loose) due, stealing the
+        # lead time the capacity-bound iron/packing actually need.  Pull it left.
+        if config.get("enable_earliness_pull", False):
+            obj_terms += apply_earliness_objective(model, task_vars, linking_tasks, horizon)
 
     stab_terms, stab_stats = apply_stability_objective(
         model, task_vars, linking_tasks, reschedule_hint, horizon, start_lb=start_lb,

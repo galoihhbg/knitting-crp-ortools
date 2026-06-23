@@ -1057,6 +1057,47 @@ def apply_order_cluster_objective(
     return terms
 
 
+def apply_earliness_objective(
+    model: cp_model.CpModel,
+    task_vars: Dict[str, Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+    horizon: int,
+) -> List[Any]:
+    """Kéo MỌI task của một công đoạn KHÔNG-PHẢI-CUỐI về xong sớm nhất có thể.
+
+    Bối cảnh: due_at_min của từng task được back-propagate từ due của ĐƠN với
+    lead = đúng MỘT task-duration mỗi công đoạn (linking 1477, washing 1537,
+    iron 1552, packing 1559) — bỏ qua việc 240 task xếp hàng trên 2–5 máy.  Vì
+    vậy due trung gian quá lỏng: solver chỉ phạt trễ-so-với-due, không thưởng
+    xong-sớm, nên linking/washing "rề" tới sát due lỏng đó rồi mới xong, nuốt hết
+    thời gian mà iron/packing (bị giới hạn năng lực thật) cần → downstream trễ.
+
+    Với group toàn-slice, `apply_order_flow_objective` BỎ QUA group_end (nhường
+    cho slice_sync), nên linking hoàn toàn không có lực kéo-về-sớm tuyệt đối —
+    chỉ còn start tie-breaker (weight//100) bị slice_sync (×~0.7·weight) lấn át.
+    Hàm này thêm lực `end × earliness_w` cho từng task.
+
+    Trọng số `weight` (= 1·min_weight) NẰM TRÊN order_flow/slice_sync (~0.7·weight)
+    để thắng việc rải, NHƯNG DƯỚI lateness (×100) gấp 100 lần → không bao giờ ép
+    một task xong sớm bằng cách làm task khác trễ.  Chỉ phá thế-hòa-lateness theo
+    hướng "xong sớm, chừa thời gian cho downstream".  Cold-only (caller gate).
+    Bỏ qua capacity_block và task đã pin.
+    """
+    terms: List[Any] = []
+    for t_id, tv in sorted(task_vars.items()):
+        task = next((t for t in tasks if t["task_id"] == t_id), None)
+        if task is None:
+            continue
+        if task.get("is_pinned", False):
+            continue
+        if task.get("operation", "").lower() == "capacity_block":
+            continue
+        priority = int(task.get("priority", 5))
+        weight = 10 ** (6 - priority)
+        terms.append(tv["end"] * weight)
+    return terms
+
+
 def apply_slice_sync_objective(
     model: cp_model.CpModel,
     task_vars: Dict[str, Dict[str, Any]],
