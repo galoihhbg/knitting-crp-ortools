@@ -21,6 +21,7 @@ end_times dict for Phase 4 downstream lower-bound calculation.
 """
 import logging
 import math
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -377,9 +378,22 @@ def _solve_group(
         model.Add(batch_starts[k] == 0).OnlyEnforceIf(batch_active[k].Not())
 
     if shift_ends:
+        # Only boundaries that a task can actually STRADDLE need a reified
+        # before/after BoolVar.  shift_ends spans the whole factory calendar (236–390
+        # points, up to ~4× the washing horizon), so the vast majority are inert:
+        #   • S ≥ horizon  → end ≤ horizon ≤ S, so "end ≤ S" always holds (b≡True).
+        #   • S ≤ start_lb → start ≥ start_lb ≥ S, so "start ≥ S" always holds (b≡False).
+        # Both produce a fixed BoolVar + two no-op constraints.  Skipping them is
+        # nghiệm-preserving (the disjunction is already satisfied) and removes ~75% of
+        # this phase's BoolVars on real payloads.  Filter the upper bound once, the
+        # lower bound per task (it depends on each task's start_lb).
+        relevant_bounds = [S for S in shift_ends if S < horizon]
         for t_id in free_scheduled_ids:
             tv = task_vars[t_id]
-            for S in shift_ends:
+            lb = group_start_lb.get(t_id, 0)
+            for S in relevant_bounds:
+                if S <= lb:
+                    continue
                 b = model.NewBoolVar(f"before_shift_{t_id}_{S}")
                 model.Add(tv["end"] <= S).OnlyEnforceIf(b)
                 model.Add(tv["start"] >= S).OnlyEnforceIf(b.Not())
@@ -1274,3 +1288,166 @@ def _compute_start_lb(
         if current_lb > 0:
             lb[t_id] = current_lb
     return lb
+
+
+# ---------------------------------------------------------------------------
+# End-of-shift washing flush (COLD-only deterministic post-pass)
+# ---------------------------------------------------------------------------
+def flush_unwashed_end_of_shift(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    shift_ends: List[int],
+    dep_ends: Optional[Dict[str, int]] = None,
+) -> int:
+    """COLD-only: any washing task that became ready (linking done) before a shift
+    boundary but is scheduled to START in a LATER shift is pulled into a flush batch
+    that ENDS exactly at that boundary T (start = T − duration), so the goods wash
+    before the break instead of sitting overnight ("cứ cuối ca là đem đi giặt, không
+    vắt qua giờ nghỉ").  Mutates the washing `assignments` in place; returns #moved.
+
+    Run it BEFORE phase 4 (downstream then schedules a SINGLE solve against the
+    pulled-forward washing ends — no re-solve needed because flush ONLY moves washing
+    EARLIER, so every iron/packing release bound only RELAXES; the phase 4–5 feasible
+    region is a superset → its optimum cannot get worse).  `dep_ends` supplies the
+    dependency end-times for the ready computation (P1+P2 ends when called mid-pipeline,
+    before iron/packing exist); when None, ready is read from `assignments` (the
+    standalone final-output post-pass form, used by the unit tests).
+
+    Guarantees:
+      * new end = T ≤ old start ⇒ washing only moves earlier (linking dep satisfied:
+        start = T−dur ≥ each member's ready);
+      * the flush batch is placed only where the chosen machine's window [T−dur, T] is
+        FREE of every existing washing interval (machine no-overlap preserved);
+      * [T−dur, T] lies wholly inside the ready-shift (T−dur ≥ the previous boundary),
+        so it never straddles a break.
+
+    Batches respect washing_batch_capacity and (color, substance) compatibility.
+    Pinned washing tasks are immovable.  Deterministic.
+    """
+    if not shift_ends:
+        return 0
+    bounds = sorted({int(s) for s in shift_ends})
+    cap = max(1, int(config.get("washing_batch_capacity", 10)))
+    info = {t["task_id"]: t for t in all_tasks}
+    end_of = dict(dep_ends) if dep_ends is not None else {
+        a["task_id"]: int(a["end_time"]) for a in assignments
+    }
+
+    wash_assigns = {
+        a["task_id"]: a for a in assignments
+        if (info.get(a["task_id"]) or {}).get("operation", "").lower() == "washing"
+    }
+    if not wash_assigns:
+        return 0
+
+    # Machine occupancy = every existing washing interval (conservative: vacated space
+    # is NOT reclaimed, so we can never create an overlap with a batch we partly empty).
+    machine_busy: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    for a in wash_assigns.values():
+        machine_busy[a["machine_id"]].append((int(a["start_time"]), int(a["end_time"])))
+
+    def _prev_bound(T: int) -> int:
+        p = 0
+        for b in bounds:
+            if b < T:
+                p = b
+            else:
+                break
+        return p
+
+    def _free(machine: str, s: int, e: int) -> bool:
+        for (bs, be) in machine_busy.get(machine, ()):
+            if s < be and bs < e:  # overlap
+                return False
+        return True
+
+    # ── Collect flush candidates ──────────────────────────────────────────────
+    # candidate ⇔ ready < its-ready-shift-end T  AND  current start ≥ T (spilled into a
+    # later shift)  AND  the task can still finish by T (ready ≤ T−dur, T−dur ≥ prevT).
+    # Grouped by (T, color, substance) so a flush batch is one cycle in one shift.
+    groups: Dict[Tuple[int, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    ready_of: Dict[str, int] = {}
+    for tid, a in wash_assigns.items():
+        t = info[tid]
+        if t.get("is_pinned"):
+            continue
+        deps = [end_of[d] for d in (t.get("final_depends_on") or []) if d in end_of]
+        ready = max(deps) if deps else 0
+        T = next((b for b in bounds if b > ready), None)
+        if T is None:
+            continue
+        start = int(a["start_time"])
+        dur = int(a["end_time"]) - start
+        if start < T:
+            continue  # already washed within its ready-shift
+        if T - dur < ready or T - dur < _prev_bound(T):
+            continue  # cannot finish by T without straddling the break / before ready
+        ready_of[tid] = ready
+        groups[(T, t.get("color", ""), t.get("substance", ""))].append(a)
+
+    if not groups:
+        return 0
+
+    moved = 0
+    # Deterministic order: ascending boundary, then color/substance.
+    for (T, _color, _subs) in sorted(groups):
+        members = sorted(
+            groups[(T, _color, _subs)],
+            key=lambda a: (
+                max((end_of[d] for d in (info[a["task_id"]].get("final_depends_on") or [])
+                     if d in end_of), default=0),
+                a["task_id"],
+            ),
+        )
+        prevT = _prev_bound(T)
+        # Greedily pack members into ≤cap batches; each batch shares one machine + cycle.
+        i = 0
+        while i < len(members):
+            batch: List[Dict[str, Any]] = []
+            qty = 0.0
+            common: Optional[set] = None
+            j = i
+            while j < len(members):
+                a = members[j]
+                t = info[a["task_id"]]
+                q = float(a.get("quantity", t.get("qty", 0)) or 0)
+                rids = set(t.get("compatible_resource_ids") or [])
+                nxt_common = rids if common is None else (common & rids)
+                if batch and (qty + q > cap or not nxt_common):
+                    break  # close this batch; member j starts the next
+                batch.append(a)
+                qty += q
+                common = nxt_common
+                j += 1
+            i = j
+
+            # Cycle runs until the LONGEST member finishes → window = [T−maxdur, T].
+            dur = max(int(a["end_time"]) - int(a["start_time"]) for a in batch)
+            s = T - dur
+            # Never start before the shift's previous break, nor before any member's
+            # ready time (a shorter member must not be pulled ahead of its linking end).
+            if s < prevT or not common or s < max(ready_of[a["task_id"]] for a in batch):
+                continue
+            machine = next((m for m in sorted(common) if _free(m, s, T)), None)
+            if machine is None:
+                continue  # no compatible machine free in [T−dur, T] — leave them
+            slot = f"flush_{T}"
+            for a in batch:
+                tid = a["task_id"]
+                due = int(info[tid].get("due_at_min", T + 1) or (T + 1))
+                a["start_time"] = s
+                a["end_time"] = T
+                a["machine_id"] = machine
+                a["status"] = "LATE" if T > due else "ON_TIME"
+                a["batch_slot_id"] = slot
+                end_of[tid] = T
+                moved += 1
+            machine_busy[machine].append((s, T))
+
+    if moved:
+        logger.info(
+            f"   🚿 End-of-shift washing flush: pulled {moved} task(s) into pre-break "
+            f"batches (finish by shift boundary; downstream untouched)."
+        )
+    return moved

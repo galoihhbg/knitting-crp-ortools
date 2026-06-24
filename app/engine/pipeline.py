@@ -37,7 +37,12 @@ from .phases.phase2_linking import (
     compute_sameqty_start_lb,
     solve_linking,
 )
-from .phases.phase3_batching import PHASE3_OPS, Phase3Result, solve_washing
+from .phases.phase3_batching import (
+    PHASE3_OPS,
+    Phase3Result,
+    flush_unwashed_end_of_shift,
+    solve_washing,
+)
 from .phases.phase4_downstream import UPSTREAM_OPS, Phase4Result, solve_downstream
 
 logger = logging.getLogger(__name__)
@@ -264,18 +269,44 @@ class Pipeline:
         if p3.status not in ("feasible", "empty"):
             return _phase_failure_result(p3.status, p3_tasks, all_resources, self.config, global_horizon)
 
-        # ── Phase 4: Ironing ──────────────────────────────────────────────
-        # Downstream split into ironing → packing so each CP-SAT model stays
-        # small (one combined "downstream" model solving ironing+packing together
-        # was heavy and could time out / report infeasible).  Same cross-phase
-        # handoff as knit→link→wash: integers (end_times), no shared CP-SAT vars.
-        all_end_times = {**combined_end_times, **p3.end_times}
+        # ── End-of-shift washing flush (cold only), BEFORE downstream ─────
+        # Pull washing that became ready before a shift boundary but spilled into a
+        # later shift into a pre-break batch, THEN solve ironing/packing once on the
+        # earlier washing ends so they follow.  No re-solve/gate needed: flush only
+        # moves washing EARLIER, so every downstream release bound relaxes and the
+        # phase 4–5 optimum cannot get worse.  Skipped on re-schedule (washing kept).
+        if not self.reschedule_hint and self.config.get("enable_washing_flush", True):
+            moved = flush_unwashed_end_of_shift(
+                p3.assignments, self.tasks, self.config, shift_ends,
+                dep_ends=combined_end_times,
+            )
+            if moved:
+                for a in p3.assignments:
+                    p3.end_times[a["task_id"]] = a["end_time"]
 
+        all_end_times = {**combined_end_times, **p3.end_times}
+        p4, p5 = self._solve_phases_4_5(all_resources, global_horizon, all_end_times)
+        return p3, p4, p5
+
+    def _solve_phases_4_5(
+        self,
+        all_resources: List[Dict[str, Any]],
+        global_horizon: int,
+        end_through_washing: Dict[str, int],
+    ) -> Tuple["Phase4Result", "Phase4Result"]:
+        """Ironing (P4) → Packing (P5) given end-times through washing (P1+P2+P3).
+
+        Split out so the washing-flush refinement can re-run downstream on the
+        flushed (earlier) washing ends.  Downstream is split into ironing → packing
+        so each CP-SAT model stays small (one combined model was heavy / could time
+        out).  Cross-phase handoff is integers (end_times), no shared CP-SAT vars.
+        """
+        # ── Phase 4: Ironing ──────────────────────────────────────────────
         p4_tasks = [t for t in self.tasks if t.get("operation", "").lower() in _PHASE4_OP_SET]
         p4_hint = _hint_for_phase(self.reschedule_hint, self.partitioned_hint.get("ironing"))
         p4: Phase4Result = solve_downstream(
             p4_tasks, all_resources, self.config,
-            p3_end_times=all_end_times,
+            p3_end_times=end_through_washing,
             horizon=global_horizon,
             reschedule_hint=p4_hint,
             workload_shrank=self.workload_shrank,
@@ -285,7 +316,7 @@ class Pipeline:
         # ── Phase 5: Packing (+ any other downstream op) ──────────────────
         # Packing waits for ironing via end_times (start_lb).  Anything downstream
         # that is NOT ironing lands here, preserving the old "any other op" catch-all.
-        all_end_times_iron = {**all_end_times, **p4.end_times}
+        all_end_times_iron = {**end_through_washing, **p4.end_times}
         p5_tasks = [
             t for t in self.tasks
             if t.get("operation", "").lower() not in UPSTREAM_OPS
@@ -301,7 +332,7 @@ class Pipeline:
         )
         logger.info(f"✅ Phase 5 (Packing) complete: {len(p5.assignments)} assignments, status={p5.status}")
 
-        return p3, p4, p5
+        return p4, p5
 
     def _total_lateness(self, ends: Dict[str, int]) -> Tuple[int, int]:
         """(Σ tardiness, # late orders) at the ORDER level.

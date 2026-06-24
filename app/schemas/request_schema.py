@@ -108,7 +108,12 @@ class SolverConfig(BaseModel):
     # the SAME (component, qty) bucket instead of its index-paired panel, under
     # per-task Pareto end-caps + a whole-pipeline pointwise verify: the refined
     # schedule is accepted only if NO task finishes later than pass 1.
-    enable_sameqty_relink: bool = True
+    # DEFAULT OFF (2026-06-24): measured 0/9 accepted on cold inputs while costing
+    # 16–21% of total pipeline wall-time on ~half of runs (it re-runs phases 2–5).
+    # The EDD knitting hint + panel-sync (shipped after this) make pass-1 linking good
+    # enough that pass 2 only ever REGRESSES (Pareto guard rejects it).  Re-enable per
+    # payload if a future change reopens slack.
+    enable_sameqty_relink: bool = False
     # Cold-solve knitting EDD warm-start (hints-only AddHint seed; zero new
     # constraints/objective terms).  Cold knitting routinely stops at FEASIBLE
     # with due-inversions on the machines; an earliest-due-date incumbent seed
@@ -184,6 +189,18 @@ class SolverConfig(BaseModel):
     # (true FIFO).  Measured: an early-ready slice stranded 1550 min → 103, longest
     # single wait −71%, total wait −22%, lateness unchanged.  0 disables (flat).
     washing_prompt_fifo_span: int = 50
+    # End-of-shift washing flush — COLD-only deterministic POST-PASS (default OFF).
+    # An in-solver penalty was tried and reverted (it added genuinely-constrained
+    # BoolVars to the FEASIBLE-stuck washing solve and degraded it).  Instead this runs
+    # AFTER all phases on the final output: any washing task that became ready before a
+    # shift boundary but is scheduled to start in a LATER shift is pulled into a flush
+    # batch that ENDS exactly at that boundary (start = boundary − duration, so it never
+    # straddles the break), IF a compatible washing machine has that window free.  It
+    # only moves tasks EARLIER and never touches downstream, so it is safe by
+    # construction: nothing finishes later, machine no-overlap is checked, end-to-end
+    # lateness is unchanged (operational WIP win — goods wash before the break instead of
+    # sitting overnight — not a lateness win).  Skipped on re-schedule.
+    enable_washing_flush: bool = True
 
 
 class PreviousAssignment(BaseModel):
