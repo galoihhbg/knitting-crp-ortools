@@ -110,6 +110,10 @@ def solve_downstream(
     # soft anchor is one-sided (late_only) this run so it won't fight compaction.
     cold = not reschedule_hint or workload_shrank
     if cold:
+        # NB: identical-task symmetry break is NOT applied here — packing's start_lb is
+        # derived from washing, but packing actually depends on iron WITHIN this phase,
+        # so a washing-based ordering can contradict the intra-phase iron→packing
+        # constraints.  Only knitting (independent, first stage) is safe for it.
         obj_terms += apply_order_flow_objective(model, task_vars, downstream_tasks, horizon)
         # slice_sync coordinates cross-order slice TIMING for a DOWNSTREAM consumer
         # (its real job in linking).  Ironing/packing are terminal — nothing consumes

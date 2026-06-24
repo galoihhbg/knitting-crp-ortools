@@ -223,6 +223,11 @@ def solve_linking(
     # EXCEPTION — workload shrank: re-enable so survivors re-pack (no gaps); the
     # soft anchor is one-sided (late_only) this run so it won't fight compaction.
     if not reschedule_hint or workload_shrank:
+        # NB: identical-task symmetry break is NOT applied here — linking slices carry
+        # wait_offsets / index-paired panel deps, so forcing start[i] ≤ start[j] between
+        # same-signature slices contradicts their timing constraints → INFEASIBLE
+        # (measured: linking returned UNKNOWN, whole pipeline produced no schedule).
+        # The technique is only valid on independent tasks (knitting).
         obj_terms += apply_order_flow_objective(model, task_vars, linking_tasks, horizon)
         obj_terms += apply_slice_sync_objective(model, task_vars, linking_tasks, horizon)
         # Linking is all-slices → order_flow skips its group_end, so nothing pulls

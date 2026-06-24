@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 from ortools.sat.python import cp_model
 
 from app.engine.shared import (
+    apply_identical_task_symmetry,
     apply_order_cluster_objective,
     apply_order_flow_objective,
     apply_panel_sync_objective,
@@ -350,6 +351,19 @@ def solve_knitting(
     task_vars, affinity_terms, no_resource_tasks = build_resource_model(
         model, knitting_tasks, resource_map, horizon, use_affinity=True
     )
+
+    # Break permutation symmetry among identical knitting tasks to speed up the
+    # cold solve.  DEFAULT OFF — and the reason is a hard lesson: it speeds phase 1
+    # (and improves phase-1's own objective) but on a SEQUENTIAL pipeline it WRECKS
+    # downstream.  Each "identical" knitting batch actually feeds a DISTINCT order's
+    # linking→washing→iron→packing chain, so a canonical start-order — equivalent
+    # for phase 1 — throws away the per-order sequencing that panel-co-completion /
+    # EDD encode for downstream.  Measured on a 240-identical-order payload: iron/
+    # packing tardiness 13_523 (off) → 79_107 (on), a ~6× regression, while wall
+    # time only dropped 54→29 min.  Kept flag-gated for a future TRULY-independent
+    # single-phase use case; never enable it where knitting feeds a sequential tail.
+    if not reschedule_hint and config.get("enable_identical_symmetry_break", False):
+        apply_identical_task_symmetry(model, task_vars, knitting_tasks)
 
     # Pipeline-wide downstream chain — used both to upper-bound knitting end
     # (so NEW tasks must finish early enough for downstream to fit) and to

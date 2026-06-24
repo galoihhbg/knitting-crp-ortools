@@ -1057,6 +1057,92 @@ def apply_order_cluster_objective(
     return terms
 
 
+def apply_identical_task_symmetry(
+    model: cp_model.CpModel,
+    task_vars: Dict[str, Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+    start_lb: Optional[Dict[str, int]] = None,
+) -> int:
+    """Phá đối-xứng giữa các task GIỐNG HỆT nhau (cold solve, mọi công đoạn).
+
+    Khi payload có nhiều đơn y hệt (cùng design_item_id, color_config, qty,
+    duration, due, priority, start_after, CÙNG earliest-start, và CÙNG tập máy
+    tương thích), các task đó hoàn-toàn thay-thế-được: mọi hoán vị thứ tự cho
+    cùng một objective.  CP-SAT phải duyệt N! hoán vị tương đương → kẹt FEASIBLE,
+    mỗi solve tốn hàng phút (đo: knitting wave 161s, downstream 678s với 240 đơn
+    giống nhau).
+
+    Cách phá: trong mỗi nhóm-giống-hệt, sắp task theo task_id rồi ÉP start không
+    giảm dần `start[i] <= start[i+1]`.  Ràng buộc HỢP LỆ — chỉ chọn một đại-diện
+    chuẩn-tắc cho mỗi lớp hoán vị, KHÔNG loại giá-trị-objective phân-biệt nào →
+    nghiệm tối ưu không đổi, chỉ co không gian tìm kiếm.
+
+    ⚠️ CẢNH BÁO — KHÔNG an-toàn end-to-end trên pipeline TUẦN TỰ.  Ràng buộc này
+    chỉ bảo-toàn objective CỦA RIÊNG pha hiện tại.  Nhưng các pha giải tuần tự, và
+    hai task "giống hệt" thường nuôi HAI đơn downstream KHÁC nhau → hai lịch hòa
+    nhau ở pha này KHÔNG hòa nhau ở downstream.  Ép thứ tự chuẩn-tắc vứt đi đúng
+    thông tin xếp-chuỗi mà panel-co-completion/EDD đã cài cho downstream.  Đo trên
+    payload 240 đơn giống hệt: iron/packing trễ 13_523 → 79_107 (~6×) khi bật cho
+    knitting.  ⇒ CHỈ dùng khi các task thật-sự thay-thế-được CẢ Ở DOWNSTREAM (ví dụ
+    pha cuối, hoặc bài toán một-pha độc lập).  Caller hiện default OFF.
+
+    `start_lb` (earliest-start theo upstream) vào chữ ký để hai task chỉ bị ép thứ
+    tự khi đầu-vào sẵn sàng cùng lúc.  Trả về số ràng buộc đã thêm.  Bỏ qua
+    capacity_block, task đã pin, và task is_slice (slice cần interleave, không
+    fungible-theo-thứ-tự).
+    """
+    start_lb = start_lb or {}
+
+    def _sig(t: Dict[str, Any], tv: Dict[str, Any]) -> tuple:
+        t_id = t["task_id"]
+        return (
+            t.get("operation", "").lower(),
+            t.get("design_item_id"),
+            t.get("color_config"),
+            int(t.get("qty", 0) or 0),
+            int(t.get("duration", 0) or 0),
+            int(t.get("due_at_min", 0) or 0),
+            int(t.get("priority", 5)),
+            int(t.get("start_after_min", 0) or 0),
+            int(start_lb.get(t_id, 0)),
+            frozenset(tv.get("r_ids") or []),
+        )
+
+    groups: Dict[tuple, List[str]] = {}
+    for t in tasks:
+        t_id = t["task_id"]
+        tv = task_vars.get(t_id)
+        if tv is None or tv.get("is_pinned") or t.get("is_pinned"):
+            continue
+        if t.get("operation", "").lower() == "capacity_block":
+            continue
+        # Slices are NOT fungible-for-ordering: the pipeline deliberately INTERLEAVES
+        # slice_1 of every order (so a downstream consumer gets one slice from each
+        # early) — forcing a canonical start order would bunch them (A_s1..A_sN then
+        # B_s1..), the exact anti-pattern slice_sync/panel_sync exist to prevent.
+        # Only non-slice identical tasks (e.g. whole BATCH lots) are reorder-safe.
+        if t.get("is_slice"):
+            continue
+        groups.setdefault(_sig(t, tv), []).append(t_id)
+
+    n_constraints = 0
+    n_groups = 0
+    for _sig_key, t_ids in groups.items():
+        if len(t_ids) < 2:
+            continue
+        n_groups += 1
+        t_ids.sort()
+        for a, b in zip(t_ids, t_ids[1:]):
+            model.Add(task_vars[a]["start"] <= task_vars[b]["start"])
+            n_constraints += 1
+    if n_constraints:
+        logger.info(
+            f"   🪞 Identical-task symmetry break: {n_groups} group(s), "
+            f"{n_constraints} ordering constraint(s) added."
+        )
+    return n_constraints
+
+
 def apply_earliness_objective(
     model: cp_model.CpModel,
     task_vars: Dict[str, Dict[str, Any]],
