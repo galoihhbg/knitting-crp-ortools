@@ -1147,15 +1147,31 @@ def reorder_contiguous_knitting(
         if any(info[a["task_id"]].get("is_pinned") for a in items):
             # immovable anchor on this machine — keep solver positions verbatim
             continue
-        # Group the machine's tasks by order; order the groups EDD-ishly by the
-        # order's earliest original start so the machine's overall sequence (and
-        # thus its left edge) is preserved — only the interleaving is removed.
+        # Group the machine's tasks by order; order the groups by DUE DATE (EDD),
+        # then by the order's earliest original start as a tie-breaker.
+        #
+        # Why EDD and not earliest-start: when an URGENT order (near due) was
+        # interleaved into the middle of a SLACK order (far due) to hit its
+        # deadline, an earliest-start ordering would try to pull the slack order's
+        # whole footprint in front of the urgent one — pushing the urgent order
+        # past its `cap[tid]` (due − downstream chain), which aborts the repack and
+        # leaves the machine fragmented (measured: 2 fragmented machines stayed
+        # split for exactly this reason).  EDD instead keeps the urgent order in its
+        # early slot and dovetails the slack order contiguously AFTER it: the slack
+        # order has huge due slack so delaying it is free → full contiguity with
+        # equal-or-lower lateness (measured 2→0 re-entries, knit tardiness 1755→1466
+        # on a real cold payload).  The pipeline-wide lateness gate still verifies.
         groups: Dict[str, List[Dict[str, Any]]] = {}
         for a in items:
             oid = info[a["task_id"]].get("original_order_id") or a["task_id"]
             groups.setdefault(oid, []).append(a)
         order_keys = sorted(
-            groups, key=lambda o: (min(x["start_time"] for x in groups[o]), o)
+            groups,
+            key=lambda o: (
+                min(int(info[x["task_id"]].get("due_at_min", 0) or 0) for x in groups[o]),
+                min(x["start_time"] for x in groups[o]),
+                o,
+            ),
         )
         # Repack from the machine's original earliest start (do not shift left of it,
         # which would only add early-window concurrency pressure).

@@ -17,6 +17,20 @@ import pytest
 
 from app.engine.model import Engine
 
+# Phase-1 knitting material/creel enforcement is DELIBERATELY DISABLED.
+# `_apply_material_constraints` is commented out in phase1_knitting.py
+# ("Temporarily disabled per user request", commit 0b9019c, debug-log 2026-05-08)
+# so that panels sharing scarce yarn can knit IN PARALLEL — material serialisation
+# was holding back the parallel-knitting / earlier-panel-completion goal, and a
+# real material with capacity 0 (vs nonzero demand) makes the cumulative INFEASIBLE.
+# The tests below assert ENFORCEMENT, which contradicts that decision, so they are
+# skipped (not deleted) — the infrastructure remains and they document the intended
+# behaviour if creel limits are ever re-enabled (would also need a capacity<=0 guard).
+_MATERIAL_P1_DISABLED = pytest.mark.skip(
+    reason="Phase-1 knitting material/creel enforcement deliberately disabled "
+    "(parallel-knitting); see phase1_knitting.py:_apply_material_constraints."
+)
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -112,6 +126,7 @@ def _overlaps(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
 # ── Tests ─────────────────────────────────────────────────────────────────
 
 
+@_MATERIAL_P1_DISABLED
 def test_material_constraint_serialises_tasks():
     """
     Two tasks each demand 2 rolls of Yarn_Red. Capacity = 2.
@@ -191,6 +206,7 @@ def test_no_material_capacities_is_noop():
     assert len(result["assignments"]) == 1
 
 
+@_MATERIAL_P1_DISABLED
 def test_multi_material_constraint_serialises_tasks():
     """
     Yarn_Red capacity=2, Yarn_Blue capacity=2.
@@ -251,6 +267,7 @@ def test_task_without_material_demand_is_not_constrained():
     )
 
 
+@_MATERIAL_P1_DISABLED
 def test_material_constraint_with_pinned_task():
     """
     Pinned task occupies Yarn_Red for its fixed window.

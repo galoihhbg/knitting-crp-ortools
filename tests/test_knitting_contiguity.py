@@ -13,7 +13,10 @@ import copy
 from ortools.sat.python import cp_model
 
 from app.engine.model import Engine
-from app.engine.phases.phase1_knitting import _apply_po_bounding_box
+from app.engine.phases.phase1_knitting import (
+    _apply_po_bounding_box,
+    reorder_contiguous_knitting,
+)
 from app.engine.shared import build_resource_model
 
 
@@ -120,6 +123,38 @@ def _fragmentation(result, tasks):
             seen[oid] = seen.get(oid, 0) + 1
         frag += sum(1 for c in seen.values() if c > 1)
     return frag
+
+
+# ── reorder post-pass: EDD ordering defrags urgent-into-slack interleaving ────
+
+def test_reorder_edd_defrags_urgent_interleaved_into_slack():
+    """A near-due order U was woven into the middle of a far-due order S on one
+    machine.  Sorting groups by earliest-start would try to pull S in front of U,
+    pushing U past its due `cap` → the machine is skipped and stays fragmented.
+    Sorting by DUE (EDD) keeps U in its early slot and dovetails S after it →
+    fully contiguous with U still on time.  Guards the EDD ordering fix.
+    """
+    M = "KM_00"
+    # S (slack, due far) split around U (urgent, due 560) — baseline interleave.
+    tasks = [
+        _knit("S1", "OS", M, dur=152, due=13987),
+        _knit("U1", "OU", M, dur=400, due=560),
+        _knit("S2", "OS", M, dur=152, due=13987),
+    ]
+    assignments = [
+        {"task_id": "S1", "machine_id": M, "start_time": 0,   "end_time": 152},
+        {"task_id": "U1", "machine_id": M, "start_time": 152, "end_time": 552},
+        {"task_id": "S2", "machine_id": M, "start_time": 552, "end_time": 704},
+    ]
+    config = {"max_factory_machines": 50}
+    cand = reorder_contiguous_knitting(assignments, tasks, config)
+    assert cand is not None, "EDD reorder should produce a defrag candidate"
+    new_start, new_end = cand["start"], cand["end"]
+    # U keeps its early slot (runs first), S runs contiguously after — no re-entry.
+    assert new_start["U1"] < new_start["S1"] < new_start["S2"]
+    assert new_end["U1"] <= 560, "urgent order must still finish by its due"
+    # The two S tasks are adjacent (contiguous), U is not between them.
+    assert new_end["S1"] == new_start["S2"]
 
 
 def test_contiguity_feasible_and_no_worse_than_off():
