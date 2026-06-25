@@ -104,6 +104,18 @@ def allocate_dyelots(
         logger.info("🎨 Dyelot allocator: no dyelot_stock in payload — skipped.")
         return empty
 
+    # Dyelot solves get their OWN deterministic budget, independent of the
+    # pipeline's max_deterministic_time: a VI with many orders (e.g. 134) needs
+    # more search to PROVE the all-orders-assigned optimum than knitting/washing
+    # do, and the main per-VI solve is what decides feasibility.  Falls back to
+    # the shared pipeline budget when `dyelot_max_deterministic_time` is unset
+    # (unchanged behaviour).  Paired with relative_gap=0.0 on the dyelot solves
+    # below — see _solve_vi: a 1% gap on a 134-order VI swallows a single dropped
+    # order (1/134 ≈ 0.75% < 1%), surfacing a SPURIOUS shortage Go then errors on.
+    dyelot_det = config.get("dyelot_max_deterministic_time")
+    solver_config = ({**config, "max_deterministic_time": dyelot_det}
+                     if dyelot_det is not None else config)
+
     # task_id → (machine, start) from the scheduler's knitting assignments.
     knit_ids = {
         t["task_id"] for t in tasks
@@ -197,7 +209,7 @@ def allocate_dyelots(
             continue
 
         res = _solve_vi(vi, order_kg, lots, vi_machine_units.get(vi, {}),
-                        vi_mo.get(vi, {}), config)
+                        vi_mo.get(vi, {}), solver_config)
         assignments.extend(res["assignments"])
         flush_points.extend(res["flush_points"])
         unassigned.extend(res["unassigned"])
@@ -424,7 +436,10 @@ def _solve_vi(
         - k_frag * frag_sum
     )
 
-    solver = make_solver(config)
+    # gap=0: tier-1 is feasibility (max assigned orders); the default 1% gap on a
+    # many-order VI lets CP-SAT stop with one order stranded (1/N < 1%), which
+    # then reports a FALSE shortage.  Feasibility must not trade against the gap.
+    solver = make_solver(config, relative_gap=0.0)
     status = solver.Solve(model)
 
     out: Dict[str, Any] = {"assignments": [], "flush_points": [],
@@ -503,7 +518,7 @@ def _topup_one_lot_g(d_fill, orders, n_lots, demand_g, cap_g, pk_g,
     _add_roll_capacity(m, x, orders, n_lots, demand_g, cap_g, pk_g,
                        machine_order, extra=extra)
     m.Minimize(fill)
-    s = make_solver(config)
+    s = make_solver(config, relative_gap=0.0)   # exact minimal top-up, not within 1%
     st = s.Solve(m)
     if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return None
@@ -530,7 +545,7 @@ def _new_lot_g(orders, n_lots, demand_g, cap_g, pk_g,
     _add_roll_capacity(m, x, orders, nl, demand_g, cap2, pk2,
                        machine_order, extra=extra)
     m.Minimize(new)
-    s = make_solver(config)
+    s = make_solver(config, relative_gap=0.0)   # exact minimal fresh-lot size, not within 1%
     st = s.Solve(m)
     if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return 0
