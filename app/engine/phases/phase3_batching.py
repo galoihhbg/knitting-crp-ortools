@@ -1451,3 +1451,211 @@ def flush_unwashed_end_of_shift(
             f"batches (finish by shift boundary; downstream untouched)."
         )
     return moved
+
+
+def left_shift_cold_washing(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    shift_ends: List[int],
+    dep_ends: Optional[Dict[str, int]] = None,
+) -> int:
+    """COLD-only: pull washing goods that became ready early but got bundled into a
+    LATER batch into the earliest boundary-safe free wash slot.
+
+    The washing solver minimises batch count + machines used (consolidation) and only
+    weakly rewards early starts, so with loose due dates it co-batches an early-ready
+    slice with a much-later-ready one from another order: the batch is gated by its
+    latest-ready member and the early goods sit unwashed while the (often single
+    compatible) machine stays idle ("đã linking xong nhưng cuối ngày không được gom đi
+    giặt").  The end-of-shift flush only targets the slot that ENDS exactly at a shift
+    boundary, so it cannot help when that pre-break window is occupied — yet the machine
+    may be free right AFTER the break.
+
+    This post-pass peels the early-ready members out of each cycle and re-seats them in
+    the earliest [s', s'+dur] window that is (a) ≥ their ready time, (b) free on a
+    compatible machine, (c) wholly inside one shift (never straddles a break), and
+    (d) STRICTLY earlier than the cycle's current start.  Capacity (washing_batch_
+    capacity) and (color, substance) compatibility are respected; a peeled sub-batch
+    forms its own cycle while the late members stay put.
+
+    Safety: every moved task gets new_end = s' + own_dur < its old end (s' < old start),
+    so washing only moves EARLIER ⇒ every iron/packing release bound only relaxes ⇒
+    downstream stays valid and end-to-end lateness is monotone non-increasing.  Run it
+    BEFORE phase 4 (after the flush) so ironing/packing solve on the earlier ends.
+    Pinned washing tasks are immovable anchors.  Deterministic.  Returns #tasks moved.
+    """
+    cap = max(1, int(config.get("washing_batch_capacity", 10)))
+    bounds = sorted({int(s) for s in shift_ends})
+    info = {t["task_id"]: t for t in all_tasks}
+    end_of = dict(dep_ends) if dep_ends is not None else {
+        a["task_id"]: int(a["end_time"]) for a in assignments
+    }
+
+    wash_assigns = [
+        a for a in assignments
+        if (info.get(a["task_id"]) or {}).get("operation", "").lower() == "washing"
+    ]
+    if not wash_assigns:
+        return 0
+
+    ready_of: Dict[str, int] = {}
+    for a in wash_assigns:
+        t = info[a["task_id"]]
+        deps = [end_of[d] for d in (t.get("final_depends_on") or []) if d in end_of]
+        ready_of[a["task_id"]] = max(deps) if deps else 0
+
+    def _qty(a: Dict[str, Any]) -> float:
+        return float(a.get("quantity", info[a["task_id"]].get("qty", 0)) or 0)
+
+    def _grp(a: Dict[str, Any]) -> Tuple[str, str]:
+        t = info[a["task_id"]]
+        return (t.get("color", ""), t.get("substance", ""))
+
+    moved = 0
+
+    # ── Merge pass: fold a washing task into an EARLIER cycle on the SAME machine and
+    # (color, substance) group that still has spare capacity and starts no earlier than
+    # the task's ready time.  The solver sometimes leaves an under-filled trailing cycle
+    # — e.g. a 4-slice batch + a lone 1-slice batch that together fit one 5-slice load —
+    # wasting a whole wash run even though every slice was ready in time.  Merging removes
+    # the extra run and only moves the task EARLIER (target start < its own start ⇒ end
+    # strictly earlier).  Same machine only (never spreads → consolidation preserved);
+    # pinned cycles are neither source nor target.
+    def _cycle_view() -> Dict[Tuple[str, int, int], List[Dict[str, Any]]]:
+        cv: Dict[Tuple[str, int, int], List[Dict[str, Any]]] = defaultdict(list)
+        for a in wash_assigns:
+            cv[(a["machine_id"], int(a["start_time"]), int(a["end_time"]))].append(a)
+        return cv
+
+    cv = _cycle_view()
+    pinned_cycle = {
+        key for key, mem in cv.items()
+        if any(info[a["task_id"]].get("is_pinned") for a in mem)
+    }
+    # Drain trailing (latest-start) cycles into earlier ones first; deterministic.
+    for key in sorted(cv, key=lambda c: (-c[1], c[0])):
+        if key in pinned_cycle:
+            continue
+        for a in sorted(list(cv[key]), key=lambda x: (ready_of[x["task_id"]], x["task_id"])):
+            own_dur = int(a["end_time"]) - int(a["start_time"])
+            rdy = ready_of[a["task_id"]]
+            grp = _grp(a)
+            target = None
+            for tkey in sorted(cv, key=lambda c: c[1]):  # earliest compatible target first
+                if tkey == key or tkey in pinned_cycle or not cv[tkey]:
+                    continue
+                m_t, s_t, e_t = tkey
+                if m_t != a["machine_id"] or s_t >= int(a["start_time"]):
+                    continue                       # must be an earlier cycle on this machine
+                if s_t < rdy or own_dur > (e_t - s_t):
+                    continue                       # not ready by then / wouldn't fit the window
+                if _grp(cv[tkey][0]) != grp:
+                    continue                       # different wash group
+                if sum(_qty(x) for x in cv[tkey]) + _qty(a) > cap:
+                    continue                       # no spare capacity
+                target = tkey
+                break
+            if target is None:
+                continue
+            m_t, s_t, e_t = target
+            due = int(info[a["task_id"]].get("due_at_min", s_t + own_dur + 1)
+                      or (s_t + own_dur + 1))
+            cv[key].remove(a)
+            a["machine_id"] = m_t
+            a["start_time"] = s_t
+            a["end_time"] = s_t + own_dur
+            a["status"] = "LATE" if a["end_time"] > due else "ON_TIME"
+            a["batch_slot_id"] = cv[target][0].get("batch_slot_id", a.get("batch_slot_id", ""))
+            end_of[a["task_id"]] = a["end_time"]
+            cv[target].append(a)
+            moved += 1
+
+    # Machine occupancy = every existing washing CYCLE (a batch = one shared interval).
+    # Conservative: a vacated cycle slot is NOT reclaimed, so we can never overlap a
+    # batch we partly empty.
+    cycles: Dict[Tuple[str, int, int], List[Dict[str, Any]]] = defaultdict(list)
+    for a in wash_assigns:
+        cycles[(a["machine_id"], int(a["start_time"]), int(a["end_time"]))].append(a)
+    machine_busy: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    for (m, s, e) in cycles:
+        machine_busy[m].append((s, e))
+
+    def _straddles(s: int, e: int) -> bool:
+        return any(s < b < e for b in bounds)
+
+    def _free(m: str, s: int, e: int) -> bool:
+        for (bs, be) in machine_busy.get(m, ()):
+            if s < be and bs < e:
+                return False
+        return True
+
+    def _earliest(m: str, release: int, dur: int, limit: int) -> Optional[int]:
+        """Earliest s ≥ release with [s, s+dur] free, boundary-safe, and s < limit."""
+        cands = {release}
+        for (bs, be) in machine_busy.get(m, ()):
+            cands.add(be)
+        for b in bounds:
+            cands.add(b)  # start exactly at a break → next shift
+        for s in sorted(c for c in cands if release <= c < limit):
+            if _straddles(s, s + dur):
+                continue
+            if _free(m, s, s + dur):
+                return s
+        return None
+
+    # Free-window pass: rescue tasks still stranded after the merge pass (no earlier
+    # cycle had room / matching group) by pulling them into an earlier idle gap.
+    # Process cycles earliest-start first; deterministic by (start, machine).
+    for (m0, s0, e0) in sorted(cycles, key=lambda c: (c[1], c[0])):
+        members = cycles[(m0, s0, e0)]
+        if any(info[a["task_id"]].get("is_pinned") for a in members):
+            continue
+        pool = sorted(members, key=lambda a: (ready_of[a["task_id"]], a["task_id"]))
+
+        # Repeatedly extract an early-ready sub-batch (≤ cap) that can reach a strictly
+        # earlier boundary-safe free slot.  Peel the highest-ready member when the whole
+        # candidate set has no earlier slot, so a late member never blocks early goods.
+        progress = True
+        while pool and progress:
+            progress = False
+            sub = list(pool)
+            # Capacity: drop highest-ready members until the cycle fits one wash load.
+            while sub and sum(
+                float(a.get("quantity", info[a["task_id"]].get("qty", 0)) or 0) for a in sub
+            ) > cap:
+                sub.pop()
+            while sub:
+                release = max(ready_of[a["task_id"]] for a in sub)
+                dur = max(int(a["end_time"]) - int(a["start_time"]) for a in sub)
+                # SAME machine only: fill an earlier idle gap on the cycle's own machine.
+                # Re-seating onto a DIFFERENT idle machine would undo the solver's
+                # deliberate machine consolidation (fewer machines is an objective), so we
+                # never spread — we only reclaim idle time the machine already has.
+                best_s = _earliest(m0, release, dur, limit=s0)
+                if best_s is not None:
+                    slot = f"pull_{best_s}"
+                    for a in sub:
+                        tid = a["task_id"]
+                        own_dur = int(a["end_time"]) - int(a["start_time"])
+                        due = int(info[tid].get("due_at_min", best_s + own_dur + 1)
+                                  or (best_s + own_dur + 1))
+                        a["start_time"] = best_s
+                        a["end_time"] = best_s + own_dur
+                        a["status"] = "LATE" if a["end_time"] > due else "ON_TIME"
+                        a["batch_slot_id"] = slot
+                        end_of[tid] = a["end_time"]
+                        moved += 1
+                    machine_busy[m0].append((best_s, best_s + dur))
+                    for a in sub:
+                        pool.remove(a)
+                    progress = True
+                    break
+                sub.pop()  # peel highest-ready member; retry with an earlier subset
+
+    if moved:
+        logger.info(
+            f"   ⬅️ Cold washing left-shift: pulled {moved} ready task(s) to earlier "
+            f"free wash slots (machine was idle; downstream untouched)."
+        )
+    return moved

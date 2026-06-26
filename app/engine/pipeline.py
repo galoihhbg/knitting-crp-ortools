@@ -43,6 +43,7 @@ from .phases.phase3_batching import (
     PHASE3_OPS,
     Phase3Result,
     flush_unwashed_end_of_shift,
+    left_shift_cold_washing,
     solve_washing,
 )
 from .phases.phase4_downstream import UPSTREAM_OPS, Phase4Result, solve_downstream
@@ -228,6 +229,18 @@ class Pipeline:
             # Skipped on re-schedule — machine assignment is part of stability there.
             if self.config.get("enable_linking_balance", True):
                 balance_linking_load(all_assignments, self.tasks, all_resources, self.config)
+            # Washing left-shift, FINAL pass — re-run on the post-linking-left-shift ends.
+            # The in-phase-3 pass (before phase 4) used the linking ends as the solver left
+            # them; the linking left-shift above then pulls linking EARLIER, which can
+            # newly expose a washing consolidation/idle-gap win (a slice now ready in time
+            # to merge into an earlier wash run).  Re-running here on the final ends catches
+            # it.  Washing only moves earlier → iron/packing release bounds relax → their
+            # already-placed assignments stay valid (downstream not re-pulled, just slack).
+            if self.config.get("enable_washing_left_shift", True):
+                left_shift_cold_washing(
+                    all_assignments, self.tasks, self.config,
+                    [int(s) for s in self.config.get("shift_ends_min", [])],
+                )
         all_overloads = (
             p1.overloads + p2.overloads + p3.overloads
             + p4.overloads + p5.overloads
@@ -296,6 +309,19 @@ class Pipeline:
         # phase 4–5 optimum cannot get worse.  Skipped on re-schedule (washing kept).
         if not self.reschedule_hint and self.config.get("enable_washing_flush", True):
             moved = flush_unwashed_end_of_shift(
+                p3.assignments, self.tasks, self.config, shift_ends,
+                dep_ends=combined_end_times,
+            )
+            if moved:
+                for a in p3.assignments:
+                    p3.end_times[a["task_id"]] = a["end_time"]
+
+        # Washing left-shift: catch ready goods the solver bundled into a later batch
+        # (machine idle in between) that the flush couldn't pull before a break.  Pulls
+        # them to the earliest boundary-safe free wash slot.  Monotone (only earlier) →
+        # downstream solves below on the earlier washing ends.  Skipped on re-schedule.
+        if not self.reschedule_hint and self.config.get("enable_washing_left_shift", True):
+            moved = left_shift_cold_washing(
                 p3.assignments, self.tasks, self.config, shift_ends,
                 dep_ends=combined_end_times,
             )

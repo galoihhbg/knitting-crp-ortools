@@ -243,6 +243,19 @@ class SolverConfig(BaseModel):
     # lateness is unchanged (operational WIP win — goods wash before the break instead of
     # sitting overnight — not a lateness win).  Skipped on re-schedule.
     enable_washing_flush: bool = True
+    # Washing left-shift — COLD-only deterministic POST-PASS (default ON), run after the
+    # flush and BEFORE ironing/packing solve.  The washing solver consolidates batches
+    # and only weakly rewards early starts, so it can co-batch an early-ready slice with
+    # a much-later-ready slice of another order: the batch is gated by the latest member
+    # and the early goods sit unwashed while the (often single) compatible machine is
+    # idle.  The flush only fixes the slot that ENDS at a shift boundary; when that
+    # pre-break window is busy it cannot help even though the machine is free right after
+    # the break.  This peels the early-ready members out and re-seats them in the earliest
+    # boundary-safe free wash slot strictly earlier than the cycle's start (respecting
+    # capacity + (color, substance) compatibility + shift boundaries).  Monotone: a task
+    # only moves earlier ⇒ downstream release bounds relax ⇒ ironing/packing stay valid
+    # and end-to-end lateness is non-increasing.  Skipped on re-schedule (washing kept).
+    enable_washing_left_shift: bool = True
 
 
 class PreviousAssignment(BaseModel):
