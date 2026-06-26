@@ -27,6 +27,7 @@ from .phases.phase1_knitting import (
     left_shift_cold_knitting,
     reorder_contiguous_knitting,
     solve_knitting,
+    spread_cold_knitting,
 )
 from .shared import compute_global_horizon, diagnose_infeasibility
 from .phases.phase2_linking import (
@@ -35,6 +36,7 @@ from .phases.phase2_linking import (
     _compute_start_lb as _compute_linking_start_lb,
     balance_linking_load,
     compute_sameqty_start_lb,
+    left_shift_cold_linking,
     solve_linking,
 )
 from .phases.phase3_batching import (
@@ -202,7 +204,24 @@ class Pipeline:
         # lateness is monotonically non-increasing (knitting only moves earlier).
         # Skipped on re-schedule — knitting is hard-kept there.
         if not self.reschedule_hint:
+            # Cross-machine spread FIRST: a PO's tail that the solver serialised onto
+            # one machine (while compatible machines sat idle) gets re-balanced onto
+            # the earliest free compatible machines, so a panel's components finish
+            # in parallel and linking is ready sooner.  Monotone-safe (every task only
+            # moves earlier → downstream untouched); falls back silently if it would
+            # break the workforce cap.  left_shift then catches any same-machine idle.
+            if self.config.get("enable_knitting_spread", True):
+                spread_cold_knitting(all_assignments, self.tasks, self.config)
             left_shift_cold_knitting(all_assignments, self.tasks, self.config)
+            # Linking left-shift: pull each linking task to the earliest free worker at
+            # its knitting-derived release, so linking is tight to knitting instead of
+            # staggered late (solver stalls FEASIBLE with no early-start incentive when
+            # due is far).  Monotone-safe (only earlier → downstream untouched); reads
+            # the post-knitting-shift ends so linking inherits earlier knitting too.
+            if self.config.get("enable_linking_left_shift", True):
+                left_shift_cold_linking(
+                    all_assignments, self.tasks, all_resources, self.config
+                )
             # Linking worker load-balance: machine-relabel only (timing unchanged),
             # so downstream stays byte-identical and no order can finish later.
             # Fixes severe linking-worker idle/imbalance (measured stdev 965→40).

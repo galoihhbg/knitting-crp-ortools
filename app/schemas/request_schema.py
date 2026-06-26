@@ -53,6 +53,11 @@ class SolverTask(BaseModel):
     qty: float = Field(alias="qty")
     total_qty: float = Field(alias="total_qty")
     priority: int = Field(alias="priority")
+    # Đơn "thường" (normal): vẫn nhắm dueDate (giữ phạt lateness nhẹ) nhưng KHÔNG bị
+    # check khắt khe — bỏ phạt đếm số-đơn-trễ (is_late) trong objective và KHÔNG báo
+    # cáo task này vào danh sách overloads dù end > due.  Đơn gấp (is_normal=False)
+    # giữ nguyên hành vi cũ.  Default False để tương thích payload cũ chưa gửi cờ.
+    is_normal: bool = Field(default=False, alias="is_normal")
     final_depends_on: List[str] = Field(default=[], alias="final_depends_on")
     start_after_min: int = Field(default=0, alias="start_after_min")
     due_at_min: int = Field(default=0, alias="due_at_min")
@@ -180,6 +185,43 @@ class SolverConfig(BaseModel):
     # machines carrying a pinned/in-progress task are left untouched.  Costs ~1 extra
     # phases-2–5 pass when a candidate is found.
     enable_knitting_contiguity_reorder: bool = True
+    # Knitting cross-machine SPREAD post-pass (cold solve only).  The solver stalls at
+    # FEASIBLE and sometimes serialises a PO's tail onto ONE machine while other
+    # compatible machines sit idle (measured: 17 tasks of one PO piled on a single
+    # machine to t=4518 while 21–25 of its 26 compatible machines were free).  Because
+    # a linking panel cannot start until the LAST of its component POs is knit, that
+    # serial tail gates the panel late.  This post-pass re-balances each knitting task
+    # to the earliest feasible start across ALL its compatible machines.  Processing in
+    # original-start order guarantees every task only moves EARLIER (its own machine is
+    # always a slot ≤ its original position), so downstream release bounds only relax →
+    # downstream assignments stay byte-identical and end-to-end lateness is monotone
+    # non-increasing — no re-solve / gate needed.  Abandoned (no-op) if the extra
+    # parallelism would breach the workforce cap; left_shift then handles same-machine.
+    enable_knitting_spread: bool = True
+    # Linking left-shift post-pass (cold solve only).  Linking due dates are usually
+    # far off, so the solver has no lateness incentive to start linking early and
+    # stalls at a FEASIBLE solution that staggers slices late even though every worker
+    # is idle and every knitting panel is ready (measured: starts 406→4024 / makespan
+    # 4225 vs an earliest-free placement of 1009).  This pulls each linking task to its
+    # knitting-derived earliest start on the earliest free compatible worker.  Monotone
+    # (only earlier) → washing/iron/packing release bounds only relax → downstream
+    # byte-identical, lateness non-increasing.  Runs after the knitting left-shift so
+    # linking also inherits any earlier knitting.
+    enable_linking_left_shift: bool = True
+    # Knitting PO setup-change cost (cold solve only).  Switching a knitting machine
+    # between POs costs real setup time at the factory (yarn/pattern re-setup) that the
+    # model otherwise ignores, so the solver freely ping-pongs POs across machines.
+    # This penalises each EXTRA PO assigned to a machine (first PO free), driving the
+    # solver to DEDICATE machines to POs → same-panel component POs run on disjoint
+    # machines in parallel with no ping-pong.  Banded below lateness (never makes an
+    # order late).  Default OFF — MEASURED HARMFUL (2026-06-25, fresh-solve on a real
+    # 854-task payload): enabling it left switches UNCHANGED (286→293) while Σtardiness
+    # rose +25% (279.5k→349k) and late tasks 460→472 — the textbook FEASIBLE-stall
+    # degradation (cf. washing flush, panel-sync B2).  The cross-machine spread post-pass
+    # (enable_knitting_spread) already drives A…B…A re-entries to ~0, so this adds no
+    # contiguity benefit and only hurts.  Kept behind the flag for future experiments.
+    enable_knitting_setup_cost: bool = False
+    knitting_setup_mult: int = 4
     enable_washing_prompt: bool = True
     washing_prompt_weight_divisor: int = 100
     # FIFO fairness for prompt-washing: a flat wait penalty minimises TOTAL wait but

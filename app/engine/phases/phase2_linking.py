@@ -134,6 +134,142 @@ def balance_linking_load(
     return changed
 
 
+def left_shift_cold_linking(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    resources: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> int:
+    """COLD-only post-pass: pull each linking task to its earliest feasible start
+    across all compatible workers, so linking begins the moment its knitting panel is
+    ready instead of being staggered late.
+
+    The linking due dates are typically far off, so the solver has no lateness
+    incentive to start early and stalls at a FEASIBLE solution that spreads slices
+    arbitrarily across time even though every worker is idle and every panel is ready
+    (measured: starts staggered 406→4024 / makespan 4225 while a simple earliest-free
+    placement gives 1009).  Each task's earliest start is its Phase-1-derived lower
+    bound — ``max(knit_end[dep], knit_start[dep] + wait_offset)`` — read from the
+    CURRENT (post knitting left-shift/spread) assignments, so linking also inherits any
+    earlier knitting.
+
+    Safety mirrors the knitting spread: every linking task is seeded at its ORIGINAL
+    (worker, start) and may only move into an EARLIER feasible gap (its own slot is
+    always a fallback ⇒ new_end ≤ old_end).  Washing/iron/packing depend on linking
+    END (and start+offset) — both only DECREASE — so every downstream release bound
+    only relaxes ⇒ downstream assignments stay byte-identical and lateness is monotone
+    non-increasing.  Worker unavailability windows + available_at_min are respected;
+    pinned linking tasks are immovable anchors.  Deterministic; ties by worker id.
+    NOT applied on re-schedule.  Mutates `assignments` in place.  Returns #tasks moved.
+    """
+    info = {t["task_id"]: t for t in all_tasks}
+    workers = [r["id"] for r in resources if r.get("operation", "").lower() in PHASE2_OPS]
+    if not workers:
+        return 0
+    res_by_id = {r["id"]: r for r in resources}
+
+    def _unavail(m_id: str):
+        return [
+            (int(w["start"]), int(w["end"]))
+            for w in (res_by_id.get(m_id, {}).get("unavailability") or [])
+            if int(w["end"]) > int(w["start"])
+        ]
+
+    def _avail_at(m_id: str) -> int:
+        return int(res_by_id.get(m_id, {}).get("available_at_min", 0) or 0)
+
+    # Current upstream knitting timing (post knitting left-shift/spread) for the lb.
+    k_start = {a["task_id"]: int(a["start_time"]) for a in assignments}
+    k_end = {a["task_id"]: int(a["end_time"]) for a in assignments}
+
+    link_assigns = [
+        a for a in assignments
+        if info.get(a["task_id"], {}).get("operation", "").lower() in PHASE2_OPS
+    ]
+    if not link_assigns:
+        return 0
+
+    def _start_lb(t: Dict[str, Any]) -> int:
+        c = 0
+        for dep in (t.get("final_depends_on") or []):
+            if dep in k_end:
+                c = max(c, k_end[dep])
+        for batch, off in (t.get("wait_offsets") or t.get("WaitOffsets") or {}).items():
+            if batch in k_start:
+                c = max(c, k_start[batch] + int(off))
+        return c
+
+    orig_m = {a["task_id"]: a["machine_id"] for a in link_assigns}
+    orig_s = {a["task_id"]: int(a["start_time"]) for a in link_assigns}
+    dur_of = {a["task_id"]: int(a["end_time"]) - int(a["start_time"]) for a in link_assigns}
+
+    # Seed: worker unavailability windows + every linking task at its original slot.
+    placed: Dict[str, List[tuple]] = {m: list(_unavail(m)) for m in workers}
+    for a in link_assigns:
+        placed.setdefault(a["machine_id"], []).append(
+            (orig_s[a["task_id"]], orig_s[a["task_id"]] + dur_of[a["task_id"]])
+        )
+    for m in placed:
+        placed[m].sort()
+
+    def _earliest(plist: List[tuple], release: int, dur: int) -> int:
+        cur = release
+        for s, e in plist:
+            if s >= cur + dur:
+                return cur
+            if e > cur:
+                cur = e
+        return cur
+
+    cur_m = dict(orig_m)
+    cur_s = dict(orig_s)
+    free = sorted(
+        (a for a in link_assigns if not info[a["task_id"]].get("is_pinned")),
+        key=lambda a: (orig_s[a["task_id"]], a["task_id"]),
+    )
+    for a in free:
+        t_id = a["task_id"]
+        dur = dur_of[t_id]
+        release = max(_start_lb(info[t_id]), 0)
+        compat = [w for w in (info[t_id].get("compatible_resource_ids") or []) if w in placed]
+        if orig_m[t_id] not in compat:
+            compat.append(orig_m[t_id])
+
+        m0, s0 = cur_m[t_id], cur_s[t_id]
+        placed[m0].remove((s0, s0 + dur))
+
+        best_m, best_s = orig_m[t_id], orig_s[t_id]  # guaranteed-available fallback
+        for m in sorted(compat):
+            s = _earliest(placed.get(m, []), max(release, _avail_at(m)), dur)
+            if s < best_s or (s == best_s and m < best_m):
+                best_m, best_s = m, s
+
+        cur_m[t_id], cur_s[t_id] = best_m, best_s
+        placed.setdefault(best_m, []).append((best_s, best_s + dur))
+        placed[best_m].sort()
+
+    moved = 0
+    for a in assignments:
+        t_id = a["task_id"]
+        if t_id not in cur_s:
+            continue
+        if a["machine_id"] != cur_m[t_id] or a["start_time"] != cur_s[t_id]:
+            moved += 1
+        a["machine_id"] = cur_m[t_id]
+        a["start_time"] = cur_s[t_id]
+        a["end_time"] = cur_s[t_id] + dur_of[t_id]
+        due = int(info[t_id].get("due_at_min", a["end_time"] + 1) or (a["end_time"] + 1))
+        a["status"] = "LATE" if a["end_time"] > due else "ON_TIME"
+
+    if moved:
+        logger.info(
+            f"   ⬅️ Cold linking left-shift: pulled {moved} task(s) to earliest "
+            f"feasible start on free workers (linking now tight to knitting; "
+            f"downstream untouched)."
+        )
+    return moved
+
+
 @dataclass
 class Phase2Result:
     status: str

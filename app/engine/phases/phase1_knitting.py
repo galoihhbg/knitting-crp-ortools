@@ -499,6 +499,23 @@ def solve_knitting(
                     f"co-completion penalised."
                 )
             obj_terms += panel_terms
+        # PO setup-change cost: penalise each extra PO per machine so machines stay
+        # DEDICATED to a PO (no unmodeled setup ping-pong; same-panel POs parallelise
+        # on disjoint machines).  Banded below lateness via lateness_scale.  Default
+        # OFF — in-solver terms on the FEASIBLE-stuck knitting solve can be inert or
+        # harmful, so it is measured before being trusted.
+        if config.get("enable_knitting_setup_cost", False):
+            setup_scale = min(max(1, horizon // 1000), 50)
+            setup_w = max(1, setup_scale * int(config.get("knitting_setup_mult", 4)))
+            setup_terms = _apply_po_setup_cost(
+                model, task_vars, knitting_tasks, resource_map, setup_w
+            )
+            if setup_terms:
+                logger.info(
+                    f"   🔧 Phase1 PO setup-cost: {len(setup_terms)} machine(s) "
+                    f"penalised for hosting extra POs (w={setup_w})."
+                )
+            obj_terms += setup_terms
 
     # Reified-keep + hints-only on knitting.  apply_stability_objective is
     # NOT called here (it would double-stabilize via soft time penalty +
@@ -974,6 +991,161 @@ def _knitting_workforce_ok(
         if cur > MAXM:
             return False
     return True
+
+
+def _reentries(orders: List[str]) -> int:
+    """Number of orders that appear in ≥2 separate runs in this time-ordered order
+    sequence — i.e. the count of A…B…A interleavings on a machine."""
+    runs: List[str] = []
+    for o in orders:
+        if not runs or runs[-1] != o:
+            runs.append(o)
+    from collections import Counter
+    return sum(v - 1 for v in Counter(runs).values() if v > 1)
+
+
+def _earliest_nonfrag_start(
+    placed: List[tuple], release: int, dur: int, order: str
+) -> Optional[int]:
+    """Earliest start ≥ release for a `dur`-long task of `order` on a machine whose
+    placed intervals are `placed` (list of (s, e, order), sorted by s), such that the
+    task (a) does not overlap any existing interval and (b) does NOT increase the
+    machine's order-reentry (A…B…A) count — so spreading never fragments an order or
+    splits another order's run.  Returns None if no such start exists."""
+    base_re = _reentries([o for _, _, o in placed])
+    candidates = sorted({release} | {e for _, e, _ in placed if e >= release})
+    for cs in candidates:
+        ce = cs + dur
+        if any(s < ce and e > cs for s, e, _ in placed):  # overlaps an interval
+            continue
+        merged = sorted(placed + [(cs, ce, order)])
+        if _reentries([o for _, _, o in merged]) <= base_re:
+            return cs
+    return None
+
+
+def spread_cold_knitting(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> int:
+    """COLD-only post-pass: pull each knitting task to its earliest feasible start
+    across ALL its COMPATIBLE machines (not just its own).  Generalises
+    `left_shift_cold_knitting` from same-machine compaction to cross-machine
+    re-balancing, so a PO whose tail the solver serialised onto one machine
+    (FEASIBLE-stall) gets spread over idle compatible machines — its components
+    finish earlier and the linking panel (max of component ends) is ready sooner.
+
+    Safety (no re-solve, downstream left byte-identical, like left_shift):
+    EVERY knitting task is first seeded at its ORIGINAL (machine, start); a free task
+    is then moved only into an EARLIER feasible gap.  Because a task is removed from
+    its own slot only while it is being processed — and no other task can have taken
+    that slot (a task can only occupy a gap, and this slot was occupied until now) —
+    every task can always fall back to its original position, so ``new_start ≤
+    original_start`` for all.  Tasks therefore only move EARLIER ⇒ every downstream
+    release bound (D.start ≥ knit_end) only relaxes ⇒ end-to-end lateness is
+    monotonically non-increasing and downstream assignments stay untouched.
+
+    Only COMPATIBLE machines are used (affinity preserved); pinned/in-progress tasks
+    are immovable anchors pre-occupying their machine.  Contiguity-aware: a task is
+    only re-placed where it does NOT increase any machine's order-reentry (A…B…A)
+    count, so spreading never re-fragments an order or adds a setup change — it merely
+    parallelises onto idle compatible machines (append/extend, never split).  After
+    placement the workforce cumulative cap is validated — if cross-machine parallelism
+    would exceed it the whole spread is abandoned (return 0) and the caller falls back
+    to the same-machine left-shift.  Deterministic: ties broken by machine_id.
+
+    NOT applied on re-schedule (knitting is hard-kept there).  Returns #tasks moved.
+    """
+    info = {t["task_id"]: t for t in all_tasks}
+    knit_assigns = [
+        a for a in assignments
+        if (info.get(a["task_id"]) or {}).get("operation", "").lower() == "knitting"
+    ]
+    if not knit_assigns:
+        return 0
+
+    orig_m = {a["task_id"]: a["machine_id"] for a in knit_assigns}
+    orig_s = {a["task_id"]: int(a["start_time"]) for a in knit_assigns}
+    dur_of = {a["task_id"]: int(a["end_time"]) - int(a["start_time"]) for a in knit_assigns}
+    order_of = {
+        a["task_id"]: (info[a["task_id"]].get("original_order_id") or a["task_id"])
+        for a in knit_assigns
+    }
+
+    # Seed every knitting task (free AND pinned) at its original slot, so each task's
+    # own position is always available as a fallback ⇒ no task can be pushed later.
+    placed: Dict[str, List[tuple]] = {}
+    for a in knit_assigns:
+        placed.setdefault(a["machine_id"], []).append(
+            (int(a["start_time"]), int(a["end_time"]), order_of[a["task_id"]])
+        )
+    for m in placed:
+        placed[m].sort()
+
+    cur_m: Dict[str, str] = dict(orig_m)
+    cur_s: Dict[str, int] = dict(orig_s)
+
+    free = sorted(
+        (a for a in knit_assigns if not info[a["task_id"]].get("is_pinned")),
+        key=lambda a: (orig_s[a["task_id"]], a["task_id"]),
+    )
+    for a in free:
+        t_id = a["task_id"]
+        dur = dur_of[t_id]
+        order = order_of[t_id]
+        release = int(info[t_id].get("start_after_min", 0) or 0)
+        compat = list(info[t_id].get("compatible_resource_ids") or [])
+        if orig_m[t_id] not in compat:
+            compat.append(orig_m[t_id])  # original machine is always a candidate
+
+        # Lift this task out of its current slot before searching for an earlier gap.
+        m0, s0 = cur_m[t_id], cur_s[t_id]
+        placed[m0].remove((s0, s0 + dur, order))
+
+        best_m, best_s = orig_m[t_id], orig_s[t_id]  # guaranteed-available fallback
+        for m in sorted(compat):
+            s = _earliest_nonfrag_start(placed.get(m, []), release, dur, order)
+            if s is not None and (s < best_s or (s == best_s and m < best_m)):
+                best_m, best_s = m, s
+
+        cur_m[t_id], cur_s[t_id] = best_m, best_s
+        lst = placed.setdefault(best_m, [])
+        lst.append((best_s, best_s + dur, order))
+        lst.sort()
+
+    new_start = cur_s
+    new_end = {t_id: cur_s[t_id] + dur_of[t_id] for t_id in cur_s}
+    new_machine = cur_m
+
+    knitting_tasks = [t for t in all_tasks
+                      if t.get("operation", "").lower() in ("knitting", "capacity_block")]
+    if not _knitting_workforce_ok(new_start, new_end, knitting_tasks, config):
+        logger.info(
+            "🧵 Cold knitting spread SKIPPED: cross-machine parallelism would exceed "
+            "the workforce cap — falling back to same-machine left-shift."
+        )
+        return 0
+
+    moved = 0
+    for a in assignments:
+        t_id = a["task_id"]
+        if t_id not in new_start:
+            continue
+        if a["machine_id"] != new_machine[t_id] or a["start_time"] != new_start[t_id]:
+            moved += 1
+        a["machine_id"] = new_machine[t_id]
+        a["start_time"] = new_start[t_id]
+        a["end_time"] = new_end[t_id]
+        due = int(info[t_id].get("due_at_min", new_end[t_id] + 1) or (new_end[t_id] + 1))
+        a["status"] = "LATE" if new_end[t_id] > due else "ON_TIME"
+
+    if moved:
+        logger.info(
+            f"   🧵 Cold knitting spread: re-balanced {moved} task(s) onto earliest "
+            f"feasible compatible machines (parallelised serial tails, downstream untouched)."
+        )
+    return moved
 
 
 def left_shift_cold_knitting(
@@ -1526,4 +1698,62 @@ def _apply_po_bounding_box(
                 model.Add(span == po_end - po_start)
                 terms.append(span * contiguity_w)
 
+    return terms
+
+
+def _apply_po_setup_cost(
+    model: cp_model.CpModel,
+    task_vars: Dict[str, Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+    resource_map: Dict[str, Dict[str, Any]],
+    setup_w: int,
+) -> List[Any]:
+    """SOFT setup-change penalty: each EXTRA PO assigned to a machine costs `setup_w`.
+
+    Switching a knitting machine between POs costs real (unmodeled) setup time at the
+    factory, so a machine hosting many POs is expensive.  For every (PO, machine) we
+    reify ``po_on_m`` = "this PO has at least one task on this machine" (OR of the
+    task→machine literals); per machine we then penalise ``max(0, Σ_PO po_on_m − 1)``
+    — i.e. the first PO is free, every additional PO on the machine pays one setup.
+    Minimising this drives the solver to DEDICATE machines to POs, so same-panel
+    component POs run on disjoint machines in parallel (panel ready sooner) with no
+    ping-pong.  Banded below lateness (caller scales `setup_w`) so it never makes an
+    order late.  Returns objective terms.  Free (non-pinned) knitting tasks only.
+    """
+    if setup_w <= 0:
+        return []
+    po_groups: Dict[str, List[Dict]] = {}
+    for t in tasks:
+        if t.get("operation", "").lower() == "knitting" and not t.get("is_pinned", False):
+            po_id = t.get("original_order_id")
+            if po_id:
+                po_groups.setdefault(po_id, []).append(t)
+
+    machine_pos: Dict[str, List[Any]] = {r_id: [] for r_id in resource_map}
+    for po_id, po_tasks in sorted(po_groups.items()):
+        for r_id in resource_map:
+            lits = []
+            for t in po_tasks:
+                tv = task_vars.get(t["task_id"])
+                if tv is None:
+                    continue
+                lit = next(
+                    (l for l in tv["literals"] if l.Name().endswith(f"_on_{r_id}")),
+                    None,
+                )
+                if lit is not None:
+                    lits.append(lit)
+            if not lits:
+                continue
+            po_on_m = model.NewBoolVar(f"setup_{po_id}_{r_id}")
+            model.AddMaxEquality(po_on_m, lits)  # True iff this PO touches r_id
+            machine_pos[r_id].append(po_on_m)
+
+    terms: List[Any] = []
+    for r_id, actives in sorted(machine_pos.items()):
+        if len(actives) <= 1:
+            continue  # ≤1 candidate PO → never an extra setup
+        extra = model.NewIntVar(0, len(actives), f"setup_extra_{r_id}")
+        model.Add(extra >= sum(actives) - 1)  # extra ≥ 0 by domain ⇒ = max(0, Σ−1)
+        terms.append(extra * setup_w)
     return terms

@@ -902,6 +902,7 @@ def apply_soft_deadlines(
             continue
 
         priority = int(task.get("priority", 5))
+        is_normal = bool(task.get("is_normal", False))
         due_at = int(task.get("due_at_min", horizon))
         if deadline_override and t_id in deadline_override:
             due_at = int(deadline_override[t_id])
@@ -918,7 +919,12 @@ def apply_soft_deadlines(
         #   * 1 minute of lateness reduction saves weight × 100 (10× more)
         #   → reducing total tardiness still dominates reducing count.
         # Skipped when max_lateness == 0 (due past horizon → cannot be late).
-        if max_lateness > 0:
+        # SKIPPED for normal orders (is_normal): the late-count term is what makes the
+        # solver fight hard to flip a task on-time (and sacrifice slack from other
+        # orders to do it).  Normal orders still carry the lateness-minutes term above
+        # (×100) so they keep aiming at dueDate, but without the count pressure they no
+        # longer compete aggressively for capacity — "tuân thủ dueDate, không khắt khe".
+        if max_lateness > 0 and not is_normal:
             is_late = model.NewBoolVar(f"is_late_{t_id}")
             model.Add(lateness >= 1).OnlyEnforceIf(is_late)
             model.Add(lateness == 0).OnlyEnforceIf(is_late.Not())
@@ -1616,7 +1622,11 @@ def extract_results(
             "batch_slot_id": batch_slot_id,
         })
 
-        if is_late and not tv.get("is_pinned"):
+        # Normal orders: still scheduled toward dueDate, but never reported as an
+        # overload even when they finish late (per user — "tuân thủ dueDate nhưng
+        # không khắt khe trả overload").  The assignment status above still reflects
+        # LATE/ON_TIME truthfully; only the overloads diagnostic list suppresses them.
+        if is_late and not tv.get("is_pinned") and not task.get("is_normal", False):
             if config is not None:
                 root_cause = _classify_root_cause(
                     t_id, selected_res, start_val,
