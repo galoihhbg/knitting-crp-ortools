@@ -239,9 +239,10 @@ def test_no_stock_vi_reported_as_shortage():
 
 def test_no_stock_new_lot_is_gross_when_packing_known():
     """Zero-stock vi WITH a known default packing → fresh-lot size is the GROSS
-    (whole-roll, pooled across machines), not the net floor. One order, 13 kg net
-    on 2 machines at packing 10 → pooled ceil(13/10)=2 rolls = 20 kg (residual is
-    shared across machines, NOT 2 rolls per machine)."""
+    (whole-roll + per-machine creel-up), not the net floor. One order knit on 2
+    machines IN PARALLEL, each mounting slots=2 cones at packing 10: each machine
+    pulls its OWN max(ceil(net_m/10), 2)·10 = 20 kg (parallel machines can't share a
+    physical cone), so gross = 20 + 20 = 40 kg, NOT the pooled 20 kg."""
     tasks = [
         _knit_task("u1", "A", {"V": 7.0}, slots={"V": 2}),
         _knit_task("u2", "A", {"V": 6.0}, slots={"V": 2}),
@@ -251,9 +252,9 @@ def test_no_stock_new_lot_is_gross_when_packing_known():
     res = allocate_dyelots(tasks, assigns, stock, CFG, vi_packing={"V": 10.0})
     sh = next(s for s in res["dyelot_shortage"] if s["vi"] == "V")
     assert sh["net_demand_kg"] == 13.0
-    # Pooled: ceil((7+6)/10)·10 = 20 kg gross (one roll shared across both machines).
-    assert sh["new_lot_kg"] == 20.0
-    assert sh["demand_kg"] == 20.0
+    # Per-machine: M1 max(ceil(7/10),2)·10 + M2 max(ceil(6/10),2)·10 = 20 + 20 = 40 kg.
+    assert sh["new_lot_kg"] == 40.0
+    assert sh["demand_kg"] == 40.0
     assert sh["topups"] == []
 
 
@@ -531,7 +532,11 @@ def test_machine_shared_creel_with_slots():
 #     model charged 2 creel rolls/machine = 80 kg and wrongly dropped it.)
 # ---------------------------------------------------------------------------
 
-def test_residual_pools_across_machines():
+def test_parallel_machines_each_charge_own_creel():
+    """Một đơn knit trên 2 máy SONG SONG, mỗi máy mount slots=4 cone (packing 10) →
+    mỗi máy giữ cone RIÊNG (không chia chung được), nên charge 4·10 = 40 kg/máy = 80
+    kg > stock 50 → KHÔNG đủ, đơn bị unassigned + báo shortage. Đây là model đúng:
+    số máy song song nhân lên lượng cuộn phải giữ."""
     VI = "V"
     tasks = [
         _knit_task("u1", "A", {VI: 5.0}, slots={VI: 4}),
@@ -542,7 +547,29 @@ def test_residual_pools_across_machines():
 
     res = allocate_dyelots(tasks, assigns, stock, CFG)
 
-    # Pooled gross = 10 kg ≤ 50 → assigned; creel-up no longer sums per machine.
+    # Per-machine creel: 2 máy × max(ceil(5/10),4)·10 = 2 × 40 = 80 kg > 50 → shortage.
+    assert res["order_dyelot_assignment"] == []
+    assert res["dyelot_unassigned"] == [{"order": "A", "vi": VI, "reason": "capacity_shortage"}]
+    sh = next(s for s in res["dyelot_shortage"] if s["vi"] == VI)
+    assert sh["demand_kg"] == 80.0
+    assert sh["net_demand_kg"] == 10.0
+
+
+def test_legacy_pooled_creel_flag_assigns():
+    """Tắt per-machine (enable_dyelot_per_machine_creel=False) → quay về model pooled
+    cũ: gross = ceil((5+5)/10)·10 = 10 kg ≤ 50 → đơn được assign. Giữ coverage nhánh
+    legacy để A/B."""
+    VI = "V"
+    tasks = [
+        _knit_task("u1", "A", {VI: 5.0}, slots={VI: 4}),
+        _knit_task("u2", "A", {VI: 5.0}, slots={VI: 4}),
+    ]
+    assigns = [_assign("u1", "M1", 0), _assign("u2", "M2", 0)]
+    stock = [{"vi": VI, "dyelot": "L1", "remaining_kg": 50.0, "packing_size": 10.0}]
+
+    cfg = {**CFG, "enable_dyelot_per_machine_creel": False}
+    res = allocate_dyelots(tasks, assigns, stock, cfg)
+
     assert len(res["order_dyelot_assignment"]) == 1
     assert res["dyelot_unassigned"] == []
 
