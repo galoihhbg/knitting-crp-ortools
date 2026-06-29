@@ -132,6 +132,12 @@ class Pipeline:
         if p1.status not in ("feasible", "empty"):
             return _phase_failure_result(p1.status, p1_tasks, all_resources, self.config, global_horizon)
 
+        # Improve knitting BEFORE linking solves on it: cross-machine spread (parallel
+        # serial tails) + same-machine idle compaction.  Running it here (not as a final
+        # post-pass) means linking — and every downstream phase — schedules on the
+        # pulled-earlier knitting, so the whole pipeline flows tight (no re-solve).
+        self._improve_knitting(p1)
+
         # ── Phase 2: Linking ──────────────────────────────────────────────
         p2_tasks = [t for t in self.tasks if t.get("operation", "").lower() in PHASE2_OPS]
         p2_hint = _hint_for_phase(self.reschedule_hint, self.partitioned_hint.get("linking"))
@@ -148,6 +154,11 @@ class Pipeline:
 
         if p2.status not in ("feasible", "empty"):
             return _phase_failure_result(p2.status, p2_tasks, all_resources, self.config, global_horizon)
+
+        # Tighten linking BEFORE washing/iron/packing solve: pull each linking task to
+        # its earliest free worker at its (improved-)knitting-derived release, so the
+        # downstream phases schedule on the tight linking and FOLLOW it — no re-solve.
+        self._tighten_linking(p1, p2, all_resources)
 
         # ── Phases 3→5: Washing → Ironing → Packing ───────────────────────
         chain = self._solve_phases_3_to_5(
@@ -204,45 +215,22 @@ class Pipeline:
             + p4.assignments + p5.assignments
         )
 
-        # Cold-only knitting idle compaction (post-pass on the FINAL output).
-        # Knitting stalls at FEASIBLE, so the span objective leaves machines idle
-        # even when a task could run earlier on the same machine.  This pulls each
-        # cold knitting task to its earliest feasible start (same machine, in order);
-        # it runs AFTER every phase so downstream stays byte-identical and end-to-end
-        # lateness is monotonically non-increasing (knitting only moves earlier).
-        # Skipped on re-schedule — knitting is hard-kept there.
+        # Knitting spread/left-shift and linking left-shift now run FORWARD — knitting
+        # before linking (_improve_knitting), linking before phases 3–5
+        # (_tighten_linking) — so each downstream phase solves on the pulled-earlier
+        # upstream and follows it, instead of being fixed first and left with a gap.
+        # Only worker-relabel + washing compaction remain as final touch-ups here.
         if not self.reschedule_hint:
-            # Cross-machine spread FIRST: a PO's tail that the solver serialised onto
-            # one machine (while compatible machines sat idle) gets re-balanced onto
-            # the earliest free compatible machines, so a panel's components finish
-            # in parallel and linking is ready sooner.  Monotone-safe (every task only
-            # moves earlier → downstream untouched); falls back silently if it would
-            # break the workforce cap.  left_shift then catches any same-machine idle.
-            if self.config.get("enable_knitting_spread", True):
-                spread_cold_knitting(all_assignments, self.tasks, self.config)
-            left_shift_cold_knitting(all_assignments, self.tasks, self.config)
-            # Linking left-shift: pull each linking task to the earliest free worker at
-            # its knitting-derived release, so linking is tight to knitting instead of
-            # staggered late (solver stalls FEASIBLE with no early-start incentive when
-            # due is far).  Monotone-safe (only earlier → downstream untouched); reads
-            # the post-knitting-shift ends so linking inherits earlier knitting too.
-            if self.config.get("enable_linking_left_shift", True):
-                left_shift_cold_linking(
-                    all_assignments, self.tasks, all_resources, self.config
-                )
             # Linking worker load-balance: machine-relabel only (timing unchanged),
             # so downstream stays byte-identical and no order can finish later.
             # Fixes severe linking-worker idle/imbalance (measured stdev 965→40).
             # Skipped on re-schedule — machine assignment is part of stability there.
             if self.config.get("enable_linking_balance", True):
                 balance_linking_load(all_assignments, self.tasks, all_resources, self.config)
-            # Washing left-shift, FINAL pass — re-run on the post-linking-left-shift ends.
-            # The in-phase-3 pass (before phase 4) used the linking ends as the solver left
-            # them; the linking left-shift above then pulls linking EARLIER, which can
-            # newly expose a washing consolidation/idle-gap win (a slice now ready in time
-            # to merge into an earlier wash run).  Re-running here on the final ends catches
-            # it.  Washing only moves earlier → iron/packing release bounds relax → their
-            # already-placed assignments stay valid (downstream not re-pulled, just slack).
+            # Washing left-shift, FINAL pass — washing itself stalls at FEASIBLE and can
+            # leave idle gaps even though linking was already tight when phase 3 solved.
+            # This compacts washing on the final ends; washing only moves EARLIER →
+            # iron/packing release bounds relax → their assignments stay valid (slack).
             if self.config.get("enable_washing_left_shift", True):
                 left_shift_cold_washing(
                     all_assignments, self.tasks, self.config,
@@ -272,6 +260,40 @@ class Pipeline:
             "objective_value": combined_obj,
             "solve_time_seconds": total_time,
         }
+
+    def _improve_knitting(self, p1r: Phase1Result) -> None:
+        """Cold knitting cross-machine spread + same-machine left-shift, applied to a
+        Phase-1 result IN PLACE before linking solves on it.  Both transforms are
+        deterministic and monotone (every task only moves earlier), so linking and all
+        downstream phases simply schedule on the pulled-earlier knitting.  Skipped on
+        re-schedule (knitting is hard-kept there)."""
+        if self.reschedule_hint:
+            return
+        if self.config.get("enable_knitting_spread", True):
+            spread_cold_knitting(p1r.assignments, self.tasks, self.config)
+        left_shift_cold_knitting(p1r.assignments, self.tasks, self.config)
+        for a in p1r.assignments:
+            p1r.start_times[a["task_id"]] = a["start_time"]
+            p1r.end_times[a["task_id"]] = a["end_time"]
+
+    def _tighten_linking(
+        self,
+        p1r: Phase1Result,
+        p2r: Phase2Result,
+        all_resources: List[Dict[str, Any]],
+    ) -> None:
+        """Cold linking left-shift applied to a Phase-2 result IN PLACE before the
+        downstream phases solve on it, so washing/iron/packing schedule on the tight
+        linking and follow it.  Monotone (linking only moves earlier).  Reads the
+        knitting timing from `p1r` (already improved).  Skipped on re-schedule."""
+        if self.reschedule_hint or not self.config.get("enable_linking_left_shift", True):
+            return
+        combined = p1r.assignments + p2r.assignments
+        moved = left_shift_cold_linking(combined, self.tasks, all_resources, self.config)
+        if moved:
+            for a in p2r.assignments:
+                p2r.start_times[a["task_id"]] = a["start_time"]
+                p2r.end_times[a["task_id"]] = a["end_time"]
 
     def _solve_phases_3_to_5(
         self,
@@ -555,6 +577,7 @@ class Pipeline:
             if p2b.status != "feasible":
                 logger.info(f"🧩 Knitting relayout: linking re-solve status={p2b.status} — keeping solver plan.")
                 return None
+            self._tighten_linking(p1b, p2b, all_resources)
             chain = self._solve_phases_3_to_5(
                 all_resources, global_horizon, {**p1b.end_times, **p2b.end_times}
             )
@@ -642,6 +665,7 @@ class Pipeline:
             logger.info("🔁 Same-qty re-link: pass 2 changed nothing — keeping pass 1.")
             return None
 
+        self._tighten_linking(p1, p2b, all_resources)
         chain = self._solve_phases_3_to_5(
             all_resources, global_horizon, {**p1.end_times, **p2b.end_times}
         )
