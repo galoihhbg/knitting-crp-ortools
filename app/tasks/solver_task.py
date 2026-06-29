@@ -27,6 +27,35 @@ _ROOT_CAUSE_CODES = (
 )
 
 
+def _truthy_env(name: str, default: bool) -> bool:
+    """Read a boolean env var with a sane default (1/true/yes/on → True)."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _hint_from_assignments(assignments: list) -> dict:
+    """Dựng reschedule_hint từ assignments của lượt solve trước.
+
+    Tái hiện đúng cái Go gửi lại ở lần re-schedule kế tiếp: mỗi assignment
+    thành một previous_assignment khớp theo task_id. order_id → original_order_id.
+    Chỉ giữ assignment có đủ task_id + machine_id (bỏ qua bản ghi thiếu trường).
+    """
+    previous = [
+        {
+            "task_id": a["task_id"],
+            "machine_id": a["machine_id"],
+            "start_time": int(a["start_time"]),
+            "end_time": int(a["end_time"]),
+            "original_order_id": a.get("order_id", "") or "",
+        }
+        for a in assignments
+        if a.get("task_id") and a.get("machine_id")
+    ]
+    return {"previous_assignments": previous}
+
+
 def _post_webhook(response_data: dict, task_id: str) -> bool:
     """
     POST result to Go backend with exponential-backoff retries.
@@ -100,6 +129,40 @@ def optimize_schedule(self, payload: dict):
                 # rớt xuống chạy solver bình thường
 
         result = Engine(payload).solve()
+
+        # ─── DOUBLE-SOLVE STABILIZATION ──────────────────────────────────────
+        # Lịch lần 1 (cold) khác lần 2 một chút vì lần 2 thực chất là re-schedule
+        # của cold (kích hoạt conditional hard-keep ở phase 4); từ lần 2 trở đi ổn
+        # định. Để UI nhận thẳng lịch ổn định, ta tự chạy lượt 2 nội bộ: dùng kết
+        # quả lượt 1 làm reschedule_hint rồi solve lại, trả về lượt 2.
+        #
+        # Chỉ áp dụng cho cold-solve (payload chưa có reschedule_hint sẵn — re-schedule
+        # đã ổn định) và khi lượt 1 cho ra assignments khả dụng. Bật/tắt qua
+        # ENABLE_DOUBLE_SOLVE (mặc định bật).
+        if (
+            _truthy_env("ENABLE_DOUBLE_SOLVE", True)
+            and not payload.get("reschedule_hint")
+            and result.get("status") in ("feasible", "optimal")
+            and result.get("assignments")
+        ):
+            try:
+                stabilize_payload = dict(payload)
+                stabilize_payload["reschedule_hint"] = _hint_from_assignments(
+                    result["assignments"]
+                )
+                logger.info(
+                    f"[Task {self.request.id}] 🔁 Double-solve: chạy lượt 2 với "
+                    f"{len(stabilize_payload['reschedule_hint']['previous_assignments'])} "
+                    f"previous assignments để ổn định lịch trước khi trả UI"
+                )
+                result = Engine(stabilize_payload).solve()
+            except Exception as exc:
+                # Lượt 2 lỗi → giữ nguyên lượt 1 (vẫn là lịch hợp lệ), không làm hỏng job.
+                logger.error(
+                    f"[Task {self.request.id}] ⚠️ Double-solve lượt 2 lỗi, "
+                    f"dùng kết quả lượt 1: {exc}",
+                    exc_info=True,
+                )
 
         raw_assignments = result.get("assignments", [])
         raw_overloads = result.get("overloads", [])
