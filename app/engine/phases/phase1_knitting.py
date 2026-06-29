@@ -1278,7 +1278,7 @@ def reorder_contiguous_knitting(
     order's tasks LATER, so unlike `left_shift_cold_knitting` it is NOT
     downstream-safe by construction.  The pipeline runs it as a CANDIDATE, re-solves
     phases 2–5 on the new ends, and accepts only if total lateness does not increase
-    (see `Pipeline._try_knitting_contiguity`).
+    (see `Pipeline._try_knitting_relayout`).
 
     Determinism: orders are sequenced by (earliest original start on the machine,
     order_id); tasks within an order by (original start, task_id).  Machines that
@@ -1391,6 +1391,294 @@ def reorder_contiguous_knitting(
         f"pairs {base_frag}→{new_frag} — verifying downstream…"
     )
     return {"start": new_start, "end": new_end}
+
+
+def _panel_index(task_id: str) -> int:
+    """Trailing _<int> of a knitting batch id (BATCH_0-641_7 → 7); 0 if none."""
+    tail = task_id.rsplit("_", 1)[-1]
+    return int(tail) if tail.isdigit() else 0
+
+
+def parallelize_component_pos(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    resources: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> Optional[Dict[str, Dict[str, int]]]:
+    """COLD-only: when a garment's component POs (e.g. front 0-641 + back 0-642) are
+    knit SERIALLY — every batch of one PO before the other starts — the first complete
+    PANEL (one batch from EACH PO at the same index) isn't ready until the 2nd PO's
+    first batch finishes, so linking workers idle through the whole first PO (measured:
+    job CP_…841621, order WE3EwiOKOy, first panel ready 2590 though 641 batches finished
+    from 914 — ~2 shift-days of linking idle).
+
+    This DEDICATES a disjoint subset of the garment's machines to each component PO
+    (split ∝ workload to balance makespan) and re-places each PO's batches on its own
+    machines in panel-index order, so the POs knit IN PARALLEL: the first panel — and
+    every middle panel — becomes ready far sooner, feeding linking early.  Each machine
+    still runs ONE PO contiguously (no PO-switch churn; honours the contiguity
+    preference — cf. [[project_po_setup_cost_parallel_panels]]).
+
+    Returns ``{"start": {tid: s}, "end": {tid: e}}`` over ALL knitting tasks (moved +
+    untouched), or ``None`` (no serialized multi-component garment, or it would breach
+    the workforce cap).  NOT monotone — early batches of the first PO move LATER to free
+    machines for the second PO — so the pipeline re-solves phases 2–5 and accepts ONLY
+    if total lateness does not increase (see ``Pipeline._try_knitting_relayout``).
+    Garments touching a pinned/in-progress knitting task are left untouched.
+    Deterministic: garments by (due, id); POs by (−work, id); machines by earliest free.
+    """
+    info = {t["task_id"]: t for t in all_tasks}
+    asg = {a["task_id"]: a for a in assignments}
+
+    # 1. component PO (knitting group_id) → garment (linking order) it feeds + due.
+    garment_pos: Dict[str, set] = {}
+    garment_due: Dict[str, int] = {}
+    for t in all_tasks:
+        if t.get("operation", "").lower() != "linking":
+            continue
+        g = t.get("original_order_id") or t.get("parent_task_id") or t["task_id"]
+        for dep in (t.get("final_depends_on") or []):
+            kt = info.get(dep)
+            if kt and kt.get("operation", "").lower() == "knitting" and kt.get("group_id"):
+                garment_pos.setdefault(g, set()).add(kt["group_id"])
+        if g in garment_pos:
+            garment_due[g] = int(t.get("due_at_min", 0) or 0)
+    multi = {g: pos for g, pos in garment_pos.items() if len(pos) >= 2}
+    if not multi:
+        return None
+
+    # knitting tasks per PO (from the current assignment).
+    po_tasks: Dict[str, List[str]] = {}
+    for a in assignments:
+        t = info.get(a["task_id"])
+        if t is not None and t.get("operation", "").lower() == "knitting" and t.get("group_id"):
+            po_tasks.setdefault(t["group_id"], []).append(a["task_id"])
+
+    # 2. pick SERIALIZED garments: current first-panel (max over POs of the PO's
+    #    earliest-finished batch) is later than the parallel-achievable first-panel
+    #    (group start + longest single first batch) by more than one batch of idle.
+    pinned_machines = {a["machine_id"] for a in assignments
+                       if info.get(a["task_id"], {}).get("is_pinned")}
+    affected_pos: set = set()
+    target_garments: List[str] = []
+    for g in sorted(multi, key=lambda x: (garment_due.get(x, 0), x)):
+        pos = [p for p in multi[g] if po_tasks.get(p)]
+        if len(pos) < 2:
+            continue
+        tids = [tid for p in pos for tid in po_tasks[p]]
+        if any(info[tid].get("is_pinned") or asg[tid]["machine_id"] in pinned_machines
+               for tid in tids):
+            continue
+        t0 = min(asg[tid]["start_time"] for tid in tids)
+        cur_first = max(min(asg[tid]["end_time"] for tid in po_tasks[p]) for p in pos)
+        par_first = t0 + max(
+            min(asg[tid]["end_time"] - asg[tid]["start_time"] for tid in po_tasks[p])
+            for p in pos
+        )
+        if cur_first - par_first <= par_first - t0:
+            continue  # already overlapping / barely serialized
+        target_garments.append(g)
+        affected_pos |= set(pos)
+    if not target_garments:
+        return None
+
+    affected_tids = {tid for p in affected_pos for tid in po_tasks.get(p, [])
+                     if not info[tid].get("is_pinned")}
+    if not affected_tids:
+        return None
+
+    # 3. timeline state — fixed busy windows + global workforce occupancy from
+    #    everything we do NOT re-place (machine unavailability, untouched knitting,
+    #    pinned knitting, capacity_block), then place the affected POs around them.
+    MAXM = int(config.get("max_factory_machines", 100))
+    avail_at: Dict[str, int] = {}
+    fixed_busy: Dict[str, List[Any]] = {}
+    occ: List[Any] = []
+    for r in resources:
+        mid = r["id"]
+        avail_at[mid] = int(r.get("available_at_min", 0) or 0)
+        fixed_busy[mid] = [(int(w["start"]), int(w["end"]))
+                           for w in (r.get("unavailability") or [])
+                           if int(w["end"]) > int(w["start"])]
+    for t in all_tasks:
+        op = t.get("operation", "").lower()
+        tid = t["task_id"]
+        if op == "capacity_block":
+            dem = int(t.get("demand", 0) or 0)
+            pe = t.get("pinned_end_time")
+            if dem > 0 and pe is not None:
+                ps = t.get("pinned_start_time")
+                ps = int(ps) if ps is not None else int(pe) - int(t.get("duration", 0) or 0)
+                occ.append((ps, dem)); occ.append((int(pe), -dem))
+            continue
+        if op != "knitting" or tid in affected_tids:
+            continue
+        a = asg.get(tid)
+        if t.get("is_pinned"):
+            ps, pe = t.get("pinned_start_time"), t.get("pinned_end_time")
+            if (ps is None or pe is None) and a:
+                ps, pe = a["start_time"], a["end_time"]
+            m = t.get("pinned_machine_id") or (a["machine_id"] if a else None)
+        elif a:
+            ps, pe, m = a["start_time"], a["end_time"], a["machine_id"]
+        else:
+            continue
+        if ps is None or pe is None or m is None:
+            continue
+        fixed_busy.setdefault(m, []).append((int(ps), int(pe)))
+        occ.append((int(ps), 1)); occ.append((int(pe), -1))
+    for m in fixed_busy:
+        fixed_busy[m].sort()
+    machine_tail: Dict[str, int] = dict(avail_at)
+
+    def _occ_fits(s: int, e: int) -> bool:
+        cur = 0
+        for tm, dl in sorted(occ + [(s, 1), (e, -1)]):
+            cur += dl
+            if cur > MAXM:
+                return False
+            if tm > e:
+                break
+        return True
+
+    def _next_release(t0: int) -> int:
+        nxt = None
+        for tm, dl in occ:
+            if dl < 0 and tm > t0 and (nxt is None or tm < nxt):
+                nxt = tm
+        return nxt if nxt is not None else t0 + 1
+
+    def _machine_earliest(m: str, release: int, dur: int) -> int:
+        st = max(machine_tail.get(m, 0), release, avail_at.get(m, 0))
+        moved = True
+        while moved:
+            moved = False
+            for ws, we in fixed_busy.get(m, []):
+                if st < we and st + dur > ws:
+                    st = we
+                    moved = True
+        return st
+
+    new_start: Dict[str, int] = {}
+    new_end: Dict[str, int] = {}
+    new_machine: Dict[str, str] = {}
+    for g in target_garments:
+        pos = [p for p in sorted(multi[g]) if any(t in affected_tids for t in po_tasks.get(p, []))]
+        work = {p: sum(int(asg[t]["end_time"] - asg[t]["start_time"])
+                       for t in po_tasks[p] if t in affected_tids) for p in pos}
+        pos = [p for p in pos if work[p] > 0]
+        if len(pos) < 2:
+            continue
+        comp = sorted({m for p in pos for t in po_tasks[p] if t in affected_tids
+                       for m in (info[t].get("compatible_resource_ids") or [])
+                       if m in avail_at})
+        if len(comp) < len(pos):
+            continue
+        t0 = min(asg[t]["start_time"] for p in pos for t in po_tasks[p] if t in affected_tids)
+        # partition machines ∝ work (≥1 each); machines dealt earliest-free first.
+        total = sum(work[p] for p in pos)
+        nm = {p: max(1, round(work[p] / total * len(comp))) for p in pos}
+        order_w = sorted(pos, key=lambda p: (-work[p], p))
+        diff = len(comp) - sum(nm.values())
+        i = 0
+        while diff != 0 and order_w:
+            p = order_w[i % len(order_w)]
+            if diff > 0:
+                nm[p] += 1; diff -= 1
+            elif nm[p] > 1:
+                nm[p] -= 1; diff += 1
+            i += 1
+        comp_sorted = sorted(comp, key=lambda m: (_machine_earliest(m, t0, 0), m))
+        po_machines: Dict[str, List[str]] = {p: [] for p in pos}
+        mi = 0
+        for p in order_w:
+            for _ in range(nm[p]):
+                if mi < len(comp_sorted):
+                    po_machines[p].append(comp_sorted[mi]); mi += 1
+        while mi < len(comp_sorted):
+            po_machines[order_w[0]].append(comp_sorted[mi]); mi += 1
+
+        # snapshot for per-garment rollback on failure.
+        snap = (len(occ), {m: list(v) for m, v in fixed_busy.items()}, dict(machine_tail))
+        local_s: Dict[str, int] = {}
+        local_e: Dict[str, int] = {}
+        local_m: Dict[str, str] = {}
+        ok = True
+        for p in pos:
+            mset = po_machines[p]
+            batches = sorted((t for t in po_tasks[p] if t in affected_tids),
+                             key=lambda t: (_panel_index(t), t))
+            for tid in batches:
+                dur = int(asg[tid]["end_time"] - asg[tid]["start_time"])
+                release = max(t0, int(info[tid].get("start_after_min", 0) or 0))
+                cands = [m for m in mset
+                         if m in (info[tid].get("compatible_resource_ids") or [])]
+                if not cands:
+                    ok = False; break
+                m = min(cands, key=lambda mm: (_machine_earliest(mm, release, dur), mm))
+                st = _machine_earliest(m, release, dur)
+                guard = 0
+                while dur > 0 and not _occ_fits(st, st + dur):
+                    st = _next_release(st)
+                    moved = True
+                    while moved:
+                        moved = False
+                        for ws, we in fixed_busy.get(m, []):
+                            if st < we and st + dur > ws:
+                                st = we; moved = True
+                    guard += 1
+                    if guard > 100000:
+                        ok = False; break
+                if not ok:
+                    break
+                if dur > 0:
+                    occ.append((st, 1)); occ.append((st + dur, -1))
+                fixed_busy.setdefault(m, []).append((st, st + dur))
+                fixed_busy[m].sort()
+                machine_tail[m] = st + dur
+                local_s[tid] = st; local_e[tid] = st + dur; local_m[tid] = m
+            if not ok:
+                break
+        if ok:
+            new_start.update(local_s); new_end.update(local_e); new_machine.update(local_m)
+        else:  # rollback this garment's partial placements
+            del occ[snap[0]:]
+            fixed_busy.clear(); fixed_busy.update(snap[1])
+            machine_tail.clear(); machine_tail.update(snap[2])
+
+    if not new_start:
+        return None
+
+    # full knitting layout (moved + untouched) for the workforce check + p1b build.
+    # Includes machine_id — the dedication CHANGES which machine runs each PO, so the
+    # caller must apply machine too (else old-machine + new-time = overlap).
+    full_start: Dict[str, int] = {}
+    full_end: Dict[str, int] = {}
+    full_machine: Dict[str, str] = {}
+    for a in assignments:
+        t = info.get(a["task_id"])
+        if t is None or t.get("operation", "").lower() != "knitting":
+            continue
+        tid = a["task_id"]
+        if tid in new_start:
+            full_start[tid] = new_start[tid]; full_end[tid] = new_end[tid]
+            full_machine[tid] = new_machine[tid]
+        else:
+            full_start[tid] = a["start_time"]; full_end[tid] = a["end_time"]
+            full_machine[tid] = a["machine_id"]
+
+    knitting_tasks = [t for t in all_tasks
+                      if t.get("operation", "").lower() in ("knitting", "capacity_block")]
+    if not _knitting_workforce_ok(full_start, full_end, knitting_tasks, config):
+        logger.info("⏸ Knitting parallel-PO: candidate exceeds workforce cap — skipped.")
+        return None
+
+    logger.info(
+        f"⏸ Knitting parallel-PO: dedicated machines to component POs of "
+        f"{len(target_garments)} garment(s), {len(new_start)} batch(es) re-placed "
+        f"in parallel — verifying downstream…"
+    )
+    return {"start": full_start, "end": full_end, "machine": full_machine}
 
 
 # ---------------------------------------------------------------------------

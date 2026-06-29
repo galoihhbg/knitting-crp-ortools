@@ -148,10 +148,13 @@ def left_shift_cold_linking(
     incentive to start early and stalls at a FEASIBLE solution that spreads slices
     arbitrarily across time even though every worker is idle and every panel is ready
     (measured: starts staggered 406→4024 / makespan 4225 while a simple earliest-free
-    placement gives 1009).  Each task's earliest start is its Phase-1-derived lower
-    bound — ``max(knit_end[dep], knit_start[dep] + wait_offset)`` — read from the
-    CURRENT (post knitting left-shift/spread) assignments, so linking also inherits any
-    earlier knitting.
+    placement gives 1009).  Each task's earliest start is a FIFO-theo-PO floor: the k-th
+    slice of an order waits for the k-th-FINISHED panel of each component-PO bucket
+    ((group_id, qty)) — NOT the rigid index-paired panel — read from the CURRENT (post
+    knitting left-shift/spread) assignments, so linking also inherits any earlier
+    knitting AND a middle slice no longer waits on a late index-panel when a same-PO
+    panel already finished.  Bijection slice↔panel ⇒ the last slice still waits for the
+    last panel (order completion unchanged); only middle slices are freed earlier.
 
     Safety mirrors the knitting spread: every linking task is seeded at its ORIGINAL
     (worker, start) and may only move into an EARLIER feasible gap (its own slot is
@@ -189,15 +192,79 @@ def left_shift_cold_linking(
     if not link_assigns:
         return 0
 
-    def _start_lb(t: Dict[str, Any]) -> int:
-        c = 0
-        for dep in (t.get("final_depends_on") or []):
-            if dep in k_end:
-                c = max(c, k_end[dep])
-        for batch, off in (t.get("wait_offsets") or t.get("WaitOffsets") or {}).items():
-            if batch in k_start:
-                c = max(c, k_start[batch] + int(off))
-        return c
+    # FIFO-theo-PO release floor (thay cho floor index cứng).  Go ghép cứng linking
+    # SLICE_k ↔ panel BATCH_<comp>_k theo index, nhưng các panel CÙNG (component PO,
+    # qty) là THAY-THẾ-ĐƯỢC (chốt domain): slice thứ k chỉ cần panel-xong-thứ-k của
+    # bucket, không cần đúng panel số-hiệu-k.  Khi thứ tự dệt-xong ≠ thứ tự index,
+    # một slice giữa bị floor index ghìm trong khi panel cùng-PO đã xong nằm chờ.
+    # Ở đây floor mỗi slice = end của panel-xong-thứ-k trong bucket (con trỏ `ptr`
+    # tiêu thụ mỗi panel đúng MỘT lần ⇒ không đếm trùng), WaitOffsets đọc từ ĐÚNG
+    # panel đó.  Bijection slice↔panel ⇒ slice cuối vẫn chờ panel cuối (đơn xong
+    # KHÔNG đổi); chỉ slice GIỮA được nới sớm.  Vì left-shift chỉ kéo sớm + seed mọi
+    # task ở slot gốc, floor cao bất ngờ cũng vô hại (giữ nguyên).  Dep không-knitting
+    # / không-resolve → hành vi index.  Floor hợp lệ vì Go chạy theo start/end trả về.
+    def _knit_bucket(dep_id: str):
+        kt = info.get(dep_id)
+        if not kt or kt.get("operation", "").lower() != "knitting":
+            return None
+        group = kt.get("group_id") or ""
+        if not group:
+            return None
+        return (group, int(round(float(kt.get("qty", 0) or 0))))
+
+    def _index_floor(t: Dict[str, Any]) -> int:
+        ends = [k_end[d] for d in (t.get("final_depends_on") or []) if d in k_end]
+        return max(ends) if ends else 0
+
+    by_parent: Dict[str, List[Dict[str, Any]]] = {}
+    for a in link_assigns:
+        t = info[a["task_id"]]
+        by_parent.setdefault(t.get("parent_task_id") or t["task_id"], []).append(t)
+
+    release_of: Dict[str, int] = {}
+    for parent, slices in sorted(by_parent.items()):
+        bucket_panels: Dict[tuple, Dict[str, tuple]] = {}
+        for t in slices:
+            for dep in (t.get("final_depends_on") or []):
+                if dep not in k_end:
+                    continue
+                key = _knit_bucket(dep)
+                if key is not None:
+                    bucket_panels.setdefault(key, {})[dep] = (k_start.get(dep), k_end[dep])
+        bucket_sorted = {
+            k: sorted(v.values(), key=lambda se: (se[1], se[0] if se[0] is not None else se[1]))
+            for k, v in bucket_panels.items()
+        }
+        ptr: Dict[tuple, int] = {}
+        for t in sorted(slices, key=lambda x: (_index_floor(x), x["task_id"])):
+            wait_offsets = t.get("wait_offsets") or t.get("WaitOffsets") or {}
+            consumed: set = set()
+            c = 0
+            for dep in (t.get("final_depends_on") or []):
+                if dep not in k_end:
+                    continue
+                off = wait_offsets.get(dep)
+                if dep in wait_offsets:
+                    consumed.add(dep)
+                key = _knit_bucket(dep)
+                if key is None:
+                    c = max(c, k_end[dep])
+                    if off is not None and dep in k_start:
+                        c = max(c, k_start[dep] + int(off))
+                    continue
+                panels = bucket_sorted[key]
+                k = ptr.get(key, 0)
+                ptr[key] = k + 1
+                p_start, p_end = panels[min(k, len(panels) - 1)]
+                c = max(c, p_end)
+                if off is not None and p_start is not None:
+                    c = max(c, p_start + int(off))
+            for batch, off in wait_offsets.items():
+                if batch in consumed:
+                    continue
+                if batch in k_start:
+                    c = max(c, k_start[batch] + int(off))
+            release_of[t["task_id"]] = c
 
     orig_m = {a["task_id"]: a["machine_id"] for a in link_assigns}
     orig_s = {a["task_id"]: int(a["start_time"]) for a in link_assigns}
@@ -230,7 +297,7 @@ def left_shift_cold_linking(
     for a in free:
         t_id = a["task_id"]
         dur = dur_of[t_id]
-        release = max(_start_lb(info[t_id]), 0)
+        release = max(release_of.get(t_id, 0), 0)
         compat = [w for w in (info[t_id].get("compatible_resource_ids") or []) if w in placed]
         if orig_m[t_id] not in compat:
             compat.append(orig_m[t_id])

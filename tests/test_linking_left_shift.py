@@ -115,6 +115,47 @@ def test_linking_left_shift_is_monotone():
         assert a["end_time"] <= before[a["task_id"]]
 
 
+def _knit_task_g(task_id: str, group: str, qty: int = 10) -> Dict[str, Any]:
+    return {"task_id": task_id, "operation": "knitting", "final_depends_on": [],
+            "group_id": group, "qty": float(qty)}
+
+
+def test_linking_left_shift_fifo_skips_index_for_middle_slice():
+    """FIFO-theo-PO: a two-component order where index pairing over-constrains the first
+    slice.  Component PO A finishes a2 early / a1 late; PO B finishes b1 early / b2 late.
+    Index floors are 500/500 (each slice gated by its late index-panel), but the panels
+    of each PO are interchangeable, so SLICE_1 only needs the FIRST-finished panel of each
+    PO (both at 100).  FIFO pulls SLICE_1 to 100 while the LAST slice still waits for the
+    last panel (500) → order completion unchanged, middle slice freed."""
+    workers = ["W1", "W2", "W3"]
+    knit = [_knit_task_g("a1", "POA"), _knit_task_g("a2", "POA"),
+            _knit_task_g("b1", "POB"), _knit_task_g("b2", "POB")]
+    knit_asg = [
+        _knit_assign("a1", "M", 0, 500), _knit_assign("a2", "M2", 0, 100),
+        _knit_assign("b1", "M3", 0, 100), _knit_assign("b2", "M4", 0, 500),
+    ]
+    links = [
+        _link_task("L_S1", duration=100, deps=["a1", "b1"], workers=workers),
+        _link_task("L_S2", duration=100, deps=["a2", "b2"], workers=workers),
+    ]
+    link_asg = [
+        {"task_id": "L_S1", "machine_id": "W1", "start_time": 900, "end_time": 1000, "status": "ON_TIME"},
+        {"task_id": "L_S2", "machine_id": "W1", "start_time": 1000, "end_time": 1100, "status": "ON_TIME"},
+    ]
+    asg = knit_asg + link_asg
+    before = {a["task_id"]: a["end_time"] for a in asg}
+
+    left_shift_cold_linking(asg, knit + links, _workers(workers), {})
+
+    s1 = next(a for a in asg if a["task_id"] == "L_S1")
+    s2 = next(a for a in asg if a["task_id"] == "L_S2")
+    assert s1["start_time"] == 100          # FIFO: first-finished panel of each PO (not index a1@500)
+    assert s2["start_time"] == 500          # last slice still waits for the last panel
+    assert _no_overlap(asg)
+    for a in asg:
+        assert a["end_time"] <= before[a["task_id"]]
+
+
 def test_linking_left_shift_respects_worker_unavailability():
     """A worker unavailable early forces the slice onto a free worker or a later slot,
     never overlapping the unavailability window."""

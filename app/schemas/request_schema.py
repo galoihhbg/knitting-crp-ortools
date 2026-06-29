@@ -222,6 +222,26 @@ class SolverConfig(BaseModel):
     # contiguity benefit and only hurts.  Kept behind the flag for future experiments.
     enable_knitting_setup_cost: bool = False
     knitting_setup_mult: int = 4
+    # Parallel component-PO knitting (cold solve only).  A garment split into component
+    # POs (front 0-641 / back 0-642) can be knit SERIALLY by the solver — all of one PO
+    # before the other — so the first complete PANEL (one batch from EACH PO at the same
+    # index) isn't ready until the 2nd PO's first batch finishes, idling linking workers
+    # through the whole first PO (measured WE3EwiOKOy: first panel 2590 though 641
+    # finished from 914 ≈ 2 shift-days idle).  This DEDICATES disjoint machine subsets to
+    # each component PO (split ∝ workload) so they knit IN PARALLEL → first/middle panels
+    # ready far sooner, feeding linking early; each machine still runs one PO contiguously
+    # (no PO-switch setup).  NOT monotone (first-PO batches move later to free machines)
+    # so it is a VERIFIED reorder post-pass: re-sequence, re-run phases 2–5, accept only
+    # if total lateness + late-order count do not increase.  Skipped on re-schedule.
+    enable_knitting_parallel_pos: bool = True
+    # Cheaper solver budget for the knitting-relayout VERIFY re-solve (parallel-PO +
+    # contiguity now share ONE verified phases-2–5 re-solve).  The verify only checks
+    # that the relayout does not raise lateness; the deterministic left-shift post-passes
+    # repair tightness afterward, so it does not need the full det-time budget.  By
+    # default the verify uses knitting_reorder_verify_frac × the configured
+    # max_deterministic_time; set knitting_reorder_verify_det for an absolute cap.
+    knitting_reorder_verify_frac: float = 0.5
+    knitting_reorder_verify_det: Optional[float] = None
     enable_washing_prompt: bool = True
     washing_prompt_weight_divisor: int = 100
     # FIFO fairness for prompt-washing: a flat wait penalty minimises TOTAL wait but

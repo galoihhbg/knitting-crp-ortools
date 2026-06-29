@@ -25,6 +25,7 @@ from .phases.phase1_knitting import (
     PHASE1_OPS,
     Phase1Result,
     left_shift_cold_knitting,
+    parallelize_component_pos,
     reorder_contiguous_knitting,
     solve_knitting,
     spread_cold_knitting,
@@ -156,19 +157,25 @@ class Pipeline:
             return chain  # phase-failure result
         p3, p4, p5 = chain
 
-        # ── Knitting order-contiguity refinement (cold solve only) ────────
-        # The solver stalls at FEASIBLE on overloaded payloads, so its secondary
-        # contiguity term never optimises and orders interleave on a machine even
-        # when slack would allow finishing each one before the next ("dứt điểm đơn
-        # đó").  A warm-start hint / in-solve penalty are both inert there
-        # (measured byte-identical).  So re-sequence each machine AFTER the solve,
-        # re-run phases 2–5 on the new knitting ends, and accept ONLY if total
-        # pipeline lateness does not increase — re-sequencing pushes the yielding
-        # order later, so it is verified, not safe-by-construction.
-        if not self.reschedule_hint and self.config.get(
-            "enable_knitting_contiguity_reorder", False
+        # ── Knitting relayout refinement (cold solve only) ────────────────
+        # ONE verified pass combining two knitting-layout transforms that share a
+        # SINGLE phases-2–5 re-solve (instead of one re-solve each):
+        #   1. parallel component-PO — the solver may knit a garment's component POs
+        #      (front 0-641 / back 0-642) SERIALLY, so the first complete panel isn't
+        #      ready until the 2nd PO starts → linking idles through the whole first PO.
+        #      Dedicate disjoint machines per PO so they knit in PARALLEL (first panel
+        #      far sooner; feeds linking early).
+        #   2. order-contiguity — the solver stalls at FEASIBLE so its secondary
+        #      contiguity term never optimises; re-sequence each machine so an order's
+        #      tasks run contiguously ("dứt điểm đơn đó").
+        # Neither is monotone (both can push a yielding order later), so the merged
+        # candidate is re-solved (cheaper verify budget) and accepted ONLY if total
+        # pipeline lateness does not increase.
+        if not self.reschedule_hint and (
+            self.config.get("enable_knitting_parallel_pos", True)
+            or self.config.get("enable_knitting_contiguity_reorder", False)
         ):
-            refined = self._try_knitting_contiguity(
+            refined = self._try_knitting_relayout(
                 p2_tasks, all_resources, global_horizon, p1, p2, p3, p4, p5,
             )
             if refined is not None:
@@ -409,7 +416,59 @@ class Pipeline:
                 n_late += 1
         return total, n_late
 
-    def _try_knitting_contiguity(
+    def _rebuild_p1_from_knitting(
+        self, p1: Phase1Result, new_start: Dict[str, int], new_end: Dict[str, int],
+        new_machine: Optional[Dict[str, str]] = None,
+    ) -> Phase1Result:
+        """Build a candidate Phase-1 result with knitting tasks re-timed to new_* (and
+        re-machined to new_machine where given — the parallel-PO dedication changes the
+        machine, so it MUST be applied or old-machine + new-time would overlap)."""
+        info = {t["task_id"]: t for t in self.tasks}
+        new_machine = new_machine or {}
+        p1b_assignments: List[Dict[str, Any]] = []
+        for a in p1.assignments:
+            tid = a["task_id"]
+            if tid in new_start:
+                b = dict(a)
+                b["start_time"] = new_start[tid]
+                b["end_time"] = new_end[tid]
+                if tid in new_machine:
+                    b["machine_id"] = new_machine[tid]
+                due = int(info.get(tid, {}).get("due_at_min", new_end[tid] + 1) or (new_end[tid] + 1))
+                b["status"] = "LATE" if new_end[tid] > due else "ON_TIME"
+                p1b_assignments.append(b)
+            else:
+                p1b_assignments.append(a)
+        return Phase1Result(
+            status="feasible",
+            assignments=p1b_assignments,
+            overloads=p1.overloads,
+            start_times={**p1.start_times, **new_start},
+            end_times={**p1.end_times, **new_end},
+            solve_time_seconds=0.0,
+            solver_status_name=p1.solver_status_name,
+        )
+
+    def _verify_config(self) -> Dict[str, Any]:
+        """Cheaper solver budget for CANDIDATE re-solves (reorder verifies).  The verify
+        re-runs phases 2–5 only to check that a knitting relayout does not raise lateness
+        — it is not the production solve, and the deterministic left-shift post-passes
+        repair tightness afterward, so it does not need the full det-time budget.  Caps
+        ``max_deterministic_time`` to ``knitting_reorder_verify_det`` (or a fraction of
+        the configured budget).  Everything else (shift_ends, seeds, flags) is copied."""
+        cfg = dict(self.config)
+        explicit = cfg.get("max_deterministic_time")
+        base = float(explicit) if explicit is not None else float(
+            min(cfg.get("max_search_time", 12) or 12, 12)
+        )
+        cap = cfg.get("knitting_reorder_verify_det")
+        cfg["max_deterministic_time"] = (
+            float(cap) if cap is not None
+            else max(2.0, base * float(cfg.get("knitting_reorder_verify_frac", 0.5)))
+        )
+        return cfg
+
+    def _try_knitting_relayout(
         self,
         p2_tasks: List[Dict[str, Any]],
         all_resources: List[Dict[str, Any]],
@@ -420,77 +479,111 @@ class Pipeline:
         p4: "Phase4Result",
         p5: "Phase4Result",
     ):
-        """Re-sequence knitting per machine for order-contiguity, re-run 2→5, and
-        accept ONLY if total pipeline lateness (Σ tardiness AND late-task count)
-        does not increase.  Any failure / regression → None (keep the solver plan).
-        """
-        cand = reorder_contiguous_knitting(p1.assignments, self.tasks, self.config)
-        if cand is None:
-            return None
-        new_start, new_end = cand["start"], cand["end"]
+        """ONE verified knitting-relayout pass that COMBINES two candidate transforms,
+        so they share a SINGLE phases-2–5 re-solve instead of one each:
 
-        # Build the candidate Phase-1 result (only knitting tasks moved).
-        p1b_assignments: List[Dict[str, Any]] = []
+          1. parallel component-PO  — dedicate machines per component PO so a garment's
+             POs knit in parallel (first panel ready sooner; feeds linking early).
+          2. order-contiguity        — re-sequence each machine so an order's tasks run
+             contiguously (no A→B→A interleave).
+
+        (2) runs ON TOP of (1)'s layout, then the merged candidate is re-solved through
+        phases 2–5 (on the cheaper ``_verify_config`` budget) and accepted ONLY if total
+        pipeline lateness (Σ tardiness AND late-order count) does not increase.  Either
+        transform alone, both, or neither may apply.  Returns the refined phase results
+        or None (keep the solver plan)."""
         info = {t["task_id"]: t for t in self.tasks}
-        for a in p1.assignments:
-            tid = a["task_id"]
-            if tid in new_start:
-                b = dict(a)
-                b["start_time"] = new_start[tid]
-                b["end_time"] = new_end[tid]
-                due = int(info.get(tid, {}).get("due_at_min", new_end[tid] + 1) or (new_end[tid] + 1))
-                b["status"] = "LATE" if new_end[tid] > due else "ON_TIME"
-                p1b_assignments.append(b)
-            else:
-                p1b_assignments.append(a)
-        p1b = Phase1Result(
-            status="feasible",
-            assignments=p1b_assignments,
-            overloads=p1.overloads,
-            start_times={**p1.start_times, **new_start},
-            end_times={**p1.end_times, **new_end},
-            solve_time_seconds=0.0,
-            solver_status_name=p1.solver_status_name,
-        )
 
-        # Re-solve linking on the new knitting ends, then washing→ironing→packing.
-        p2b: Phase2Result = solve_linking(
-            p2_tasks, all_resources, self.config,
-            p1_start_times=p1b.start_times,
-            p1_end_times=p1b.end_times,
-            translation_map=self.translation_map,
-            horizon=global_horizon,
-            reschedule_hint=None,
-            workload_shrank=False,
+        cand_p = (
+            parallelize_component_pos(p1.assignments, self.tasks, all_resources, self.config)
+            if self.config.get("enable_knitting_parallel_pos", True) else None
         )
-        if p2b.status != "feasible":
-            logger.info(f"🧱 Knitting contiguity: linking re-solve status={p2b.status} — keeping solver plan.")
+        # Interim assignments after the parallel-PO dedication (start/end/machine).
+        if cand_p is not None:
+            interim: List[Dict[str, Any]] = []
+            for a in p1.assignments:
+                tid = a["task_id"]
+                if tid in cand_p["start"]:
+                    b = dict(a)
+                    b["start_time"] = cand_p["start"][tid]
+                    b["end_time"] = cand_p["end"][tid]
+                    b["machine_id"] = cand_p["machine"][tid]
+                    interim.append(b)
+                else:
+                    interim.append(a)
+        else:
+            interim = p1.assignments
+
+        cand_c = (
+            reorder_contiguous_knitting(interim, self.tasks, self.config)
+            if self.config.get("enable_knitting_contiguity_reorder", False) else None
+        )
+        if cand_p is None and cand_c is None:
             return None
-        chain = self._solve_phases_3_to_5(
-            all_resources, global_horizon, {**p1b.end_times, **p2b.end_times}
-        )
+
+        # Merge: machine + times from the parallel layout, then overlay contiguity times.
+        final_start: Dict[str, int] = {}
+        final_end: Dict[str, int] = {}
+        final_machine: Dict[str, str] = {}
+        for a in interim:
+            t = info.get(a["task_id"])
+            if t is None or t.get("operation", "").lower() != "knitting":
+                continue
+            tid = a["task_id"]
+            final_start[tid] = a["start_time"]
+            final_end[tid] = a["end_time"]
+            final_machine[tid] = a["machine_id"]
+        if cand_c is not None:
+            final_start.update(cand_c["start"])
+            final_end.update(cand_c["end"])  # machine unchanged by per-machine reorder
+
+        p1b = self._rebuild_p1_from_knitting(p1, final_start, final_end, final_machine)
+
+        verify_cfg = self._verify_config()
+        saved_cfg = self.config
+        try:
+            self.config = verify_cfg
+            p2b: Phase2Result = solve_linking(
+                p2_tasks, all_resources, verify_cfg,
+                p1_start_times=p1b.start_times,
+                p1_end_times=p1b.end_times,
+                translation_map=self.translation_map,
+                horizon=global_horizon,
+                reschedule_hint=None,
+                workload_shrank=False,
+            )
+            if p2b.status != "feasible":
+                logger.info(f"🧩 Knitting relayout: linking re-solve status={p2b.status} — keeping solver plan.")
+                return None
+            chain = self._solve_phases_3_to_5(
+                all_resources, global_horizon, {**p1b.end_times, **p2b.end_times}
+            )
+        finally:
+            self.config = saved_cfg
         if isinstance(chain, dict):
-            logger.info("🧱 Knitting contiguity: downstream re-solve failed — keeping solver plan.")
+            logger.info("🧩 Knitting relayout: downstream re-solve failed — keeping solver plan.")
             return None
         p3b, p4b, p5b = chain
 
         base_ends = {**p1.end_times, **p2.end_times, **p3.end_times, **p4.end_times, **p5.end_times}
         cand_ends = {**p1b.end_times, **p2b.end_times, **p3b.end_times, **p4b.end_times, **p5b.end_times}
         if set(base_ends) != set(cand_ends):
-            logger.info("🧱 Knitting contiguity: task-set mismatch — keeping solver plan.")
+            logger.info("🧩 Knitting relayout: task-set mismatch — keeping solver plan.")
             return None
         base_late, base_n = self._total_lateness(base_ends)
         cand_late, cand_n = self._total_lateness(cand_ends)
         if cand_late > base_late or cand_n > base_n:
             logger.info(
-                f"🧱 Knitting contiguity: REJECTED — lateness would rise "
-                f"(Σ {base_late}→{cand_late}, late tasks {base_n}→{cand_n}). Keeping solver plan."
+                f"🧩 Knitting relayout: REJECTED — lateness would rise "
+                f"(Σ {base_late}→{cand_late}, late orders {base_n}→{cand_n}). Keeping solver plan."
             )
             return None
-
+        what = "+".join(
+            x for x in (("parallel-PO" if cand_p else None), ("contiguity" if cand_c else None)) if x
+        )
         logger.info(
-            f"✨ Knitting contiguity ACCEPTED: orders re-sequenced contiguously, "
-            f"Σ lateness {base_late}→{cand_late}, late tasks {base_n}→{cand_n}."
+            f"✨ Knitting relayout ACCEPTED ({what}): Σ lateness {base_late}→{cand_late}, "
+            f"late orders {base_n}→{cand_n}."
         )
         return p1b, p2b, p3b, p4b, p5b
 

@@ -228,18 +228,25 @@ class TestSameQtyRelinkPipeline:
         regressed = {k: (e_off[k], e_on[k]) for k in e_off if e_on[k] > e_off[k]}
         assert not regressed, f"Pareto guard violated: {regressed}"
 
-    def test_relink_improves_crossed_instance(self):
-        """The crossed fixture has real slack — refinement must harvest some."""
+    def test_crossed_instance_harvested_by_fifo_left_shift(self):
+        """The crossed slack is now harvested on the COLD path by the FIFO-by-PO
+        linking left-shift (default on), which subsumes the two-pass relink here.
+
+        L_s1's index floor is 500 (its late index-panel K_c1_late), but the panels
+        of each component PO are interchangeable, so the FIFO left-shift releases it
+        at the first-finished panel of each bucket (100) → it ends at 150 even with
+        the two-pass relink DISABLED.  The bijection keeps the last slice waiting for
+        the last panel (L_s2 → 550), so order completion is unchanged.  Enabling the
+        relink on top must not regress it (Pareto), so off == on for this instance."""
         r_off = Engine(make_crossed_payload(enable_relink=False)).solve()
         r_on = Engine(make_crossed_payload(enable_relink=True)).solve()
         e_off, e_on = _ends(r_off), _ends(r_on)
-        link_ids = ("L_s1", "L_s2")
-        assert sum(e_on[k] for k in link_ids) < sum(e_off[k] for k in link_ids), (
-            f"expected linking improvement, got off={e_off} on={e_on}"
-        )
-        # Baseline floors are 500/500 → both end ≥ 550; the relaxed slice starts
-        # at the 1st-finished same-qty panels (floor 100) → one slice ends ≤ 500.
-        assert min(e_on[k] for k in link_ids) <= 500
+        # FIFO left-shift harvested the middle slice with relink OFF.
+        assert e_off["L_s1"] <= 150, e_off
+        # Bijection: the last slice still waits for the last panel (order end unchanged).
+        assert e_off["L_s2"] == 550, e_off
+        # Two-pass relink is subsumed here → adds nothing, regresses nothing.
+        assert e_on == e_off, f"relink changed a left-shift-optimal cold result: off={e_off} on={e_on}"
 
     def test_relink_never_starts_before_sameqty_floor(self):
         """Physical guard: no linking slice may start before its bucket floor."""
