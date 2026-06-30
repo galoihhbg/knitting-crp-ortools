@@ -349,3 +349,81 @@ class TestLinkingSliceInterleaving:
             f"Linking bunched with 3 orders! max s1 end = {max_s1_end}, "
             f"expected ≤ {3 * SLICE_DUR}"
         )
+
+
+# ---------------------------------------------------------------------------
+# FIFO-by-PO linking floor (enable_fifo_linking_floor) — in-solver default
+# ---------------------------------------------------------------------------
+
+class TestFifoLinkingFloor:
+    """Reproduces the WLJPELMsPp bug: two same-panel component POs (643/644) whose
+    panels finish OUT of index order.  A linking slice needs one panel of each PO and
+    they are interchangeable, but the index pairing (SLICE_k ↔ 643_k AND 644_k) forces
+    a slice to wait for its specific late index-panel while an early sibling sits ready.
+    The FIFO-by-PO floor (k-th slice ← k-th-FINISHED panel of each PO bucket) frees the
+    middle slices; per-order completion (the LAST slice) is unchanged.
+    """
+
+    # PO 643 panel ends: _1 late (1076), the rest early.   PO 644: _4 late (2756).
+    P643 = {"BATCH_643_1": 1076, "BATCH_643_2": 255, "BATCH_643_3": 407,
+            "BATCH_643_4": 255, "BATCH_643_5": 407}
+    P644 = {"BATCH_644_1": 407, "BATCH_644_2": 152, "BATCH_644_3": 407,
+            "BATCH_644_4": 2756, "BATCH_644_5": 152}
+
+    def _knit_panels(self):
+        tasks, starts, ends = [], {}, {}
+        for po, panels in (("643", self.P643), ("644", self.P644)):
+            for tid, end in panels.items():
+                tasks.append({
+                    "task_id": tid, "operation": "knitting", "group_id": po,
+                    "qty": 50.0, "final_depends_on": [],
+                })
+                starts[tid] = 0
+                ends[tid] = end
+        return tasks, starts, ends
+
+    def _link_slices(self, machines):
+        slices = []
+        for k in range(1, 6):
+            t = _link_task(f"L_WLJ_s{k}", "WLJ", k, 100, machines)
+            t["parent_task_id"] = "L_WLJ"
+            t["final_depends_on"] = [f"BATCH_643_{k}", f"BATCH_644_{k}"]
+            slices.append(t)
+        return slices
+
+    def _run(self, fifo: bool):
+        knit, p1s, p1e = self._knit_panels()
+        workers = [f"LM_{i:02d}" for i in range(5)]  # plenty: capacity never the limiter
+        slices = self._link_slices(workers)
+        kwargs = dict(
+            p1_start_times=p1s, p1_end_times=p1e, translation_map={}, horizon=6000,
+        )
+        if fifo:
+            kwargs["all_pipeline_tasks"] = knit + slices
+        result = solve_linking(slices, [_resource(w) for w in workers], _config(horizon=6000), **kwargs)
+        assert result.status == "feasible"
+        return sorted(a["start_time"] for a in result.assignments)
+
+    def test_fifo_floor_frees_two_slices_to_earliest(self):
+        """Under FIFO at least TWO slices start at 255 (643_2/4 ↔ 644_2/5); under index
+        only ONE can (the second-ready pair is index-mismatched 643_4 vs 644_5)."""
+        fifo_starts = self._run(fifo=True)
+        index_starts = self._run(fifo=False)
+
+        assert sum(1 for s in fifo_starts if s <= 255) >= 2, (
+            f"FIFO floor should free 2 slices to ≤255, got {fifo_starts}"
+        )
+        assert sum(1 for s in index_starts if s <= 255) == 1, (
+            f"index pairing should allow only 1 slice ≤255, got {index_starts}"
+        )
+
+    def test_fifo_floor_preserves_order_completion(self):
+        """The order's LAST linking slice still waits for the last panel (644_4@2756) —
+        FIFO only nudges the middle slices earlier, never the makespan."""
+        fifo_starts = self._run(fifo=True)
+        index_starts = self._run(fifo=False)
+        # last slice gated by the genuinely-late panel in both models
+        assert max(fifo_starts) == max(index_starts) == 2756
+        # FIFO is element-wise no-later than index (pure relaxation)
+        for f, i in zip(fifo_starts, index_starts):
+            assert f <= i, f"FIFO start {f} later than index {i}: {fifo_starts} vs {index_starts}"

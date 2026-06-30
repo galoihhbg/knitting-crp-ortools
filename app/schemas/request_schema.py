@@ -208,6 +208,19 @@ class SolverConfig(BaseModel):
     # byte-identical, lateness non-increasing.  Runs after the knitting left-shift so
     # linking also inherits any earlier knitting.
     enable_linking_left_shift: bool = True
+    # FIFO-by-PO linking start floor (in-solver, default ON).  Go ghép cứng linking
+    # SLICE_k ↔ panel BATCH_<comp>_k theo INDEX; khi thứ tự dệt-xong không trùng index
+    # (ví dụ 643_4 + 644_5 cùng xong sớm nhưng index lệch), index-pairing ép SLICE phải
+    # chờ "đúng panel số k" trong khi một panel cùng (component, qty) đã sẵn sàng nằm
+    # chờ → linking khởi động muộn dù đủ panel.  Floor này cho SLICE thứ k chờ panel
+    # XONG-thứ-k của mỗi bucket (component, qty) thay vì panel số-hiệu-k — phản ánh đúng
+    # rằng panel cùng-component-cùng-qty thay-thế-được.  Song ánh slice↔panel ⇒ đơn hoàn
+    # thành KHÔNG đổi (slice cuối vẫn chờ panel cuối); chỉ slice GIỮA nới sớm.  Là NỚI
+    # LỎNG sàn (FIFO floor ≤ index floor luôn) nên solver chỉ tốt-hơn-hoặc-bằng.  Áp dụng
+    # ở CẢ pass 1 lẫn pass 2 (double-solve) — trước đây chỉ left-shift post-pass relax
+    # được, nhưng pass 2 của double-solve skip post-pass nên lợi ích bị mất (lịch trả UI
+    # quay về index floor).  False → giữ index floor cũ (back-compat, byte-identical).
+    enable_fifo_linking_floor: bool = True
     # Knitting PO setup-change cost (cold solve only).  Switching a knitting machine
     # between POs costs real setup time at the factory (yarn/pattern re-setup) that the
     # model otherwise ignores, so the solver freely ping-pongs POs across machines.

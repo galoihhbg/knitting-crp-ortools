@@ -149,6 +149,7 @@ class Pipeline:
             horizon=global_horizon,
             reschedule_hint=p2_hint,
             workload_shrank=self.workload_shrank,
+            all_pipeline_tasks=self.tasks,
         )
         logger.info(f"✅ Phase 2 complete: {len(p2.assignments)} assignments, status={p2.status}")
 
@@ -573,6 +574,7 @@ class Pipeline:
                 horizon=global_horizon,
                 reschedule_hint=None,
                 workload_shrank=False,
+                all_pipeline_tasks=self.tasks,
             )
             if p2b.status != "feasible":
                 logger.info(f"🧩 Knitting relayout: linking re-solve status={p2b.status} — keeping solver plan.")

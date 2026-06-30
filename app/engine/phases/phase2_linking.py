@@ -360,6 +360,7 @@ def solve_linking(
     workload_shrank: bool = False,
     start_lb_override: Optional[Dict[str, int]] = None,
     end_caps: Optional[Dict[str, int]] = None,
+    all_pipeline_tasks: Optional[List[Dict[str, Any]]] = None,
 ) -> Phase2Result:
     """
     Solve the linking phase.
@@ -371,10 +372,12 @@ def solve_linking(
         p1_start_times:  task_id -> start minute from Phase 1.
         p1_end_times:    task_id -> end minute from Phase 1.
         translation_map: sub-task / original-order ID → batch task ID.
-        start_lb_override: dùng floor này thay vì _compute_start_lb (pass 2 của
-            same-qty relink — xem pipeline).  None → floor index như cũ.
+        start_lb_override: dùng floor này thay vì floor mặc định (pass 2 của
+            same-qty relink — xem pipeline).  None → floor mặc định.
         end_caps:        task_id → end tối đa (end của pass 1).  Pareto guard:
             pass 2 không được ra lịch muộn hơn pass 1 ở bất kỳ task nào.
+        all_pipeline_tasks: toàn bộ task pipeline (gồm knitting) để tra group_id/qty
+            cho FIFO-by-PO floor (enable_fifo_linking_floor).  None → floor index.
     """
     linking_tasks = [t for t in tasks if t.get("operation", "").lower() in PHASE2_OPS]
     if not linking_tasks:
@@ -384,12 +387,19 @@ def solve_linking(
     if horizon is None:
         horizon = compute_horizon(linking_tasks, config, resources=resources)
 
-    # Compute start lower-bounds from Phase 1
-    start_lb = (
-        start_lb_override
-        if start_lb_override is not None
-        else _compute_start_lb(linking_tasks, p1_start_times, p1_end_times, translation_map)
-    )
+    # Compute start lower-bounds from Phase 1.  Default = FIFO-by-PO floor (panels of
+    # the same (component, qty) bucket are interchangeable → SLICE thứ k chờ panel
+    # XONG-thứ-k, không phải panel số-hiệu-k); falls back to index pairing when the flag
+    # is off or knitting metadata is unavailable.  Index pairing alone leaves linking
+    # waiting on a late index-panel while an interchangeable sibling sits ready.
+    if start_lb_override is not None:
+        start_lb = start_lb_override
+    elif config.get("enable_fifo_linking_floor", True) and all_pipeline_tasks is not None:
+        start_lb = compute_sameqty_start_lb(
+            linking_tasks, p1_start_times, p1_end_times, translation_map, all_pipeline_tasks
+        )
+    else:
+        start_lb = _compute_start_lb(linking_tasks, p1_start_times, p1_end_times, translation_map)
 
     resource_map: Dict[str, Dict[str, Any]] = {r["id"]: r for r in resources}
     model = cp_model.CpModel()
