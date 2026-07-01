@@ -209,3 +209,82 @@ def _compute_start_lb(
         if current_lb > 0:
             lb[t_id] = current_lb
     return lb
+
+
+def left_shift_cold_ironing(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    dep_ends: Dict[str, int],
+) -> int:
+    """COLD-only post-pass: pull each ironing task to its earliest feasible start on its
+    OWN (serial) machine, preserving per-machine order.
+
+    The downstream solver only weakly rewards early starts, so with loose due dates it
+    stalls at FEASIBLE and staggers ironing a few minutes after its washing-ready time
+    even though the (serial, capacity-1) iron machine is free — the tester observes iron
+    starting 1–5 min after the wash finishes.  This pulls each iron task to
+    max(release, prev_end) where release = max(start_after_min, latest washing-end it
+    depends on via final_depends_on).
+
+    Safety: every task only moves EARLIER (ns ≤ old start) ⇒ packing's release bound only
+    relaxes ⇒ downstream stays valid and end-to-end lateness is monotone non-increasing.
+    Pinned iron tasks are immovable anchors.  Deterministic O(n log n).  Returns #tasks
+    moved.  NOT applied on re-schedule (iron is hard-kept there).
+    """
+    info = {t["task_id"]: t for t in all_tasks}
+    iron_ids = {
+        t["task_id"] for t in all_tasks
+        if str(t.get("operation", "")).lower() in ("iron", "ironing")
+    }
+    iron_assigns = [a for a in assignments if a["task_id"] in iron_ids]
+    if not iron_assigns:
+        return 0
+
+    def _release(t_id: str) -> int:
+        t = info[t_id]
+        rel = int(t.get("start_after_min", 0))
+        for d in (t.get("final_depends_on") or []):
+            if d in dep_ends:
+                rel = max(rel, int(dep_ends[d]))
+        return rel
+
+    by_machine: Dict[str, List[Dict[str, Any]]] = {}
+    for a in iron_assigns:
+        by_machine.setdefault(a["machine_id"], []).append(a)
+
+    new_start: Dict[str, int] = {}
+    new_end: Dict[str, int] = {}
+    for _m, items in by_machine.items():
+        items.sort(key=lambda a: (a["start_time"], a["end_time"], a["task_id"]))
+        prev_end = 0
+        for a in items:
+            t_id = a["task_id"]
+            if info[t_id].get("is_pinned"):
+                # in-progress / frozen — immovable anchor, keep solver position
+                new_start[t_id] = a["start_time"]
+                new_end[t_id] = a["end_time"]
+                prev_end = a["end_time"]
+                continue
+            dur = int(a["end_time"]) - int(a["start_time"])
+            ns = max(_release(t_id), prev_end)
+            new_start[t_id] = ns
+            new_end[t_id] = ns + dur
+            prev_end = ns + dur
+
+    moved = 0
+    for a in iron_assigns:
+        t_id = a["task_id"]
+        if a["start_time"] != new_start[t_id]:
+            moved += 1
+        a["start_time"] = new_start[t_id]
+        a["end_time"] = new_end[t_id]
+        due = int(info[t_id].get("due_at_min", new_end[t_id] + 1))
+        a["status"] = "LATE" if new_end[t_id] > due else "ON_TIME"
+
+    if moved:
+        logger.info(
+            f"   ⬅️ Cold ironing left-shift: pulled {moved} iron task(s) to earliest "
+            f"feasible start (serial-machine idle compaction, downstream untouched)."
+        )
+    return moved

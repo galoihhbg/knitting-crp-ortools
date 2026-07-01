@@ -47,7 +47,12 @@ from .phases.phase3_batching import (
     left_shift_cold_washing,
     solve_washing,
 )
-from .phases.phase4_downstream import UPSTREAM_OPS, Phase4Result, solve_downstream
+from .phases.phase4_downstream import (
+    UPSTREAM_OPS,
+    Phase4Result,
+    left_shift_cold_ironing,
+    solve_downstream,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +197,21 @@ class Pipeline:
             )
             if refined is not None:
                 p1, p2, p3, p4, p5 = refined
+                # Relayout relocates knitting across machines (parallel component-POs
+                # / contiguity) but does NOT re-compact: moving a task to another
+                # machine leaves an idle slot behind it on its old machine, so the
+                # task that followed now shows a gap that should be tight (observed:
+                # 662_3 moved off a machine → 657_1 stranded at 1080 with an empty
+                # 928–1080 slot).  Re-run the cold left-shift so each machine's tasks
+                # pull into the freed slots.  Safe: left-shift only moves knitting
+                # EARLIER and never across machines → parallelisation is preserved,
+                # downstream is untouched, and end-to-end lateness is non-increasing.
+                if left_shift_cold_knitting(p1.assignments, self.tasks, self.config):
+                    # Keep p1's time maps in sync (mirrors _improve_knitting) so the
+                    # same-qty relink below reads the compacted knitting release.
+                    for a in p1.assignments:
+                        p1.start_times[a["task_id"]] = a["start_time"]
+                        p1.end_times[a["task_id"]] = a["end_time"]
 
         # ── Same-qty re-link refinement (two-pass, cold solve only) ───────
         # Panel knitting cùng (component, qty) là thay-thế-được; floor same-qty
@@ -387,6 +407,20 @@ class Pipeline:
             workload_shrank=self.workload_shrank,
         )
         logger.info(f"✅ Phase 4 (Ironing) complete: {len(p4.assignments)} assignments, status={p4.status}")
+
+        # Tighten ironing BEFORE packing solves: the downstream solver only weakly
+        # rewards early starts, so with loose due dates it stalls at FEASIBLE and
+        # staggers iron a few minutes past its washing-ready time even though the
+        # serial iron machine is free (tester: iron starts 1–5 min after wash done).
+        # Pull each iron task to its earliest feasible start; monotone (iron only
+        # moves earlier → packing release relaxes, lateness non-increasing).  Cold
+        # only — iron is hard-kept on re-schedule.
+        if not self.reschedule_hint and self.config.get("enable_ironing_left_shift", True):
+            moved = left_shift_cold_ironing(
+                p4.assignments, self.tasks, self.config, end_through_washing,
+            )
+            if moved:
+                p4.end_times = {a["task_id"]: a["end_time"] for a in p4.assignments}
 
         # ── Phase 5: Packing (+ any other downstream op) ──────────────────
         # Packing waits for ironing via end_times (start_lb).  Anything downstream
