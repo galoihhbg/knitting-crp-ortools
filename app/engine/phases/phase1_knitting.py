@@ -1148,6 +1148,125 @@ def spread_cold_knitting(
     return moved
 
 
+def _earliest_gap(busy: List[tuple], release: int, dur: int) -> int:
+    """Earliest start ≥ release for a `dur`-long task on a serial machine whose occupied
+    intervals are `busy` (sorted [s, e)); fits the first big-enough gap, else appends."""
+    t = release
+    for s, e in busy:
+        if e <= t:
+            continue
+        if s >= t + dur:
+            break
+        t = max(t, e)
+    return t
+
+
+def balance_cold_knitting(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> int:
+    """Final knitting makespan-balance: move a makespan-defining TAIL task onto the
+    earliest-free COMPATIBLE machine whenever that strictly lowers its finish and the
+    workforce cap still holds.
+
+    Why: spread/left-shift run BEFORE the parallel-component-PO relayout, which then
+    re-concentrates a PO's tail onto one machine — leaving 1–2 machines ending far later
+    than the rest while compatible machines sit idle (user: "2 máy chạy lâu hẳn, cắt 2
+    task cuối sang 2 máy xong sớm").  This peels those critical tails across, greedily,
+    until no move lowers the makespan.
+
+    Safety: a task is moved only to a start EARLIER than its current one AND only when the
+    per-move workforce check passes (NOT all-or-nothing) ⇒ every task moves EARLIER, the
+    makespan is monotone non-increasing, downstream release bounds only relax (lateness
+    non-increasing).  Pinned tasks immovable.  Deterministic (critical tasks by id, target
+    by earliest-slot then machine id).  Returns #moves.
+    """
+    info = {t["task_id"]: t for t in all_tasks}
+    knit = [a for a in assignments
+            if str(info.get(a["task_id"], {}).get("operation", "")).lower() == "knitting"]
+    if len(knit) < 2:
+        return 0
+    knitting_tasks = [t for t in all_tasks
+                      if str(t.get("operation", "")).lower() in ("knitting", "capacity_block")]
+
+    pool = {a["machine_id"] for a in knit}
+    for a in knit:
+        pool |= set(info[a["task_id"]].get("compatible_resource_ids") or [])
+    pinned = {a["task_id"] for a in knit if info[a["task_id"]].get("is_pinned")}
+    a_by_id = {a["task_id"]: a for a in knit}
+    busy: Dict[str, List[List[int]]] = {m: [] for m in pool}
+    for a in knit:
+        busy[a["machine_id"]].append([int(a["start_time"]), int(a["end_time"]), a["task_id"]])
+    for m in busy:
+        busy[m].sort()
+
+    # Pre-fold pinned capacity_block demand once — it never moves, so workforce re-checks
+    # only need to overlay the current knitting start/end each time.
+    cb_start: Dict[str, int] = {}
+    cb_end: Dict[str, int] = {}
+    for t in knitting_tasks:
+        if str(t.get("operation", "")).lower() == "capacity_block" and t.get("pinned_end_time") is not None:
+            pe = int(t["pinned_end_time"])
+            ps = int(t.get("pinned_start_time") if t.get("pinned_start_time") is not None
+                     else pe - int(t.get("duration", 0)))
+            cb_start[t["task_id"]] = ps
+            cb_end[t["task_id"]] = pe
+
+    def _workforce_ok(move_tid: str, new_s: int, dur: int) -> bool:
+        ns = {a["task_id"]: a["start_time"] for a in knit}
+        ne = {a["task_id"]: a["end_time"] for a in knit}
+        ns[move_tid] = new_s
+        ne[move_tid] = new_s + dur
+        ns.update(cb_start)
+        ne.update(cb_end)
+        return _knitting_workforce_ok(ns, ne, knitting_tasks, config)
+
+    moved = 0
+    for _ in range(len(knit) + 1):
+        makespan = max((iv[1] for m in busy for iv in busy[m]), default=0)
+        crit = sorted(
+            (iv for m in busy for iv in busy[m] if iv[1] == makespan and iv[2] not in pinned),
+            key=lambda iv: iv[2],
+        )
+        applied = False
+        for s0, e0, tid in crit:
+            dur = e0 - s0
+            rel = int(info[tid].get("start_after_min", 0) or 0)
+            cur_m = a_by_id[tid]["machine_id"]
+            compat = set(info[tid].get("compatible_resource_ids") or [])
+            cands = [m for m in sorted(pool)
+                     if (not compat or m in compat) and m != cur_m]
+            best_m, best_s = None, None
+            for m in cands:
+                slot = _earliest_gap([(x, y) for x, y, _ in busy[m]], rel, dur)
+                if best_s is None or slot < best_s:
+                    best_m, best_s = m, slot
+            # Only worthwhile if the tail lands strictly before the current makespan.
+            if best_s is not None and best_s + dur < makespan and _workforce_ok(tid, best_s, dur):
+                busy[cur_m] = [iv for iv in busy[cur_m] if iv[2] != tid]
+                busy[best_m].append([best_s, best_s + dur, tid])
+                busy[best_m].sort()
+                a = a_by_id[tid]
+                a["machine_id"] = best_m
+                a["start_time"] = best_s
+                a["end_time"] = best_s + dur
+                due = int(info[tid].get("due_at_min", a["end_time"] + 1) or (a["end_time"] + 1))
+                a["status"] = "LATE" if a["end_time"] > due else "ON_TIME"
+                moved += 1
+                applied = True
+                break
+        if not applied:
+            break
+
+    if moved:
+        logger.info(
+            f"   ⚖️ Cold knitting balance: moved {moved} tail task(s) to earlier compatible "
+            f"machines (makespan lowered, workforce-validated, downstream untouched)."
+        )
+    return moved
+
+
 def left_shift_cold_knitting(
     assignments: List[Dict[str, Any]],
     all_tasks: List[Dict[str, Any]],

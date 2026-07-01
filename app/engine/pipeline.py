@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from .phases.phase1_knitting import (
     PHASE1_OPS,
     Phase1Result,
+    balance_cold_knitting,
     left_shift_cold_knitting,
     parallelize_component_pos,
     reorder_contiguous_knitting,
@@ -212,6 +213,20 @@ class Pipeline:
                     for a in p1.assignments:
                         p1.start_times[a["task_id"]] = a["start_time"]
                         p1.end_times[a["task_id"]] = a["end_time"]
+
+        # ── Knitting makespan balance (all paths) ─────────────────────────
+        # spread/left-shift run BEFORE the relayout, which re-concentrates a PO's tail
+        # onto one machine → 1–2 machines finish far later than the rest while compatible
+        # machines sit idle.  Peel those critical tails onto the earliest-free compatible
+        # machine (workforce-validated per move, only moves EARLIER → makespan monotone
+        # ↓, downstream release relaxes).  Runs on RE-SCHEDULE too so the double-solve
+        # pass-2 (returned to the UI) is balanced: pass-2 hard-keeps knitting to pass-1's
+        # balanced layout and re-solves washing→packing on it, so downstream follows.
+        if self.config.get("enable_knitting_load_balance", True):
+            if balance_cold_knitting(p1.assignments, self.tasks, self.config):
+                for a in p1.assignments:
+                    p1.start_times[a["task_id"]] = a["start_time"]
+                    p1.end_times[a["task_id"]] = a["end_time"]
 
         # ── Same-qty re-link refinement (two-pass, cold solve only) ───────
         # Panel knitting cùng (component, qty) là thay-thế-được; floor same-qty
@@ -413,9 +428,16 @@ class Pipeline:
         # staggers iron a few minutes past its washing-ready time even though the
         # serial iron machine is free (tester: iron starts 1–5 min after wash done).
         # Pull each iron task to its earliest feasible start; monotone (iron only
-        # moves earlier → packing release relaxes, lateness non-increasing).  Cold
-        # only — iron is hard-kept on re-schedule.
-        if not self.reschedule_hint and self.config.get("enable_ironing_left_shift", True):
+        # moves earlier → packing release relaxes, lateness non-increasing).
+        #
+        # Applied on RE-SCHEDULE too (not cold-only): the /solve double-solve returns
+        # pass-2 (a re-schedule of the cold pass-1) to the UI.  On pass-2 the iron
+        # solve is hard-kept to pass-1's positions while washing may have moved EARLIER,
+        # stranding iron minutes after its wash finishes.  Since the left-shift is
+        # monotone, deterministic and idempotent (pinned iron stays anchored, and once
+        # tight it re-converges to the same starts), running it every pass keeps iron
+        # glued to the actual washing ends without harming re-schedule stability.
+        if self.config.get("enable_ironing_left_shift", True):
             moved = left_shift_cold_ironing(
                 p4.assignments, self.tasks, self.config, end_through_washing,
             )

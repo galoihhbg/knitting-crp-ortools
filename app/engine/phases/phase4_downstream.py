@@ -211,26 +211,44 @@ def _compute_start_lb(
     return lb
 
 
+def _earliest_slot(busy: List[tuple], release: int, dur: int) -> int:
+    """Earliest start ≥ release for a `dur`-long task on a serial machine whose occupied
+    intervals are `busy` (sorted list of [s, e)).  Fits into the first gap large enough;
+    falls off the end otherwise."""
+    t = release
+    for s, e in busy:
+        if e <= t:
+            continue          # interval entirely before our candidate
+        if s >= t + dur:
+            break             # gap [t, t+dur) fits before this interval
+        t = max(t, e)         # overlaps → push past it
+    return t
+
+
 def left_shift_cold_ironing(
     assignments: List[Dict[str, Any]],
     all_tasks: List[Dict[str, Any]],
     config: Dict[str, Any],
     dep_ends: Dict[str, int],
 ) -> int:
-    """COLD-only post-pass: pull each ironing task to its earliest feasible start on its
-    OWN (serial) machine, preserving per-machine order.
+    """Post-pass: pull each ironing task to its earliest feasible start on the earliest-free
+    COMPATIBLE iron machine (iron machines are homogeneous serial/capacity-1 units, so which
+    one is interchangeable).
 
-    The downstream solver only weakly rewards early starts, so with loose due dates it
-    stalls at FEASIBLE and staggers ironing a few minutes after its washing-ready time
-    even though the (serial, capacity-1) iron machine is free — the tester observes iron
-    starting 1–5 min after the wash finishes.  This pulls each iron task to
-    max(release, prev_end) where release = max(start_after_min, latest washing-end it
-    depends on via final_depends_on).
+    The downstream solver only weakly rewards early starts, so with loose due dates it stalls
+    at FEASIBLE: it staggers ironing minutes after the wash finishes AND piles several
+    ready-together slices onto ONE iron machine (serialising them) while sibling machines sit
+    idle — the tester sees "only 1 of the 4 iron tasks of this wash runs, the other 3 slip".
+    This re-seats each iron task at max(release, earliest free slot on any compatible machine),
+    release = max(start_after_min, latest washing-end via final_depends_on).
 
-    Safety: every task only moves EARLIER (ns ≤ old start) ⇒ packing's release bound only
-    relaxes ⇒ downstream stays valid and end-to-end lateness is monotone non-increasing.
-    Pinned iron tasks are immovable anchors.  Deterministic O(n log n).  Returns #tasks
-    moved.  NOT applied on re-schedule (iron is hard-kept there).
+    Monotone guard: a task is moved ONLY when the new start is ≤ its solver start, so every
+    task moves EARLIER (or stays) ⇒ packing's release bound only relaxes ⇒ downstream stays
+    valid and end-to-end lateness is monotone non-increasing.  Pinned iron tasks are immovable
+    anchors (their machine/time is pre-reserved).  Deterministic (release/start/id order, machine-id
+    tie-break).  Runs on re-schedule too (the double-solve returns pass-2 to the UI, where iron is
+    hard-kept to pass-1 while washing may have moved earlier); idempotent + pinned-anchored, so it
+    re-glues iron to washing without harming stability.  Returns #tasks moved.
     """
     info = {t["task_id"]: t for t in all_tasks}
     iron_ids = {
@@ -249,42 +267,60 @@ def left_shift_cold_ironing(
                 rel = max(rel, int(dep_ends[d]))
         return rel
 
-    by_machine: Dict[str, List[Dict[str, Any]]] = {}
+    # Interchangeable iron-machine pool = every compatible machine across the iron tasks
+    # (NOT just the ones the solver used — idle-but-compatible machines are exactly where
+    # ready-together slices should spread) ∪ any machine already assigned (safety).
+    pool = {a["machine_id"] for a in iron_assigns}
     for a in iron_assigns:
-        by_machine.setdefault(a["machine_id"], []).append(a)
+        pool |= set(info[a["task_id"]].get("compatible_resource_ids") or [])
 
-    new_start: Dict[str, int] = {}
-    new_end: Dict[str, int] = {}
-    for _m, items in by_machine.items():
-        items.sort(key=lambda a: (a["start_time"], a["end_time"], a["task_id"]))
-        prev_end = 0
-        for a in items:
-            t_id = a["task_id"]
-            if info[t_id].get("is_pinned"):
-                # in-progress / frozen — immovable anchor, keep solver position
-                new_start[t_id] = a["start_time"]
-                new_end[t_id] = a["end_time"]
-                prev_end = a["end_time"]
-                continue
-            dur = int(a["end_time"]) - int(a["start_time"])
-            ns = max(_release(t_id), prev_end)
-            new_start[t_id] = ns
-            new_end[t_id] = ns + dur
-            prev_end = ns + dur
+    # Seed the occupancy with EVERY iron task at its solver position, so `busy` is always a
+    # valid non-overlapping schedule.  Each task is then re-seated only when a STRICTLY
+    # earlier conflict-free slot exists (remove-then-place): guarantees no overlap and
+    # monotone (earlier-or-equal) by construction — no separate guard needed.
+    busy: Dict[str, List[tuple]] = {m: [] for m in pool}
+    for a in iron_assigns:
+        busy[a["machine_id"]].append((int(a["start_time"]), int(a["end_time"])))
+    for m in busy:
+        busy[m].sort()
 
     moved = 0
-    for a in iron_assigns:
+    order = sorted(
+        (a for a in iron_assigns if not info[a["task_id"]].get("is_pinned")),
+        key=lambda a: (a["start_time"], a["end_time"], a["task_id"]),
+    )
+    for a in order:
         t_id = a["task_id"]
-        if a["start_time"] != new_start[t_id]:
+        cur_m, cur_s = a["machine_id"], int(a["start_time"])
+        dur = int(a["end_time"]) - cur_s
+        rel = _release(t_id)
+        # Temporarily lift this task so it can be re-seated (incl. back onto its own slot).
+        busy[cur_m].remove((cur_s, int(a["end_time"])))
+        compat = set(info[t_id].get("compatible_resource_ids") or [])
+        cands = [m for m in sorted(pool) if not compat or m in compat] or [cur_m]
+        # Earliest feasible slot over all compatible machines (deterministic id order).
+        cand_s = {m: _earliest_slot(list(busy[m]), rel, dur) for m in cands}
+        min_s = min(cand_s.values())
+        if min_s < cur_s:
+            # Strictly earlier available → move (lowest machine id achieving it).
+            best_s = min_s
+            best_m = min(m for m in cands if cand_s[m] == min_s)
+        else:
+            # No earlier slot anywhere → stay put (no needless machine churn).
+            best_m, best_s = cur_m, cur_s
+        if best_m != cur_m or best_s != cur_s:
             moved += 1
-        a["start_time"] = new_start[t_id]
-        a["end_time"] = new_end[t_id]
-        due = int(info[t_id].get("due_at_min", new_end[t_id] + 1))
-        a["status"] = "LATE" if new_end[t_id] > due else "ON_TIME"
+        a["machine_id"] = best_m
+        a["start_time"] = best_s
+        a["end_time"] = best_s + dur
+        due = int(info[t_id].get("due_at_min", a["end_time"] + 1))
+        a["status"] = "LATE" if a["end_time"] > due else "ON_TIME"
+        busy[best_m].append((best_s, best_s + dur))
+        busy[best_m].sort()
 
     if moved:
         logger.info(
-            f"   ⬅️ Cold ironing left-shift: pulled {moved} iron task(s) to earliest "
-            f"feasible start (serial-machine idle compaction, downstream untouched)."
+            f"   ⬅️ Cold ironing left-shift: re-seated {moved} iron task(s) onto the earliest-free "
+            f"compatible machine (spreads ready-together slices, downstream untouched)."
         )
     return moved
