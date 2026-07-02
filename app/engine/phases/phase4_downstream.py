@@ -324,3 +324,89 @@ def left_shift_cold_ironing(
             f"compatible machine (spreads ready-together slices, downstream untouched)."
         )
     return moved
+
+
+def left_shift_cold_packing(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    dep_ends: Dict[str, int],
+) -> int:
+    """Post-pass: pull each packing task to its earliest feasible start on the earliest-free
+    COMPATIBLE packing machine (packing machines are homogeneous serial units, so which one is
+    interchangeable).  Same FEASIBLE-stall trap as ironing/linking: packing is the LAST phase,
+    its due dates are the loosest, so the solver has the least early-start incentive and staggers
+    packing minutes past its ironing-ready time while a compatible packing machine sits idle
+    (measured: 5/78 slices slipped 100–158 min with a free compatible machine available).
+
+    release = max(start_after_min, latest ironing-end via final_depends_on).  Monotone guard by
+    construction (remove-then-place: every task seeded at its solver slot, moved only into a
+    STRICTLY earlier conflict-free slot) ⇒ packing is the terminal op so no downstream to disturb
+    — end-to-end lateness is monotone non-increasing.  Pinned packing tasks are immovable anchors.
+    Deterministic (release/start/id order, machine-id tie-break).  Runs on re-schedule too (the
+    double-solve returns pass-2 to the UI, where packing is hard-kept to pass-1 while ironing may
+    have moved earlier); idempotent + pinned-anchored.  Returns #tasks moved.
+    """
+    info = {t["task_id"]: t for t in all_tasks}
+    pack_ids = {
+        t["task_id"] for t in all_tasks
+        if str(t.get("operation", "")).lower() in ("pack", "packing")
+    }
+    pack_assigns = [a for a in assignments if a["task_id"] in pack_ids]
+    if not pack_assigns:
+        return 0
+
+    def _release(t_id: str) -> int:
+        t = info[t_id]
+        rel = int(t.get("start_after_min", 0))
+        for d in (t.get("final_depends_on") or []):
+            if d in dep_ends:
+                rel = max(rel, int(dep_ends[d]))
+        return rel
+
+    pool = {a["machine_id"] for a in pack_assigns}
+    for a in pack_assigns:
+        pool |= set(info[a["task_id"]].get("compatible_resource_ids") or [])
+
+    busy: Dict[str, List[tuple]] = {m: [] for m in pool}
+    for a in pack_assigns:
+        busy[a["machine_id"]].append((int(a["start_time"]), int(a["end_time"])))
+    for m in busy:
+        busy[m].sort()
+
+    moved = 0
+    order = sorted(
+        (a for a in pack_assigns if not info[a["task_id"]].get("is_pinned")),
+        key=lambda a: (a["start_time"], a["end_time"], a["task_id"]),
+    )
+    for a in order:
+        t_id = a["task_id"]
+        cur_m, cur_s = a["machine_id"], int(a["start_time"])
+        dur = int(a["end_time"]) - cur_s
+        rel = _release(t_id)
+        busy[cur_m].remove((cur_s, int(a["end_time"])))
+        compat = set(info[t_id].get("compatible_resource_ids") or [])
+        cands = [m for m in sorted(pool) if not compat or m in compat] or [cur_m]
+        cand_s = {m: _earliest_slot(list(busy[m]), rel, dur) for m in cands}
+        min_s = min(cand_s.values())
+        if min_s < cur_s:
+            best_s = min_s
+            best_m = min(m for m in cands if cand_s[m] == min_s)
+        else:
+            best_m, best_s = cur_m, cur_s
+        if best_m != cur_m or best_s != cur_s:
+            moved += 1
+        a["machine_id"] = best_m
+        a["start_time"] = best_s
+        a["end_time"] = best_s + dur
+        due = int(info[t_id].get("due_at_min", a["end_time"] + 1))
+        a["status"] = "LATE" if a["end_time"] > due else "ON_TIME"
+        busy[best_m].append((best_s, best_s + dur))
+        busy[best_m].sort()
+
+    if moved:
+        logger.info(
+            f"   ⬅️ Cold packing left-shift: re-seated {moved} packing task(s) onto the earliest-free "
+            f"compatible machine (spreads ready-together slices, terminal phase — nothing downstream)."
+        )
+    return moved

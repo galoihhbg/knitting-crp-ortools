@@ -969,14 +969,29 @@ def _solve_group(
     # ── Post-process: enforce same end_time within each batch slot ───────────
     # Replace individual task end_times (start + duration) with the batch cycle
     # end (max end in slot) so Phase 4 start_lb uses the correct wash-out time.
+    #
+    # NOTE: derive the cycle end from the actual member END VARS, NOT from the
+    # batch_ends[k] helper var.  batch_ends[k] is only LOWER-bounded (bend ≥ each
+    # member end); the solver is expected to squeeze it to the true max via
+    # makespan minimisation, but a batch that is not on the critical path has no
+    # such pressure → the solver may leave batch_ends[k] slack ABOVE the true max.
+    # Reading that slack stamped a phantom-inflated end on every member (observed:
+    # a 11-min wash reported as 164 min, dragging its ironing start 153 min late).
+    # max(member ends) is always the exact cycle-out time and is monotone-safe
+    # (end can only drop → Phase-4 release relaxes → lateness non-increasing).
     if status_str == "feasible":
         for k in range(K):
             if not solver.Value(batch_active[k]):
                 continue
-            batch_end_val = solver.Value(batch_ends[k])
-            for t_id in free_scheduled_ids:
-                if solver.Value(x[t_id][k]) == 1:
-                    end_times[t_id] = batch_end_val
+            members = [
+                t_id for t_id in free_scheduled_ids
+                if solver.Value(x[t_id][k]) == 1
+            ]
+            if not members:
+                continue
+            batch_end_val = max(solver.Value(task_vars[t_id]["end"]) for t_id in members)
+            for t_id in members:
+                end_times[t_id] = batch_end_val
         # Propagate corrected end_times into the assignments list
         et_map = {a["task_id"]: a for a in assignments}
         for t_id, et in end_times.items():
@@ -997,7 +1012,12 @@ def _solve_group(
 
         for k, slot_task_ids in slot_tasks.items():
             b_start = solver.Value(batch_starts[k])
-            b_end = solver.Value(batch_ends[k])
+            # Same slack correction as the end_time post-pass above: the true cycle
+            # end is the max member end, not the (possibly slack) batch_ends[k].
+            b_end = max(
+                (end_times[t_id] for t_id in slot_task_ids if t_id in end_times),
+                default=solver.Value(batch_ends[k]),
+            )
             batches.append(BatchInfo(
                 batch_id=f"wash_batch_{'_'.join(str(g) for g in group_key)}_{k}",
                 task_ids=slot_task_ids,

@@ -41,6 +41,11 @@ def _hint_from_assignments(assignments: list) -> dict:
     Tái hiện đúng cái Go gửi lại ở lần re-schedule kế tiếp: mỗi assignment
     thành một previous_assignment khớp theo task_id. order_id → original_order_id.
     Chỉ giữ assignment có đủ task_id + machine_id (bỏ qua bản ghi thiếu trường).
+
+    Đánh dấu `stabilize_pass=True`: đây là lượt 2 NỘI BỘ của double-solve (không phải
+    re-schedule thật từ Go), nên pipeline được phép chạy các post-pass nén (linking/
+    ironing left-shift, knitting balance) để UI nhận lịch KHÍT — trong khi re-schedule
+    thật (Go gửi kế hoạch cũ) vẫn ưu tiên ỔN ĐỊNH máy, bỏ qua các pass dời máy đó.
     """
     previous = [
         {
@@ -53,7 +58,7 @@ def _hint_from_assignments(assignments: list) -> dict:
         for a in assignments
         if a.get("task_id") and a.get("machine_id")
     ]
-    return {"previous_assignments": previous}
+    return {"previous_assignments": previous, "stabilize_pass": True}
 
 
 def _post_webhook(response_data: dict, task_id: str) -> bool:

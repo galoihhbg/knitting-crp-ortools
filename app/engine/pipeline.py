@@ -52,6 +52,7 @@ from .phases.phase4_downstream import (
     UPSTREAM_OPS,
     Phase4Result,
     left_shift_cold_ironing,
+    left_shift_cold_packing,
     solve_downstream,
 )
 
@@ -88,6 +89,15 @@ class Pipeline:
         self.material_capacities = material_capacities or {}
         self.translation_map: Dict[str, str] = _build_translation_map(self.tasks)
         self.reschedule_hint = reschedule_hint
+        # `stabilize_pass` marks the /solve double-solve's INTERNAL pass-2 (a re-schedule
+        # of cold pass-1 whose result the UI actually receives) — as opposed to a GENUINE
+        # external /re-schedule where Go sends a committed plan and machine stability is
+        # paramount.  The cold compaction passes (linking/ironing left-shift, knitting
+        # balance) reassign machines / pull tasks earlier for tightness; that is wanted on
+        # cold + the internal stabilize pass, but would churn a genuine re-schedule, so
+        # gate them on `_apply_cold_passes`.
+        self._stabilize_pass = bool(reschedule_hint and reschedule_hint.get("stabilize_pass"))
+        self._apply_cold_passes = (not reschedule_hint) or self._stabilize_pass
         # Detect BEFORE partitioning: partition_hint_for_pipeline drops previous
         # assignments whose task no longer exists, so the shrink signal must be
         # read from the raw hint vs the full current task list.
@@ -222,7 +232,7 @@ class Pipeline:
         # ↓, downstream release relaxes).  Runs on RE-SCHEDULE too so the double-solve
         # pass-2 (returned to the UI) is balanced: pass-2 hard-keeps knitting to pass-1's
         # balanced layout and re-solves washing→packing on it, so downstream follows.
-        if self.config.get("enable_knitting_load_balance", True):
+        if self._apply_cold_passes and self.config.get("enable_knitting_load_balance", True):
             if balance_cold_knitting(p1.assignments, self.tasks, self.config):
                 for a in p1.assignments:
                     p1.start_times[a["task_id"]] = a["start_time"]
@@ -318,11 +328,18 @@ class Pipeline:
         p2r: Phase2Result,
         all_resources: List[Dict[str, Any]],
     ) -> None:
-        """Cold linking left-shift applied to a Phase-2 result IN PLACE before the
-        downstream phases solve on it, so washing/iron/packing schedule on the tight
-        linking and follow it.  Monotone (linking only moves earlier).  Reads the
-        knitting timing from `p1r` (already improved).  Skipped on re-schedule."""
-        if self.reschedule_hint or not self.config.get("enable_linking_left_shift", True):
+        """Linking left-shift applied to a Phase-2 result IN PLACE before the downstream
+        phases solve on it, so washing/iron/packing schedule on the tight linking and
+        follow it.  Monotone (linking only moves earlier — to its earliest free worker at
+        the knitting-derived release).  Reads the knitting timing from `p1r`.
+
+        Runs on RE-SCHEDULE too (not cold-only): the /solve double-solve returns pass-2 (a
+        re-schedule of cold pass-1) to the UI, where the linking solve stalls at FEASIBLE
+        and staggers each slice minutes past its panel-ready time even though a linking
+        worker is free (user: linking không bắt đầu ngay khi panel dệt xong).  The
+        left-shift is monotone + deterministic + idempotent, so running it every pass glues
+        linking to the knitting panel ends without harming re-schedule stability."""
+        if not self._apply_cold_passes or not self.config.get("enable_linking_left_shift", True):
             return
         combined = p1r.assignments + p2r.assignments
         moved = left_shift_cold_linking(combined, self.tasks, all_resources, self.config)
@@ -437,7 +454,7 @@ class Pipeline:
         # monotone, deterministic and idempotent (pinned iron stays anchored, and once
         # tight it re-converges to the same starts), running it every pass keeps iron
         # glued to the actual washing ends without harming re-schedule stability.
-        if self.config.get("enable_ironing_left_shift", True):
+        if self._apply_cold_passes and self.config.get("enable_ironing_left_shift", True):
             moved = left_shift_cold_ironing(
                 p4.assignments, self.tasks, self.config, end_through_washing,
             )
@@ -462,6 +479,18 @@ class Pipeline:
             workload_shrank=self.workload_shrank,
         )
         logger.info(f"✅ Phase 5 (Packing) complete: {len(p5.assignments)} assignments, status={p5.status}")
+
+        # Tighten packing: same FEASIBLE-stall as ironing/linking, worst here because packing
+        # is the LAST phase (loosest due dates → least early-start incentive), so slices slip
+        # minutes past their ironing-ready time while a compatible packing machine is idle.
+        # Terminal op ⇒ nothing downstream to disturb; monotone by construction.  Runs every
+        # pass (double-solve pass-2 hard-keeps packing to pass-1 while iron may move earlier).
+        if self._apply_cold_passes and self.config.get("enable_packing_left_shift", True):
+            moved = left_shift_cold_packing(
+                p5.assignments, self.tasks, self.config, all_end_times_iron,
+            )
+            if moved:
+                p5.end_times = {a["task_id"]: a["end_time"] for a in p5.assignments}
 
         return p4, p5
 
