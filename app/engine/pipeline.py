@@ -273,15 +273,18 @@ class Pipeline:
             # Skipped on re-schedule — machine assignment is part of stability there.
             if self.config.get("enable_linking_balance", True):
                 balance_linking_load(all_assignments, self.tasks, all_resources, self.config)
-            # Washing left-shift, FINAL pass — washing itself stalls at FEASIBLE and can
-            # leave idle gaps even though linking was already tight when phase 3 solved.
-            # This compacts washing on the final ends; washing only moves EARLIER →
-            # iron/packing release bounds relax → their assignments stay valid (slack).
-            if self.config.get("enable_washing_left_shift", True):
-                left_shift_cold_washing(
-                    all_assignments, self.tasks, self.config,
-                    [int(s) for s in self.config.get("shift_ends_min", [])],
-                )
+        # Washing left-shift, FINAL pass — washing itself stalls at FEASIBLE and can
+        # leave idle gaps even though linking was already tight when phase 3 solved.
+        # This compacts washing on the final ends; washing only moves EARLIER →
+        # iron/packing release bounds relax → their assignments stay valid (slack).
+        # Runs on cold + real re-schedule (real re-schedules over-consolidate washing
+        # into late batches — see the flush gate in _solve_phases_3_to_5); only the
+        # internal stabilize pass is skipped so it can't shatter pass-1 consolidation.
+        if not self._stabilize_pass and self.config.get("enable_washing_left_shift", True):
+            left_shift_cold_washing(
+                all_assignments, self.tasks, self.config,
+                [int(s) for s in self.config.get("shift_ends_min", [])],
+            )
         all_overloads = (
             p1.overloads + p2.overloads + p3.overloads
             + p4.overloads + p5.overloads
@@ -363,33 +366,93 @@ class Pipeline:
         # ── Phase 3: Washing ──────────────────────────────────────────────
         p3_tasks = [t for t in self.tasks if t.get("operation", "").lower() in PHASE3_OPS]
         shift_ends: List[int] = [int(s) for s in self.config.get("shift_ends_min", [])]
-        # Phase 3 is group-isolated; pass the full hint (with washing-group partition
-        # already computed) so each group filter its own previous_assignments.
-        p3_hint = _hint_for_phase_washing(self.reschedule_hint, self.partitioned_hint.get("washing"))
-        p3: Phase3Result = solve_washing(
-            p3_tasks, all_resources, self.config,
-            p2_end_times=combined_end_times,
-            shift_ends=shift_ends,
-            horizon=global_horizon,
-            reschedule_hint=p3_hint,
-            workload_shrank=self.workload_shrank,
-            all_pipeline_tasks=self.tasks,
-        )
-        logger.info(
-            f"✅ Phase 3 complete: {len(p3.assignments)} assignments, "
-            f"{len(p3.batches)} batches, status={p3.status}"
-        )
+
+        # Double-solve stabilize pass: REUSE the pass-1 washing verbatim instead of
+        # re-solving it.  Re-solving washing on the stabilize pass stalls at FEASIBLE
+        # and over-consolidates early-ready goods into a late batch, leaving the wash
+        # machine idle for ~a day (pass-1 cold already left-shifted washing correctly:
+        # max idle gap 184 vs 1965 min).  We can't just re-run the left-shift on pass 2
+        # — in the full-batch-consolidation case that SHATTERS correct batches (see
+        # [[project_washing_left_shift_reschedule]]).  Reusing pass-1's assignments is
+        # right for BOTH regimes: it never re-decides consolidation, keeps every field
+        # (group_id/batch_slot_id), and skips the slow (>7 min) stabilize washing solve.
+        # Iron/packing below then solve on these (earlier, correct) washing ends.
+        p1_wash = (self.reschedule_hint or {}).get("_pass1_washing_full") \
+            if self._stabilize_pass else None
+        if p1_wash:
+            # Dependency guard: pass-1 washing was feasible against PASS-1 linking ends.
+            # Pass-2 linking is hard-kept + left-shifted so it should only be equal or
+            # EARLIER — but a dropped keep could land a linking task later, making a
+            # reused wash start precede its dependency.  In that (rare) case fall back
+            # to the normal washing solve instead of emitting an invalid schedule.
+            _info = {t["task_id"]: t for t in p3_tasks}
+            _violated = [
+                a["task_id"] for a in p1_wash
+                if any(
+                    int(a["start_time"]) < int(combined_end_times.get(d, 0))
+                    for d in (_info.get(a["task_id"], {}).get("final_depends_on") or [])
+                    if d in combined_end_times
+                )
+            ]
+            if _violated:
+                logger.warning(
+                    f"⚠️ Phase 3 (stabilize): {len(_violated)} reused washing task(s) "
+                    f"would start before their pass-2 linking dependency "
+                    f"(e.g. {_violated[0]}) — falling back to a normal washing solve."
+                )
+                p1_wash = None
+        if p1_wash:
+            p3 = Phase3Result(
+                status="feasible",
+                assignments=[dict(a) for a in p1_wash],
+                overloads=[
+                    dict(o) for o in
+                    (self.reschedule_hint or {}).get("_pass1_washing_overloads") or []
+                ],
+                end_times={a["task_id"]: int(a["end_time"]) for a in p1_wash},
+            )
+            logger.info(
+                f"✅ Phase 3 (stabilize): reused {len(p3.assignments)} pass-1 washing "
+                f"assignments (no re-solve — keeps pass-1's compacted layout)"
+            )
+        else:
+            # Phase 3 is group-isolated; pass the full hint (with washing-group partition
+            # already computed) so each group filter its own previous_assignments.
+            p3_hint = _hint_for_phase_washing(self.reschedule_hint, self.partitioned_hint.get("washing"))
+            p3 = solve_washing(
+                p3_tasks, all_resources, self.config,
+                p2_end_times=combined_end_times,
+                shift_ends=shift_ends,
+                horizon=global_horizon,
+                reschedule_hint=p3_hint,
+                workload_shrank=self.workload_shrank,
+                all_pipeline_tasks=self.tasks,
+            )
+            logger.info(
+                f"✅ Phase 3 complete: {len(p3.assignments)} assignments, "
+                f"{len(p3.batches)} batches, status={p3.status}"
+            )
 
         if p3.status not in ("feasible", "empty"):
             return _phase_failure_result(p3.status, p3_tasks, all_resources, self.config, global_horizon)
 
-        # ── End-of-shift washing flush (cold only), BEFORE downstream ─────
+        # ── End-of-shift washing flush, BEFORE downstream ────────────────
         # Pull washing that became ready before a shift boundary but spilled into a
         # later shift into a pre-break batch, THEN solve ironing/packing once on the
         # earlier washing ends so they follow.  No re-solve/gate needed: flush only
         # moves washing EARLIER, so every downstream release bound relaxes and the
-        # phase 4–5 optimum cannot get worse.  Skipped on re-schedule (washing kept).
-        if not self.reschedule_hint and self.config.get("enable_washing_flush", True):
+        # phase 4–5 optimum cannot get worse.
+        #
+        # Runs on cold AND real Go re-schedule (gate `not _stabilize_pass`): a real
+        # re-schedule re-solves the large per-color washing groups from scratch and,
+        # stalling at FEASIBLE, over-consolidates early-ready goods into much later
+        # batches — drifting them days past the stable plan Go sent (measured: 35/97
+        # washing tasks pushed >500 min later, worst +5550 → held ~4 days).  Because
+        # washing only moves EARLIER, running the flush/left-shift there recovers the
+        # early placement without hurting downstream.  ONLY the internal double-solve
+        # stabilize pass is skipped: there pass-1 (cold) is already well-consolidated
+        # AND early, and re-running the left-shift shatters that consolidation.
+        if not self._stabilize_pass and self.config.get("enable_washing_flush", True):
             moved = flush_unwashed_end_of_shift(
                 p3.assignments, self.tasks, self.config, shift_ends,
                 dep_ends=combined_end_times,
@@ -401,8 +464,9 @@ class Pipeline:
         # Washing left-shift: catch ready goods the solver bundled into a later batch
         # (machine idle in between) that the flush couldn't pull before a break.  Pulls
         # them to the earliest boundary-safe free wash slot.  Monotone (only earlier) →
-        # downstream solves below on the earlier washing ends.  Skipped on re-schedule.
-        if not self.reschedule_hint and self.config.get("enable_washing_left_shift", True):
+        # downstream solves below on the earlier washing ends.  Same gating as the flush
+        # above: cold + real re-schedule, skip only the internal stabilize pass.
+        if not self._stabilize_pass and self.config.get("enable_washing_left_shift", True):
             moved = left_shift_cold_washing(
                 p3.assignments, self.tasks, self.config, shift_ends,
                 dep_ends=combined_end_times,

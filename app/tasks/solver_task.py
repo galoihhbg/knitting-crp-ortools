@@ -152,9 +152,27 @@ def optimize_schedule(self, payload: dict):
         ):
             try:
                 stabilize_payload = dict(payload)
-                stabilize_payload["reschedule_hint"] = _hint_from_assignments(
-                    result["assignments"]
-                )
+                stab_hint = _hint_from_assignments(result["assignments"])
+                # Lượt 2 giải LẠI washing thường KẸT ở FEASIBLE → gom quá đà đồ
+                # sẵn-sàng-sớm vào mẻ muộn, tạo khe máy giặt đứng im hàng ngày (lượt 1
+                # cold đã left-shift đúng rồi).  Nên KHÔNG giặt lại ở lượt 2: đính kèm
+                # nguyên assignments washing đầy đủ của lượt 1 (giữ group_id/batch_slot_id)
+                # để pipeline tái dùng thay vì re-solve.  Bonus: bỏ được lượt-2-giặt chậm.
+                _wash_ids = {
+                    t["task_id"] for t in payload.get("tasks", [])
+                    if str(t.get("operation", "")).lower() == "washing"
+                }
+                stab_hint["_pass1_washing_full"] = [
+                    dict(a) for a in result["assignments"]
+                    if a.get("task_id") in _wash_ids
+                ]
+                # Mang theo cả overloads washing của lượt 1 (chẩn đoán LATE/root-cause
+                # cho Go) — vì lượt 2 không giặt lại nên không tự sinh ra chúng nữa.
+                stab_hint["_pass1_washing_overloads"] = [
+                    dict(o) for o in result.get("overloads", [])
+                    if o.get("task_id") in _wash_ids
+                ]
+                stabilize_payload["reschedule_hint"] = stab_hint
                 logger.info(
                     f"[Task {self.request.id}] 🔁 Double-solve: chạy lượt 2 với "
                     f"{len(stabilize_payload['reschedule_hint']['previous_assignments'])} "
