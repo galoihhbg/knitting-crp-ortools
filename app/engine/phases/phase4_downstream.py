@@ -410,3 +410,108 @@ def left_shift_cold_packing(
             f"compatible machine (spreads ready-together slices, terminal phase — nothing downstream)."
         )
     return moved
+
+
+def balance_downstream_load(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    resources: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    ops: frozenset,
+    label: str,
+) -> int:
+    """Post-pass cân tải thợ iron/packing bằng cách ĐỔI NHÃN MÁY (mirror của
+    balance_linking_load, tham số hoá theo `ops`).
+
+    Bài toán thực địa: iron/packing KHÔNG ai phải chờ (left-shift đã dán slice vào
+    máy rảnh sớm nhất) nhưng chia việc lệch nặng — đo trên payload thật: iron
+    49/38/6/3/1 task, packing 48/39/6/3/1 (thợ 05 làm 1 task/7 phút cả kỳ).  Nguồn
+    gốc: solver + left-shift tie-break "máy id nhỏ nhất" và không có động lực trải
+    việc; các máy iron/packing HOÁN ĐỔI ĐƯỢC (mọi task compatible cả 5 máy) nên
+    việc dồn về 01/02 tuỳ tiện — "một người làm nhiều task, người thì không làm gì".
+
+    Cách gỡ an toàn tuyệt đối (như linking): GIỮ NGUYÊN [start, end] của mọi task,
+    chỉ gán lại máy bằng greedy "tô màu interval" — duyệt theo start, đặt mỗi task
+    lên máy hợp-lệ (compatible, rảnh trong [start,end], ngoài unavailability, sau
+    available_at_min) có TẢI HIỆN TẠI THẤP NHẤT.  Vì thời gian không đổi:
+      * downstream byte-identical (packing phụ thuộc iron end-time, không phụ thuộc máy);
+      * lateness không đổi, KHÔNG đơn nào trễ hơn (zero regression theo cấu trúc);
+      * no-overlap giữ nguyên (chỉ chọn máy không đè); luôn khả thi vì số máy ≥
+        đỉnh đồng thời (gán cũ đã chứng minh ≤ số máy).
+
+    Pinned tasks (đang chạy) là mỏ neo bất động — giữ nguyên máy.  Deterministic
+    O(n log n).  Chạy trên cold + stabilize pass (UI nhận lịch cân); KHÔNG chạy
+    khi re-schedule thật của Go (phân công thợ là một phần của stability ở đó).
+    Mutates `assignments` in place (machine_id).  Returns số task được đổi máy.
+    """
+    info = {t["task_id"]: t for t in all_tasks}
+    machine_ids = [
+        r["id"] for r in resources if str(r.get("operation", "")).lower() in ops
+    ]
+    if len(machine_ids) < 2:
+        return 0
+    res_by_id = {r["id"]: r for r in resources}
+
+    def _unavail(m_id: str) -> List[Any]:
+        return [
+            (int(w["start"]), int(w["end"]))
+            for w in res_by_id.get(m_id, {}).get("unavailability", []) or []
+            if int(w["end"]) > int(w["start"])
+        ]
+
+    def _avail_at(m_id: str) -> int:
+        return int(res_by_id.get(m_id, {}).get("available_at_min", 0) or 0)
+
+    op_assigns = [
+        a for a in assignments
+        if str(info.get(a["task_id"], {}).get("operation", "")).lower() in ops
+        and a.get("machine_id")
+    ]
+    if len(op_assigns) < 2:
+        return 0
+
+    busy: Dict[str, List[Any]] = {m: list(_unavail(m)) for m in machine_ids}
+    load: Dict[str, int] = {m: 0 for m in machine_ids}
+
+    def _free(m_id: str, s: int, e: int) -> bool:
+        if s < _avail_at(m_id):
+            return False
+        return not any(s < be and e > bs for bs, be in busy[m_id])
+
+    # Pinned tasks are immovable: pre-place them on their current machine.
+    movable: List[Dict[str, Any]] = []
+    for a in op_assigns:
+        t = info.get(a["task_id"], {})
+        if t.get("is_pinned"):
+            m = a["machine_id"]
+            busy.setdefault(m, []).append((a["start_time"], a["end_time"]))
+            load[m] = load.get(m, 0) + (a["end_time"] - a["start_time"])
+        else:
+            movable.append(a)
+
+    changed = 0
+    # Deterministic order: by start, then end, then task_id.
+    for a in sorted(movable, key=lambda x: (x["start_time"], x["end_time"], x["task_id"])):
+        s, e = a["start_time"], a["end_time"]
+        t = info.get(a["task_id"], {})
+        compat = set(t.get("compatible_resource_ids") or []) & set(machine_ids)
+        cands = [m for m in machine_ids if m in compat] if compat else list(machine_ids)
+        eligible = [m for m in cands if _free(m, s, e)]
+        if not eligible:
+            # Keep current machine (must remain feasible there — it was before).
+            m = a["machine_id"]
+        else:
+            m = min(eligible, key=lambda x: (load[x], x))
+        if m != a["machine_id"]:
+            changed += 1
+        a["machine_id"] = m
+        busy.setdefault(m, []).append((s, e))
+        load[m] = load.get(m, 0) + (e - s)
+
+    if changed:
+        used = sum(1 for m in machine_ids if load.get(m, 0) > 0)
+        logger.info(
+            f"⚖️ {label} load-balance: re-assigned {changed} task(s) → "
+            f"{used}/{len(machine_ids)} machines used (timing unchanged)."
+        )
+    return changed

@@ -51,6 +51,7 @@ from .phases.phase3_batching import (
 from .phases.phase4_downstream import (
     UPSTREAM_OPS,
     Phase4Result,
+    balance_downstream_load,
     left_shift_cold_ironing,
     left_shift_cold_packing,
     solve_downstream,
@@ -285,6 +286,24 @@ class Pipeline:
                 all_assignments, self.tasks, self.config,
                 [int(s) for s in self.config.get("shift_ends_min", [])],
             )
+        # Iron/packing worker load-balance: machine-relabel only (timing unchanged →
+        # downstream byte-identical, zero regression by construction, like the linking
+        # balance above).  The left-shifts glue slices to their ready times but
+        # tie-break onto the lowest machine id, piling ~90% of tasks on 2 of 5 workers
+        # (measured iron 49/38/6/3/1) while nobody actually waits.  Runs on cold +
+        # stabilize (UI gets the balanced layout); skipped on real Go re-schedule —
+        # worker assignment is part of stability there.
+        if self._apply_cold_passes:
+            if self.config.get("enable_ironing_balance", True):
+                balance_downstream_load(
+                    all_assignments, self.tasks, all_resources, self.config,
+                    frozenset(_PHASE4_OP_SET), "Ironing",
+                )
+            if self.config.get("enable_packing_balance", True):
+                balance_downstream_load(
+                    all_assignments, self.tasks, all_resources, self.config,
+                    frozenset({"pack", "packing"}), "Packing",
+                )
         all_overloads = (
             p1.overloads + p2.overloads + p3.overloads
             + p4.overloads + p5.overloads
@@ -511,14 +530,15 @@ class Pipeline:
         # Pull each iron task to its earliest feasible start; monotone (iron only
         # moves earlier → packing release relaxes, lateness non-increasing).
         #
-        # Applied on RE-SCHEDULE too (not cold-only): the /solve double-solve returns
-        # pass-2 (a re-schedule of the cold pass-1) to the UI.  On pass-2 the iron
-        # solve is hard-kept to pass-1's positions while washing may have moved EARLIER,
-        # stranding iron minutes after its wash finishes.  Since the left-shift is
-        # monotone, deterministic and idempotent (pinned iron stays anchored, and once
-        # tight it re-converges to the same starts), running it every pass keeps iron
-        # glued to the actual washing ends without harming re-schedule stability.
-        if self._apply_cold_passes and self.config.get("enable_ironing_left_shift", True):
+        # Applied on EVERY pass (cold, internal stabilize, AND real Go re-schedule):
+        # wherever washing can move earlier (stabilize: washing reused from pass-1;
+        # real re-schedule: washing flush/left-shift now run there too), an iron solve
+        # hard-kept to previous positions would strand iron minutes-to-hours after its
+        # wash finishes (the 154-min-gap trap).  Since the left-shift is monotone,
+        # deterministic and idempotent (pinned iron stays anchored; a schedule that is
+        # already tight yields ZERO moves — no needless machine churn), running it every
+        # pass keeps iron glued to the actual washing ends without harming stability.
+        if self.config.get("enable_ironing_left_shift", True):
             moved = left_shift_cold_ironing(
                 p4.assignments, self.tasks, self.config, end_through_washing,
             )
@@ -547,9 +567,10 @@ class Pipeline:
         # Tighten packing: same FEASIBLE-stall as ironing/linking, worst here because packing
         # is the LAST phase (loosest due dates → least early-start incentive), so slices slip
         # minutes past their ironing-ready time while a compatible packing machine is idle.
-        # Terminal op ⇒ nothing downstream to disturb; monotone by construction.  Runs every
-        # pass (double-solve pass-2 hard-keeps packing to pass-1 while iron may move earlier).
-        if self._apply_cold_passes and self.config.get("enable_packing_left_shift", True):
+        # Terminal op ⇒ nothing downstream to disturb; monotone by construction.  Runs EVERY
+        # pass incl. real Go re-schedule (same reasoning as the ironing left-shift above:
+        # iron can now move earlier on any pass, and a tight schedule yields zero moves).
+        if self.config.get("enable_packing_left_shift", True):
             moved = left_shift_cold_packing(
                 p5.assignments, self.tasks, self.config, all_end_times_iron,
             )
