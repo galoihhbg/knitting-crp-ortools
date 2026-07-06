@@ -240,7 +240,15 @@ def _solve_group(
     if n == 0:
         K = 0  # all tasks pinned
     elif cfg_slots is not None:
-        K = max(1, min(n, int(cfg_slots)))
+        # washing_num_slots là GỢI Ý số mẻ, không phải trần cứng: floor tại
+        # min_batches+2 để config chặt không bao giờ tự bóp chết nhóm.  Đo thực tế
+        # (CP_1783157202628867763): slots=21, capacity=50, tổng qty=1050 → sức chứa
+        # 21×50 = 1050 KHỚP CHÍNH XÁC (slack 0); cold còn xếp hoàn hảo được, nhưng
+        # re-schedule thêm ma sát (hard-keep theo prev + co-location gate theo
+        # deadline) → INFEASIBLE cả nhóm → 135 task washing BIẾN MẤT khỏi output.
+        # +2 slot slack là đủ hấp thụ ma sát; batch_w vẫn thưởng gom nên solver
+        # không lạm dụng slot thừa.
+        K = max(1, min(n, max(int(cfg_slots), min_batches + 2)))
     else:
         K = max(1, min(n, min_batches + 2))
         max_k = config.get("max_washing_batches")
@@ -1479,9 +1487,17 @@ def left_shift_cold_washing(
     config: Dict[str, Any],
     shift_ends: List[int],
     dep_ends: Optional[Dict[str, int]] = None,
+    merge_only: bool = False,
 ) -> int:
     """COLD-only: pull washing goods that became ready early but got bundled into a
     LATER batch into the earliest boundary-safe free wash slot.
+
+    `merge_only=True` runs ONLY the consolidation-positive merge pass (fold a task into
+    an earlier same-machine cycle with spare capacity) and skips the free-window PEEL.
+    Used on the double-solve stabilize pass: its linking is left-shifted tighter than
+    pass-1's, so reused pass-1 washing gains new fold opportunities ("lần giặt sau còn
+    chỗ mà không nhét thêm vào"), but the peel there would shatter full-batch
+    consolidation — merge can only make existing cycles FULLER and starts EARLIER.
 
     The washing solver minimises batch count + machines used (consolidation) and only
     weakly rewards early starts, so with loose due dates it co-batches an early-ready
@@ -1590,6 +1606,14 @@ def left_shift_cold_washing(
             end_of[a["task_id"]] = a["end_time"]
             cv[target].append(a)
             moved += 1
+
+    if merge_only:
+        if moved:
+            logger.info(
+                f"   🧺 Washing merge-only: folded {moved} ready task(s) into earlier "
+                f"under-filled cycles (no new cycles — consolidation preserved)."
+            )
+        return moved
 
     # Machine occupancy = every existing washing CYCLE (a batch = one shared interval).
     # Conservative: a vacated cycle slot is NOT reclaimed, so we can never overlap a

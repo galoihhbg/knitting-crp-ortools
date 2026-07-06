@@ -49,7 +49,12 @@ def _assign(task_id, machine, start):
 # ---------------------------------------------------------------------------
 
 def _newest_real():
-    """Newest solver_input with dyelot_stock + a paired output. Skip if none."""
+    """Newest solver_input with dyelot_stock + a paired FEASIBLE output. Skip if none.
+
+    Outputs with no assignments (e.g. an infeasible solve logged by the worker) are
+    not usable fixtures — the allocator would have nothing to assign and every
+    assertion would fail for reasons unrelated to the allocator.
+    """
     for inp in sorted(glob.glob("logs/solver_input_*.json"),
                       key=os.path.getmtime, reverse=True):
         out = inp.replace("solver_input", "solver_output")
@@ -57,7 +62,10 @@ def _newest_real():
             continue
         p = json.load(open(inp))
         if p.get("dyelot_stock"):
-            return p, json.load(open(out))
+            o = json.load(open(out))
+            if not o.get("assignments"):
+                continue
+            return p, o
     pytest.skip("no real payload with dyelot_stock + paired output on disk")
 
 

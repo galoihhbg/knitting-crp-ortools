@@ -282,10 +282,28 @@ class Pipeline:
         # into late batches — see the flush gate in _solve_phases_3_to_5); only the
         # internal stabilize pass is skipped so it can't shatter pass-1 consolidation.
         if not self._stabilize_pass and self.config.get("enable_washing_left_shift", True):
-            left_shift_cold_washing(
+            wash_moved = left_shift_cold_washing(
                 all_assignments, self.tasks, self.config,
                 [int(s) for s in self.config.get("shift_ends_min", [])],
             )
+            # Re-glue iron → packing to the washing this FINAL pass just pulled earlier.
+            # The in-phase iron/packing left-shifts ran BEFORE this washing compaction,
+            # so a wash batch moved earlier here leaves its iron stranded a full cycle
+            # late (measured: wash re-solve drifted a batch 1020→1080, this pass pulled
+            # it back, iron stayed at 1140 — tester saw a 60-min wash→iron hole).  Both
+            # left-shifts are monotone + idempotent (already-tight tasks don't move),
+            # so re-running them here only closes holes this pass opened.
+            if wash_moved:
+                cur_ends = {x["task_id"]: int(x["end_time"]) for x in all_assignments}
+                if self.config.get("enable_ironing_left_shift", True):
+                    left_shift_cold_ironing(
+                        all_assignments, self.tasks, self.config, cur_ends,
+                    )
+                    cur_ends = {x["task_id"]: int(x["end_time"]) for x in all_assignments}
+                if self.config.get("enable_packing_left_shift", True):
+                    left_shift_cold_packing(
+                        all_assignments, self.tasks, self.config, cur_ends,
+                    )
         # Iron/packing worker load-balance: machine-relabel only (timing unchanged →
         # downstream byte-identical, zero regression by construction, like the linking
         # balance above).  The left-shifts glue slices to their ready times but
@@ -294,16 +312,36 @@ class Pipeline:
         # stabilize (UI gets the balanced layout); skipped on real Go re-schedule —
         # worker assignment is part of stability there.
         if self._apply_cold_passes:
+            changed = 0
             if self.config.get("enable_ironing_balance", True):
-                balance_downstream_load(
+                changed += balance_downstream_load(
                     all_assignments, self.tasks, all_resources, self.config,
                     frozenset(_PHASE4_OP_SET), "Ironing",
                 )
             if self.config.get("enable_packing_balance", True):
-                balance_downstream_load(
+                changed += balance_downstream_load(
                     all_assignments, self.tasks, all_resources, self.config,
                     frozenset({"pack", "packing"}), "Packing",
                 )
+            # Hole-closing left-shift AFTER the balance: the relabel keeps every
+            # task's time but REDISTRIBUTES the busy intervals, so a machine the
+            # earlier left-shift saw as busy can end up free in the final layout —
+            # a slice then visibly waits while a machine idles (measured: 1 of 4
+            # ready-together slices started +21 min while W_IRONING_03 sat empty).
+            # One more monotone left-shift on the final labels closes exactly those
+            # holes (zero moves when already tight); no re-balance afterwards, so
+            # no new holes can open.
+            if changed:
+                cur_ends = {x["task_id"]: int(x["end_time"]) for x in all_assignments}
+                if self.config.get("enable_ironing_left_shift", True):
+                    left_shift_cold_ironing(
+                        all_assignments, self.tasks, self.config, cur_ends,
+                    )
+                    cur_ends = {x["task_id"]: int(x["end_time"]) for x in all_assignments}
+                if self.config.get("enable_packing_left_shift", True):
+                    left_shift_cold_packing(
+                        all_assignments, self.tasks, self.config, cur_ends,
+                    )
         all_overloads = (
             p1.overloads + p2.overloads + p3.overloads
             + p4.overloads + p5.overloads
@@ -414,12 +452,32 @@ class Pipeline:
                 )
             ]
             if _violated:
-                logger.warning(
-                    f"⚠️ Phase 3 (stabilize): {len(_violated)} reused washing task(s) "
-                    f"would start before their pass-2 linking dependency "
-                    f"(e.g. {_violated[0]}) — falling back to a normal washing solve."
+                # LOCAL REPAIR first: delay ONLY the violating cycles to their pass-2
+                # dependency ends (earliest boundary-safe free slot on their machine),
+                # keeping every other reused cycle untouched.  Discarding the whole
+                # pass-1 layout over one drifted linking task re-opens the stabilize
+                # re-solve disaster (measured: 1/87 violated → full re-solve stalled
+                # FEASIBLE → 29 slices held >1 day, machine idle 2737 min).  Only if a
+                # violating cycle genuinely cannot be re-placed do we fall back.
+                repaired = _repair_reused_washing(
+                    p1_wash, _info, combined_end_times, shift_ends,
                 )
-                p1_wash = None
+                if repaired is not None:
+                    logger.info(
+                        f"🩹 Phase 3 (stabilize): {len(_violated)} reused washing "
+                        f"task(s) started before their pass-2 linking dependency "
+                        f"(e.g. {_violated[0]}) — delayed just their cycle(s); the "
+                        f"rest of the pass-1 layout is kept."
+                    )
+                    p1_wash = repaired
+                else:
+                    logger.warning(
+                        f"⚠️ Phase 3 (stabilize): {len(_violated)} reused washing task(s) "
+                        f"would start before their pass-2 linking dependency "
+                        f"(e.g. {_violated[0]}) and their cycles cannot be re-placed — "
+                        f"falling back to a normal washing solve."
+                    )
+                    p1_wash = None
         if p1_wash:
             p3 = Phase3Result(
                 status="feasible",
@@ -434,6 +492,22 @@ class Pipeline:
                 f"✅ Phase 3 (stabilize): reused {len(p3.assignments)} pass-1 washing "
                 f"assignments (no re-solve — keeps pass-1's compacted layout)"
             )
+            # Pass-2 linking is left-shifted TIGHTER than pass-1's, so the reused
+            # washing gains fold opportunities pass-1 could not see (a slice whose
+            # linking now ends before an under-filled cycle: "lần giặt sau còn chỗ mà
+            # không nhét thêm vào").  Run the MERGE-ONLY washing left-shift: folds
+            # into existing cycles with spare capacity — no new cycles, so it cannot
+            # shatter consolidation (the reason the full left-shift stays off here);
+            # starts only move EARLIER, and iron/packing solve after this on the
+            # refreshed ends.
+            if self.config.get("enable_washing_left_shift", True):
+                merged = left_shift_cold_washing(
+                    p3.assignments, self.tasks, self.config, shift_ends,
+                    dep_ends=combined_end_times, merge_only=True,
+                )
+                if merged:
+                    for a in p3.assignments:
+                        p3.end_times[a["task_id"]] = int(a["end_time"])
         else:
             # Phase 3 is group-isolated; pass the full hint (with washing-group partition
             # already computed) so each group filter its own previous_assignments.
@@ -881,6 +955,90 @@ _PHASE2_OP_SET = {"linking"}
 _PHASE3_OP_SET = {"washing"}
 _PHASE4_OP_SET = {"iron", "ironing"}  # Phase 5 (packing + rest) takes everything else downstream
                                       # (payloads use op "Iron"→"iron"; accept "ironing" too)
+
+
+def _repair_reused_washing(
+    p1_wash: List[Dict[str, Any]],
+    info: Dict[str, Dict[str, Any]],
+    dep_ends: Dict[str, int],
+    shift_ends: List[int],
+) -> Optional[List[Dict[str, Any]]]:
+    """Repair a reused pass-1 washing layout whose members start before their pass-2
+    linking dependency: delay ONLY the violating cycles (whole batch moves together)
+    to the earliest boundary-safe free slot ≥ their latest dependency end on the SAME
+    machine; every other cycle keeps its pass-1 position byte-identical.
+
+    Returns a NEW assignment list on success, or None when some violating cycle cannot
+    be re-placed (caller then falls back to a full washing re-solve).  A delayed batch
+    only moves LATER, so it can never race ahead of its linking; downstream (iron/
+    packing) solves AFTER this on the returned end_times, so it follows the delay.
+    Deterministic (cycles processed by required start, then machine id).
+    """
+    wash = [dict(a) for a in p1_wash]
+    bounds = sorted({int(s) for s in shift_ends})
+
+    cyc: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+    for a in wash:
+        cyc.setdefault((a["machine_id"], int(a["start_time"])), []).append(a)
+
+    def _span(members: List[Dict[str, Any]]) -> Tuple[int, int]:
+        return (
+            min(int(a["start_time"]) for a in members),
+            max(int(a["end_time"]) for a in members),
+        )
+
+    # Required (dependency-safe) start per violating cycle.
+    need: Dict[Tuple[str, int], int] = {}
+    for key, members in cyc.items():
+        req = key[1]
+        for a in members:
+            t = info.get(a["task_id"], {})
+            for d in (t.get("final_depends_on") or []):
+                if d in dep_ends:
+                    req = max(req, int(dep_ends[d]))
+        if req > key[1]:
+            need[key] = req
+
+    # Occupancy from the cycles that stay put.
+    busy: Dict[str, List[Tuple[int, int]]] = {}
+    for key, members in cyc.items():
+        if key in need:
+            continue
+        busy.setdefault(key[0], []).append(_span(members))
+
+    for key in sorted(need, key=lambda k: (need[k], k[0])):
+        members = cyc[key]
+        s0, e0 = _span(members)
+        dur = e0 - s0
+        m = key[0]
+        occupied = busy.setdefault(m, [])
+        # Earliest boundary-safe free slot ≥ the dependency end: try the requirement
+        # itself, then each busy-interval end and shift boundary after it.
+        cands = sorted(
+            {need[key]}
+            | {be for (_bs, be) in occupied if be >= need[key]}
+            | {b for b in bounds if b >= need[key]}
+        )
+        placed = None
+        for c in cands:
+            e = c + dur
+            if any(c < b < e for b in bounds):
+                continue  # washing must not straddle a break
+            if any(c < be and bs < e for (bs, be) in occupied):
+                continue
+            placed = c
+            break
+        if placed is None:
+            return None
+        delta = placed - s0
+        for a in members:
+            a["start_time"] = int(a["start_time"]) + delta
+            a["end_time"] = int(a["end_time"]) + delta
+            due = info.get(a["task_id"], {}).get("due_at_min")
+            if due is not None:
+                a["status"] = "LATE" if a["end_time"] > int(due) else "ON_TIME"
+        occupied.append((placed, placed + dur))
+    return wash
 
 
 def _detect_workload_shrink(
