@@ -673,7 +673,30 @@ class Pipeline:
         ORDER completes (its last task).  Tardiness = max(0, max-end-of-order − due).
         Used to gate the contiguity refinement: a candidate is accepted only if
         NEITHER figure increases, i.e. no order ships later and none newly slips.
+
+        PO knit thành phần (BATCH_0-655…) được CUỘN vào garment mà nó nuôi (map qua
+        final_depends_on của linking): dệt song song các PO của một garment tất yếu
+        kéo dài span TỪNG PO trong khi garment ship sớm hơn — đếm PO trung gian như
+        một "đơn" riêng làm gate tự chặn đúng transform nó verify
+        (CP_1783308395880305537: BATCH_0-655 "lật trễ" +1 → reject dù W8jjpJWSUc
+        −810).  Knit end ≤ linking end theo dependency nên sau khi cuộn nó không bao
+        giờ là max — pseudo-order biến mất khỏi cả Σ lẫn count; knit-order không nuôi
+        linking nào vẫn đếm như cũ.
         """
+        remap = getattr(self, "_knit_oid_remap", None)
+        if remap is None:
+            remap = {}
+            _info = {t["task_id"]: t for t in self.tasks}
+            for t in self.tasks:
+                if t.get("operation", "").lower() != "linking":
+                    continue
+                parent = t.get("original_order_id") or t["task_id"]
+                for dep in (t.get("final_depends_on") or []):
+                    kt = _info.get(dep)
+                    if kt and kt.get("operation", "").lower() == "knitting":
+                        koid = kt.get("original_order_id") or kt["task_id"]
+                        remap.setdefault(koid, parent)
+            self._knit_oid_remap = remap
         order_end: Dict[str, int] = {}
         order_due: Dict[str, int] = {}
         for t in self.tasks:
@@ -683,9 +706,14 @@ class Pipeline:
             e = ends.get(t["task_id"])
             if e is None:
                 continue
-            oid = t.get("original_order_id") or t["task_id"]
+            raw_oid = t.get("original_order_id") or t["task_id"]
+            oid = remap.get(raw_oid, raw_oid)
             order_end[oid] = max(order_end.get(oid, 0), e)
-            order_due[oid] = int(due)  # uniform per order
+            if oid == raw_oid:
+                order_due[oid] = int(due)  # uniform per order
+            else:
+                # knit thành phần cuộn vào garment: góp end, không ghi đè due garment
+                order_due.setdefault(oid, int(due))
         total = 0
         n_late = 0
         for oid, e in order_end.items():

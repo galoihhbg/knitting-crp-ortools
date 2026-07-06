@@ -12,7 +12,7 @@ lower bounds via final_depends_on and wait_offsets resolution.
 import bisect
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ortools.sat.python import cp_model
 
@@ -1601,171 +1601,234 @@ def parallelize_component_pos(
     if not target_garments:
         return None
 
-    affected_tids = {tid for p in affected_pos for tid in po_tasks.get(p, [])
-                     if not info[tid].get("is_pinned")}
-    if not affected_tids:
-        return None
-
-    # 3. timeline state — fixed busy windows + global workforce occupancy from
-    #    everything we do NOT re-place (machine unavailability, untouched knitting,
-    #    pinned knitting, capacity_block), then place the affected POs around them.
+    # 3. Đặt lại theo vòng RESTART: chạy thử placement cho các garment đang active;
+    #    garment nào re-pack làm knit-end MUỘN hơn gốc (cửa sổ gốc bị island đơn khác
+    #    ăn bớt chỗ → batch tràn ra sau rất xa — CP_1783308395880305537: Wle9h8tXRA
+    #    912→6345, tự lật LATE → gate reject cả 4 garment) hoặc không đặt được thì
+    #    LOẠI, rồi chạy lại TOÀN BỘ placement từ đầu với interval gốc của garment bị
+    #    loại giữ nguyên làm vật cản.  Khôi-phục-tại-chỗ không an toàn vì cửa sổ gốc
+    #    các garment ĐAN XEN nhau: garment đặt trước có thể đã back-fill vào đúng chỗ
+    #    garment sau trả lại (651_7 ↮ 652_1).  Thuần Python, không re-solve; hội tụ
+    #    ≤ số garment vòng.
     MAXM = int(config.get("max_factory_machines", 100))
-    avail_at: Dict[str, int] = {}
-    fixed_busy: Dict[str, List[Any]] = {}
-    occ: List[Any] = []
-    for r in resources:
-        mid = r["id"]
-        avail_at[mid] = int(r.get("available_at_min", 0) or 0)
-        fixed_busy[mid] = [(int(w["start"]), int(w["end"]))
-                           for w in (r.get("unavailability") or [])
-                           if int(w["end"]) > int(w["start"])]
-    for t in all_tasks:
-        op = t.get("operation", "").lower()
-        tid = t["task_id"]
-        if op == "capacity_block":
-            dem = int(t.get("demand", 0) or 0)
-            pe = t.get("pinned_end_time")
-            if dem > 0 and pe is not None:
-                ps = t.get("pinned_start_time")
-                ps = int(ps) if ps is not None else int(pe) - int(t.get("duration", 0) or 0)
-                occ.append((ps, dem)); occ.append((int(pe), -dem))
-            continue
-        if op != "knitting" or tid in affected_tids:
-            continue
-        a = asg.get(tid)
-        if t.get("is_pinned"):
-            ps, pe = t.get("pinned_start_time"), t.get("pinned_end_time")
-            if (ps is None or pe is None) and a:
-                ps, pe = a["start_time"], a["end_time"]
-            m = t.get("pinned_machine_id") or (a["machine_id"] if a else None)
-        elif a:
-            ps, pe, m = a["start_time"], a["end_time"], a["machine_id"]
-        else:
-            continue
-        if ps is None or pe is None or m is None:
-            continue
-        fixed_busy.setdefault(m, []).append((int(ps), int(pe)))
-        occ.append((int(ps), 1)); occ.append((int(pe), -1))
-    for m in fixed_busy:
-        fixed_busy[m].sort()
-    machine_tail: Dict[str, int] = dict(avail_at)
-
-    def _occ_fits(s: int, e: int) -> bool:
-        cur = 0
-        for tm, dl in sorted(occ + [(s, 1), (e, -1)]):
-            cur += dl
-            if cur > MAXM:
-                return False
-            if tm > e:
-                break
-        return True
-
-    def _next_release(t0: int) -> int:
-        nxt = None
-        for tm, dl in occ:
-            if dl < 0 and tm > t0 and (nxt is None or tm < nxt):
-                nxt = tm
-        return nxt if nxt is not None else t0 + 1
-
-    def _machine_earliest(m: str, release: int, dur: int) -> int:
-        st = max(machine_tail.get(m, 0), release, avail_at.get(m, 0))
-        moved = True
-        while moved:
-            moved = False
-            for ws, we in fixed_busy.get(m, []):
-                if st < we and st + dur > ws:
-                    st = we
-                    moved = True
-        return st
-
+    excluded: set = set()
     new_start: Dict[str, int] = {}
     new_end: Dict[str, int] = {}
     new_machine: Dict[str, str] = {}
-    for g in target_garments:
-        pos = [p for p in sorted(multi[g]) if any(t in affected_tids for t in po_tasks.get(p, []))]
-        work = {p: sum(int(asg[t]["end_time"] - asg[t]["start_time"])
-                       for t in po_tasks[p] if t in affected_tids) for p in pos}
-        pos = [p for p in pos if work[p] > 0]
-        if len(pos) < 2:
-            continue
-        comp = sorted({m for p in pos for t in po_tasks[p] if t in affected_tids
-                       for m in (info[t].get("compatible_resource_ids") or [])
-                       if m in avail_at})
-        if len(comp) < len(pos):
-            continue
-        t0 = min(asg[t]["start_time"] for p in pos for t in po_tasks[p] if t in affected_tids)
-        # partition machines ∝ work (≥1 each); machines dealt earliest-free first.
-        total = sum(work[p] for p in pos)
-        nm = {p: max(1, round(work[p] / total * len(comp))) for p in pos}
-        order_w = sorted(pos, key=lambda p: (-work[p], p))
-        diff = len(comp) - sum(nm.values())
-        i = 0
-        while diff != 0 and order_w:
-            p = order_w[i % len(order_w)]
-            if diff > 0:
-                nm[p] += 1; diff -= 1
-            elif nm[p] > 1:
-                nm[p] -= 1; diff += 1
-            i += 1
-        comp_sorted = sorted(comp, key=lambda m: (_machine_earliest(m, t0, 0), m))
-        po_machines: Dict[str, List[str]] = {p: [] for p in pos}
-        mi = 0
-        for p in order_w:
-            for _ in range(nm[p]):
-                if mi < len(comp_sorted):
-                    po_machines[p].append(comp_sorted[mi]); mi += 1
-        while mi < len(comp_sorted):
-            po_machines[order_w[0]].append(comp_sorted[mi]); mi += 1
+    placed_ok = False
+    for _round in range(len(target_garments)):
+        active = [g for g in target_garments if g not in excluded]
+        if not active:
+            break
+        affected_tids = {tid for g in active for p in multi[g]
+                         for tid in po_tasks.get(p, [])
+                         if not info[tid].get("is_pinned")}
+        if not affected_tids:
+            break
 
-        # snapshot for per-garment rollback on failure.
-        snap = (len(occ), {m: list(v) for m, v in fixed_busy.items()}, dict(machine_tail))
-        local_s: Dict[str, int] = {}
-        local_e: Dict[str, int] = {}
-        local_m: Dict[str, str] = {}
-        ok = True
-        for p in pos:
-            mset = po_machines[p]
-            batches = sorted((t for t in po_tasks[p] if t in affected_tids),
-                             key=lambda t: (_panel_index(t), t))
-            for tid in batches:
-                dur = int(asg[tid]["end_time"] - asg[tid]["start_time"])
-                release = max(t0, int(info[tid].get("start_after_min", 0) or 0))
-                cands = [m for m in mset
-                         if m in (info[tid].get("compatible_resource_ids") or [])]
-                if not cands:
-                    ok = False; break
-                m = min(cands, key=lambda mm: (_machine_earliest(mm, release, dur), mm))
-                st = _machine_earliest(m, release, dur)
-                guard = 0
-                while dur > 0 and not _occ_fits(st, st + dur):
-                    st = _next_release(st)
-                    moved = True
-                    while moved:
-                        moved = False
-                        for ws, we in fixed_busy.get(m, []):
-                            if st < we and st + dur > ws:
-                                st = we; moved = True
-                    guard += 1
-                    if guard > 100000:
+        # timeline state — fixed busy windows + global workforce occupancy from
+        # everything we do NOT re-place (machine unavailability, untouched knitting,
+        # pinned knitting, capacity_block, POs of excluded garments), then place the
+        # affected POs around them.
+        avail_at: Dict[str, int] = {}
+        fixed_busy: Dict[str, List[Any]] = {}
+        occ: List[Any] = []
+        for r in resources:
+            mid = r["id"]
+            avail_at[mid] = int(r.get("available_at_min", 0) or 0)
+            fixed_busy[mid] = [(int(w["start"]), int(w["end"]))
+                               for w in (r.get("unavailability") or [])
+                               if int(w["end"]) > int(w["start"])]
+        for t in all_tasks:
+            op = t.get("operation", "").lower()
+            tid = t["task_id"]
+            if op == "capacity_block":
+                dem = int(t.get("demand", 0) or 0)
+                pe = t.get("pinned_end_time")
+                if dem > 0 and pe is not None:
+                    ps = t.get("pinned_start_time")
+                    ps = int(ps) if ps is not None else int(pe) - int(t.get("duration", 0) or 0)
+                    occ.append((ps, dem)); occ.append((int(pe), -dem))
+                continue
+            if op != "knitting" or tid in affected_tids:
+                continue
+            a = asg.get(tid)
+            if t.get("is_pinned"):
+                ps, pe = t.get("pinned_start_time"), t.get("pinned_end_time")
+                if (ps is None or pe is None) and a:
+                    ps, pe = a["start_time"], a["end_time"]
+                m = t.get("pinned_machine_id") or (a["machine_id"] if a else None)
+            elif a:
+                ps, pe, m = a["start_time"], a["end_time"], a["machine_id"]
+            else:
+                continue
+            if ps is None or pe is None or m is None:
+                continue
+            fixed_busy.setdefault(m, []).append((int(ps), int(pe)))
+            occ.append((int(ps), 1)); occ.append((int(pe), -1))
+        for m in fixed_busy:
+            fixed_busy[m].sort()
+        machine_tail: Dict[str, int] = dict(avail_at)
+
+        def _occ_fits(s: int, e: int) -> bool:
+            cur = 0
+            for tm, dl in sorted(occ + [(s, 1), (e, -1)]):
+                cur += dl
+                if cur > MAXM:
+                    return False
+                if tm > e:
+                    break
+            return True
+
+        def _next_release(t0: int) -> int:
+            nxt = None
+            for tm, dl in occ:
+                if dl < 0 and tm > t0 and (nxt is None or tm < nxt):
+                    nxt = tm
+            return nxt if nxt is not None else t0 + 1
+
+        def _machine_earliest(m: str, release: int, dur: int) -> int:
+            # Quét GAP từ release (KHÔNG xuất phát từ machine_tail): các garment được
+            # xử lý theo thứ tự due nhưng cửa sổ thời gian chúng nhả ra nằm theo thứ
+            # tự t0 — nếu xuất phát từ tail (con trỏ chỉ tiến), garment due-sớm-nhưng-
+            # t0-muộn đặt trước sẽ đẩy tail lên và các garment t0-sớm hơn KHÔNG
+            # back-fill được vào chính cửa sổ mình vừa nhả (CP_1783308395880305537:
+            # 649–651 bị văng 152→9841, lật LATE → gate reject cả 4 garment).  Vòng
+            # bump-past-overlap tự hội tụ về gap sớm nhất đủ dur, nên bỏ tail là đủ
+            # để back-fill.
+            st = max(release, avail_at.get(m, 0))
+            moved = True
+            while moved:
+                moved = False
+                for ws, we in fixed_busy.get(m, []):
+                    if st < we and st + dur > ws:
+                        st = we
+                        moved = True
+            return st
+
+        new_start = {}
+        new_end = {}
+        new_machine = {}
+        bad: set = set()
+
+        # Đặt garment theo thứ tự t0 (KHÔNG phải due): cửa sổ trống được giải phóng
+        # theo trục thời gian; đặt theo due (W8jjpJWSUc due sớm nhưng t0=2432 đặt
+        # trước) làm garment t0-sớm đặt sau spill batch qua island F0 tới 6193+ dù
+        # cửa sổ 912.. của nó còn nguyên (CP_1783308395880305537).  Với t0-order,
+        # spill nhỏ chỉ trượt sang mép cửa sổ garment kế → vẫn ≤ knit-end gốc.
+        # Windows vốn rời nhau (đến từ layout nối tiếp) nên due chỉ còn là tie-break.
+        def _g_t0(g_: str) -> int:
+            return min((asg[t]["start_time"] for p in multi[g_]
+                        for t in po_tasks.get(p, []) if t in affected_tids),
+                       default=1 << 60)
+
+        for g in sorted(active, key=lambda g_: (_g_t0(g_), garment_due.get(g_, 0), g_)):
+            pos = [p for p in sorted(multi[g]) if any(t in affected_tids for t in po_tasks.get(p, []))]
+            work = {p: sum(int(asg[t]["end_time"] - asg[t]["start_time"])
+                           for t in po_tasks[p] if t in affected_tids) for p in pos}
+            pos = [p for p in pos if work[p] > 0]
+            if len(pos) < 2:
+                # tid của garment này đã bị loại khỏi fixed scan nhưng không được
+                # đặt lại → vòng sau phải coi nó là vật cản cố định.
+                bad.add(g)
+                continue
+            comp = sorted({m for p in pos for t in po_tasks[p] if t in affected_tids
+                           for m in (info[t].get("compatible_resource_ids") or [])
+                           if m in avail_at})
+            if len(comp) < len(pos):
+                bad.add(g)
+                continue
+            t0 = min(asg[t]["start_time"] for p in pos for t in po_tasks[p] if t in affected_tids)
+            # partition machines ∝ work (≥1 each); machines dealt earliest-free first.
+            total = sum(work[p] for p in pos)
+            nm = {p: max(1, round(work[p] / total * len(comp))) for p in pos}
+            order_w = sorted(pos, key=lambda p: (-work[p], p))
+            diff = len(comp) - sum(nm.values())
+            i = 0
+            while diff != 0 and order_w:
+                p = order_w[i % len(order_w)]
+                if diff > 0:
+                    nm[p] += 1; diff -= 1
+                elif nm[p] > 1:
+                    nm[p] -= 1; diff += 1
+                i += 1
+            comp_sorted = sorted(comp, key=lambda m: (_machine_earliest(m, t0, 0), m))
+            po_machines: Dict[str, List[str]] = {p: [] for p in pos}
+            mi = 0
+            for p in order_w:
+                for _ in range(nm[p]):
+                    if mi < len(comp_sorted):
+                        po_machines[p].append(comp_sorted[mi]); mi += 1
+            while mi < len(comp_sorted):
+                po_machines[order_w[0]].append(comp_sorted[mi]); mi += 1
+
+            # snapshot for per-garment rollback on failure.
+            snap = (len(occ), {m: list(v) for m, v in fixed_busy.items()}, dict(machine_tail))
+            local_s: Dict[str, int] = {}
+            local_e: Dict[str, int] = {}
+            local_m: Dict[str, str] = {}
+            ok = True
+            for p in pos:
+                mset = po_machines[p]
+                batches = sorted((t for t in po_tasks[p] if t in affected_tids),
+                                 key=lambda t: (_panel_index(t), t))
+                for tid in batches:
+                    dur = int(asg[tid]["end_time"] - asg[tid]["start_time"])
+                    release = max(t0, int(info[tid].get("start_after_min", 0) or 0))
+                    cands = [m for m in mset
+                             if m in (info[tid].get("compatible_resource_ids") or [])]
+                    if not cands:
                         ok = False; break
+                    m = min(cands, key=lambda mm: (_machine_earliest(mm, release, dur), mm))
+                    st = _machine_earliest(m, release, dur)
+                    guard = 0
+                    while dur > 0 and not _occ_fits(st, st + dur):
+                        st = _next_release(st)
+                        moved = True
+                        while moved:
+                            moved = False
+                            for ws, we in fixed_busy.get(m, []):
+                                if st < we and st + dur > ws:
+                                    st = we; moved = True
+                        guard += 1
+                        if guard > 100000:
+                            ok = False; break
+                    if not ok:
+                        break
+                    if dur > 0:
+                        occ.append((st, 1)); occ.append((st + dur, -1))
+                    fixed_busy.setdefault(m, []).append((st, st + dur))
+                    fixed_busy[m].sort()
+                    # tail giờ chỉ là khoá sort máy (earliest-free) — back-fill có
+                    # thể đặt TRƯỚC tail nên giữ max để khoá không tụt.
+                    machine_tail[m] = max(machine_tail.get(m, 0), st + dur)
+                    local_s[tid] = st; local_e[tid] = st + dur; local_m[tid] = m
                 if not ok:
                     break
-                if dur > 0:
-                    occ.append((st, 1)); occ.append((st + dur, -1))
-                fixed_busy.setdefault(m, []).append((st, st + dur))
-                fixed_busy[m].sort()
-                machine_tail[m] = st + dur
-                local_s[tid] = st; local_e[tid] = st + dur; local_m[tid] = m
-            if not ok:
-                break
-        if ok:
-            new_start.update(local_s); new_end.update(local_e); new_machine.update(local_m)
-        else:  # rollback this garment's partial placements
-            del occ[snap[0]:]
-            fixed_busy.clear(); fixed_busy.update(snap[1])
-            machine_tail.clear(); machine_tail.update(snap[2])
+            # Re-pack chỉ có lợi khi first-panel sớm hơn mà knit-end của garment
+            # KHÔNG muộn đi — garment bị kéo dài giữ layout nối tiếp gốc (loại rồi
+            # restart).
+            orig_last = max(int(asg[t]["end_time"])
+                            for p in pos for t in po_tasks[p] if t in affected_tids)
+            if ok and local_e and max(local_e.values()) > orig_last:
+                logger.info(
+                    f"⏸ Knitting parallel-PO: garment {g} re-pack kéo dài knit-end "
+                    f"{orig_last}→{max(local_e.values())} → giữ layout gốc cho garment này."
+                )
+                ok = False
+            if ok:
+                new_start.update(local_s); new_end.update(local_e); new_machine.update(local_m)
+            else:  # rollback partial placements; loại garment → restart vòng ngoài
+                del occ[snap[0]:]
+                fixed_busy.clear(); fixed_busy.update(snap[1])
+                machine_tail.clear(); machine_tail.update(snap[2])
+                bad.add(g)
+        if not bad:
+            placed_ok = True
+            break
+        excluded |= bad
 
-    if not new_start:
+    if not placed_ok or not new_start:
         return None
 
     # full knitting layout (moved + untouched) for the workforce check + p1b build.
@@ -1792,10 +1855,29 @@ def parallelize_component_pos(
         logger.info("⏸ Knitting parallel-PO: candidate exceeds workforce cap — skipped.")
         return None
 
+    # Sanity: không task nào đè nhau trên cùng máy trong layout đầy đủ (moved +
+    # untouched).  Back-fill + rollback-khôi-phục có thể va nhau ở ca hiếm (garment
+    # đặt trước chiếm vào cửa sổ của garment sau rồi garment sau rollback); một
+    # layout đè nhau gửi sang Go là hỏng lịch → thà giữ solver plan.
+    _by_m: Dict[str, List[Tuple[int, int, str]]] = {}
+    for tid, s in full_start.items():
+        e = full_end[tid]
+        if e > s:
+            _by_m.setdefault(full_machine[tid], []).append((s, e, tid))
+    for _m, _arr in _by_m.items():
+        _arr.sort()
+        for _i in range(1, len(_arr)):
+            if _arr[_i][0] < _arr[_i - 1][1]:
+                logger.info(
+                    f"⏸ Knitting parallel-PO: candidate has overlap on {_m} "
+                    f"({_arr[_i - 1][2]} {_arr[_i - 1][:2]} ↮ {_arr[_i][2]} {_arr[_i][:2]}) — skipped."
+                )
+                return None
+
     logger.info(
         f"⏸ Knitting parallel-PO: dedicated machines to component POs of "
-        f"{len(target_garments)} garment(s), {len(new_start)} batch(es) re-placed "
-        f"in parallel — verifying downstream…"
+        f"{len(target_garments) - len(excluded)}/{len(target_garments)} garment(s), "
+        f"{len(new_start)} batch(es) re-placed in parallel — verifying downstream…"
     )
     return {"start": full_start, "end": full_end, "machine": full_machine}
 
