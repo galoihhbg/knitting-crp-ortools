@@ -515,3 +515,165 @@ def balance_downstream_load(
             f"{used}/{len(machine_ids)} machines used (timing unchanged)."
         )
     return changed
+
+
+def fifo_swap_ironing(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    dep_ends: Dict[str, int],
+) -> int:
+    """Post-pass sửa FIFO inversion trên máy iron: đứa READY-TRƯỚC bị chờ vì một đứa
+    READY-SAU chiếm đúng cửa sổ máy — vi phạm luật xưởng "đến trước làm trước".
+
+    Ca thực đo được (CP_1783300710469478376): mẻ giặt nhả 5 slice cùng lúc @518 nhưng
+    máy 03 chỉ trống 60 phút vì I1-Wf90PwfsLf SLICE_3 (ready @578, SAU) đã chiếm
+    578-680 → WNesoSo0vK SLICE_4 (ready @518, TRƯỚC) phải lùi 102 phút.  Hoán đổi
+    (SLICE_4 vào 03 @518, SLICE_3 re-seat @620) cho đơn sớm 102 phút mà đơn kia
+    KHÔNG muộn đi giây nào — nhưng left-shift bị luật monotone cấm (phải dời muộn
+    blocker), còn solver kẹt FEASIBLE không tự thấy.
+
+    Cơ chế: với mỗi task w đang CHỜ (start > release), thử đặt w tại release trên một
+    máy tương thích; tập blocker B = các task chồng cửa sổ đó.  Chỉ nhận swap khi MỌI
+    blocker t ∈ B:
+      * không pinned và release_t > release_w (đúng nghĩa inversion — t đến sau);
+      * re-seat được tại slot trống sớm nhất ≥ release_t sao cho:
+          - end mới của t ≤ end CŨ của w (nhóm task liên quan không dài ra),
+          - end mới của t ≤ max iron-end hiện tại của ĐƠN t (đơn nó không muộn hơn),
+          - t không chuyển từ ON_TIME sang LATE.
+    → không đơn nào muộn đi theo cấu trúc; w chỉ sớm lên.  Gọi MỘT LẦN tại site
+    phase-4, TRƯỚC khi packing solve (packing bám theo end mới); các site muộn hơn
+    (re-glue/hole-closing) KHÔNG gọi vì packing đã chốt, dời muộn iron sẽ gãy chuỗi.
+    Deterministic; mutates in place; trả về số cặp swap đã nhận.
+    """
+    if not config.get("enable_ironing_fifo_swap", True):
+        return 0
+    info = {t["task_id"]: t for t in all_tasks}
+    iron_ids = {
+        t["task_id"] for t in all_tasks
+        if str(t.get("operation", "")).lower() in ("iron", "ironing")
+    }
+    iron_assigns = [a for a in assignments if a["task_id"] in iron_ids]
+    if len(iron_assigns) < 2:
+        return 0
+
+    def _release(t_id: str) -> int:
+        t = info[t_id]
+        rel = int(t.get("start_after_min", 0) or 0)
+        for d in (t.get("final_depends_on") or []):
+            if d in dep_ends:
+                rel = max(rel, int(dep_ends[d]))
+        return rel
+
+    def _due(t_id: str) -> Optional[int]:
+        v = info.get(t_id, {}).get("due_at_min")
+        return int(v) if v is not None else None
+
+    pool = {a["machine_id"] for a in iron_assigns}
+    for a in iron_assigns:
+        pool |= set(info[a["task_id"]].get("compatible_resource_ids") or [])
+    busy: Dict[str, List[Dict[str, Any]]] = {m: [] for m in pool}
+    for a in iron_assigns:
+        busy[a["machine_id"]].append(a)
+    for m in busy:
+        busy[m].sort(key=lambda x: (x["start_time"], x["task_id"]))
+
+    # Max iron end per order — proxy "đơn không muộn hơn" (packing chưa solve).
+    order_max_end: Dict[str, int] = {}
+    for a in iron_assigns:
+        o = a.get("order_id") or a["task_id"]
+        order_max_end[o] = max(order_max_end.get(o, 0), int(a["end_time"]))
+
+    swapped = 0
+    waiting = sorted(
+        (a for a in iron_assigns
+         if not info[a["task_id"]].get("is_pinned")
+         and int(a["start_time"]) > _release(a["task_id"])),
+        key=lambda a: (_release(a["task_id"]), a["start_time"], a["task_id"]),
+    )
+    for w in waiting:
+        w_rel = _release(w["task_id"])
+        w_dur = int(w["end_time"]) - int(w["start_time"])
+        w_old_end = int(w["end_time"])
+        if int(w["start_time"]) <= w_rel:
+            continue  # đã được pass trước kéo về rồi
+        compat = set(info[w["task_id"]].get("compatible_resource_ids") or []) or pool
+        done = False
+        for m in sorted(compat & set(busy.keys())):
+            if done:
+                break
+            win_s, win_e = w_rel, w_rel + w_dur
+            blockers = [
+                t for t in busy[m]
+                if t is not w and int(t["start_time"]) < win_e and int(t["end_time"]) > win_s
+            ]
+            if not blockers:
+                continue  # cửa sổ trống — việc của left-shift, không phải swap
+            if any(
+                info[t["task_id"]].get("is_pinned")
+                or _release(t["task_id"]) <= w_rel
+                for t in blockers
+            ):
+                continue  # chỉ swap khi MỌI blocker đến SAU w (inversion thật)
+            # Thử re-seat từng blocker với w đã chiếm [win_s, win_e) trên m.
+            trial: List[tuple] = []
+            occupied = {
+                mm: [(int(x["start_time"]), int(x["end_time"]))
+                     for x in busy[mm] if x is not w and x not in blockers]
+                for mm in busy
+            }
+            occupied[m].append((win_s, win_e))
+            for mm in occupied:
+                occupied[mm].sort()
+            ok = True
+            for t in sorted(blockers, key=lambda x: (_release(x["task_id"]), x["task_id"])):
+                t_rel = _release(t["task_id"])
+                t_dur = int(t["end_time"]) - int(t["start_time"])
+                t_compat = set(info[t["task_id"]].get("compatible_resource_ids") or []) or pool
+                best = None
+                for mm in sorted(t_compat & set(occupied.keys())):
+                    s = _earliest_slot(occupied[mm], t_rel, t_dur)
+                    if best is None or (s, mm) < best:
+                        best = (s, mm)
+                if best is None:
+                    ok = False
+                    break
+                new_s, new_m = best
+                new_e = new_s + t_dur
+                o = t.get("order_id") or t["task_id"]
+                t_due = _due(t["task_id"])
+                if (new_e > w_old_end
+                        or new_e > order_max_end.get(o, new_e)
+                        or (t_due is not None and int(t["end_time"]) <= t_due < new_e)):
+                    ok = False
+                    break
+                occupied[new_m].append((new_s, new_e))
+                occupied[new_m].sort()
+                trial.append((t, new_m, new_s, new_e))
+            if not ok:
+                continue
+            # Nhận swap: áp dụng w + mọi blocker.
+            busy[w["machine_id"]].remove(w)
+            w["machine_id"], w["start_time"], w["end_time"] = m, win_s, win_e
+            for t, new_m, new_s, new_e in trial:
+                busy[t["machine_id"]].remove(t)
+                t["machine_id"], t["start_time"], t["end_time"] = new_m, new_s, new_e
+                t_due = _due(t["task_id"])
+                if t_due is not None:
+                    t["status"] = "LATE" if new_e > t_due else "ON_TIME"
+                busy[new_m].append(t)
+                busy[new_m].sort(key=lambda x: (x["start_time"], x["task_id"]))
+            w_due = _due(w["task_id"])
+            if w_due is not None:
+                w["status"] = "LATE" if win_e > w_due else "ON_TIME"
+            busy[m].append(w)
+            busy[m].sort(key=lambda x: (x["start_time"], x["task_id"]))
+            swapped += 1
+            done = True
+
+    if swapped:
+        logger.info(
+            f"   🔁 Ironing FIFO-swap: {swapped} inversion(s) fixed — earlier-ready "
+            f"slice takes the machine, later-ready blocker re-seated (no order later)."
+        )
+    return swapped

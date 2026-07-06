@@ -52,6 +52,7 @@ from .phases.phase4_downstream import (
     UPSTREAM_OPS,
     Phase4Result,
     balance_downstream_load,
+    fifo_swap_ironing,
     left_shift_cold_ironing,
     left_shift_cold_packing,
     solve_downstream,
@@ -618,6 +619,17 @@ class Pipeline:
             )
             if moved:
                 p4.end_times = {a["task_id"]: a["end_time"] for a in p4.assignments}
+
+        # FIFO-swap: sau left-shift vẫn còn ca một slice ready-TRƯỚC phải chờ vì slice
+        # ready-SAU chiếm đúng cửa sổ máy (left-shift không được dời muộn blocker nên
+        # bó tay).  Swap có guard "không đơn nào muộn đi"; chạy TRƯỚC packing solve
+        # để packing bám theo end mới — vì vậy CHỈ gọi ở đây, không gọi ở các site
+        # re-glue/hole-closing muộn hơn (packing đã chốt ở đó).
+        moved = fifo_swap_ironing(
+            p4.assignments, self.tasks, self.config, end_through_washing,
+        )
+        if moved:
+            p4.end_times = {a["task_id"]: a["end_time"] for a in p4.assignments}
 
         # ── Phase 5: Packing (+ any other downstream op) ──────────────────
         # Packing waits for ironing via end_times (start_lb).  Anything downstream
