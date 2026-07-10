@@ -444,6 +444,31 @@ class Pipeline:
         # Iron/packing below then solve on these (earlier, correct) washing ends.
         p1_wash = (self.reschedule_hint or {}).get("_pass1_washing_full") \
             if self._stabilize_pass else None
+        _mode = "stabilize" if self._stabilize_pass else "reuse-hint"
+        # Re-schedule NGOÀI (Go hint) với workload giặt KHÔNG ĐỔI: reuse nguyên văn
+        # vị trí hint thay vì re-solve.  Re-solve group lớn kẹt FEASIBLE và HOÁN VỊ
+        # các slice thay-thế-được giữa các cycle y nguyên (giữ-nguyên-100% là nghiệm
+        # phạt-0 nhưng solver không tới được) → mỗi re-schedule một hoán vị khác,
+        # chuỗi run không đạt bất động điểm (đo CP_1783648035252240672→..315..:
+        # B đổi 49 task vs hint, A đổi 98, +1 LATE — iron/packing dời theo 1:1).
+        # Reuse giữ washing từng byte; guard/repair dep + merge-only + flush +
+        # left-shift phía dưới VẪN chạy (idempotent: hint đã khít → zero move;
+        # hint lỏng/over-consolidated → vẫn được kéo sớm như trước — không mất
+        # khả năng phục hồi của [[project_washing_reschedule_leftshift_fix]]).
+        # Chỉ áp khi MỌI washing task hiện tại có prev khớp task_id (task giặt
+        # mới → re-solve như cũ) và workload không co (shrink cần compaction).
+        if (
+            p1_wash is None
+            and self.reschedule_hint and not self._stabilize_pass
+            and not self.workload_shrank
+            and self.config.get("enable_washing_reschedule_reuse", True)
+        ):
+            p1_wash = _washing_reuse_from_hint(self.reschedule_hint, p3_tasks)
+            if p1_wash is not None:
+                logger.info(
+                    f"♻️ Phase 3 (reuse-hint): washing workload unchanged — reusing "
+                    f"{len(p1_wash)} hint positions verbatim (no re-solve)."
+                )
         if p1_wash:
             # Dependency guard: pass-1 washing was feasible against PASS-1 linking ends.
             # Pass-2 linking is hard-kept + left-shifted so it should only be equal or
@@ -472,16 +497,16 @@ class Pipeline:
                 )
                 if repaired is not None:
                     logger.info(
-                        f"🩹 Phase 3 (stabilize): {len(_violated)} reused washing "
-                        f"task(s) started before their pass-2 linking dependency "
+                        f"🩹 Phase 3 ({_mode}): {len(_violated)} reused washing "
+                        f"task(s) started before their upstream dependency "
                         f"(e.g. {_violated[0]}) — delayed just their cycle(s); the "
-                        f"rest of the pass-1 layout is kept."
+                        f"rest of the reused layout is kept."
                     )
                     p1_wash = repaired
                 else:
                     logger.warning(
-                        f"⚠️ Phase 3 (stabilize): {len(_violated)} reused washing task(s) "
-                        f"would start before their pass-2 linking dependency "
+                        f"⚠️ Phase 3 ({_mode}): {len(_violated)} reused washing task(s) "
+                        f"would start before their upstream dependency "
                         f"(e.g. {_violated[0]}) and their cycles cannot be re-placed — "
                         f"falling back to a normal washing solve."
                     )
@@ -497,8 +522,8 @@ class Pipeline:
                 end_times={a["task_id"]: int(a["end_time"]) for a in p1_wash},
             )
             logger.info(
-                f"✅ Phase 3 (stabilize): reused {len(p3.assignments)} pass-1 washing "
-                f"assignments (no re-solve — keeps pass-1's compacted layout)"
+                f"✅ Phase 3 ({_mode}): reused {len(p3.assignments)} washing "
+                f"assignments (no re-solve — keeps the previous compacted layout)"
             )
             # Pass-2 linking is left-shifted TIGHTER than pass-1's, so the reused
             # washing gains fold opportunities pass-1 could not see (a slice whose
@@ -1043,6 +1068,65 @@ _PHASE2_OP_SET = {"linking"}
 _PHASE3_OP_SET = {"washing"}
 _PHASE4_OP_SET = {"iron", "ironing"}  # Phase 5 (packing + rest) takes everything else downstream
                                       # (payloads use op "Iron"→"iron"; accept "ironing" too)
+
+
+def _washing_reuse_from_hint(
+    reschedule_hint: Dict[str, Any],
+    p3_tasks: List[Dict[str, Any]],
+) -> Optional[List[Dict[str, Any]]]:
+    """Dựng lại washing assignments NGUYÊN VĂN từ ``previous_assignments`` của một
+    re-schedule hint ngoài (Go), cùng bộ field solve_washing sinh ra.
+
+    Trả None (→ caller re-solve như cũ) khi: không có washing task; BẤT KỲ washing
+    task hiện tại nào thiếu prev khớp task_id / prev thiếu machine/start/end (task
+    giặt mới xuất hiện); hoặc một task pinned có cửa sổ pin LỆCH prev (để solve xử
+    pin chuẩn qua normalize_pinned_window thay vì đoán).
+
+    ``batch_slot_id`` không có trong hint (Go không gửi lại) → tổng hợp
+    ``keep_<start>``: các thành viên một cycle chung (machine, start) nhận cùng
+    slot id, và vì start giữ nguyên run-over-run nên id ổn định — không phá tính
+    bất động điểm.  ``status`` tính lại theo due hiện tại (due có thể đã đổi).
+    """
+    if not p3_tasks:
+        return None
+    prev_by_id = {
+        p["task_id"]: p
+        for p in (reschedule_hint.get("previous_assignments") or [])
+    }
+    out: List[Dict[str, Any]] = []
+    for t in p3_tasks:
+        tid = t["task_id"]
+        p = prev_by_id.get(tid)
+        if (
+            p is None
+            or p.get("machine_id") is None
+            or p.get("start_time") is None
+            or p.get("end_time") is None
+        ):
+            return None  # washing task mới / prev thiếu dữ liệu → re-solve
+        s, e = int(p["start_time"]), int(p["end_time"])
+        if t.get("is_pinned"):
+            ps, pe = t.get("pinned_start_time"), t.get("pinned_end_time")
+            pm = t.get("pinned_machine_id")
+            if (
+                (ps is not None and int(ps) != s)
+                or (pe is not None and int(pe) != e)
+                or (pm and pm != p["machine_id"])
+            ):
+                return None  # pin lệch prev → re-solve xử pin chuẩn
+        due = int(t.get("due_at_min", e + 1) or (e + 1))
+        out.append({
+            "task_id": tid,
+            "machine_id": p["machine_id"],
+            "start_time": s,
+            "end_time": e,
+            "group_id": t.get("group_id", ""),
+            "order_id": t.get("original_order_id", ""),
+            "quantity": t.get("qty", 0),
+            "status": "LATE" if e > due else "ON_TIME",
+            "batch_slot_id": f"keep_{s}",
+        })
+    return out
 
 
 def _repair_reused_washing(
