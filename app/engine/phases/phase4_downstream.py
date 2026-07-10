@@ -29,6 +29,12 @@ from app.engine.shared import (
     extract_results,
     make_solver,
 )
+from .placement import (  # A1a shared helpers
+    earliest_sweep as _earliest_slot,
+    overlaps,
+    relabel_balance,
+    release_from_deps,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -211,20 +217,6 @@ def _compute_start_lb(
     return lb
 
 
-def _earliest_slot(busy: List[tuple], release: int, dur: int) -> int:
-    """Earliest start ≥ release for a `dur`-long task on a serial machine whose occupied
-    intervals are `busy` (sorted list of [s, e)).  Fits into the first gap large enough;
-    falls off the end otherwise."""
-    t = release
-    for s, e in busy:
-        if e <= t:
-            continue          # interval entirely before our candidate
-        if s >= t + dur:
-            break             # gap [t, t+dur) fits before this interval
-        t = max(t, e)         # overlaps → push past it
-    return t
-
-
 def left_shift_cold_ironing(
     assignments: List[Dict[str, Any]],
     all_tasks: List[Dict[str, Any]],
@@ -260,12 +252,7 @@ def left_shift_cold_ironing(
         return 0
 
     def _release(t_id: str) -> int:
-        t = info[t_id]
-        rel = int(t.get("start_after_min", 0))
-        for d in (t.get("final_depends_on") or []):
-            if d in dep_ends:
-                rel = max(rel, int(dep_ends[d]))
-        return rel
+        return release_from_deps(info[t_id], dep_ends)
 
     # Interchangeable iron-machine pool = every compatible machine across the iron tasks
     # (NOT just the ones the solver used — idle-but-compatible machines are exactly where
@@ -357,12 +344,7 @@ def left_shift_cold_packing(
         return 0
 
     def _release(t_id: str) -> int:
-        t = info[t_id]
-        rel = int(t.get("start_after_min", 0))
-        for d in (t.get("final_depends_on") or []):
-            if d in dep_ends:
-                rel = max(rel, int(dep_ends[d]))
-        return rel
+        return release_from_deps(info[t_id], dep_ends)
 
     pool = {a["machine_id"] for a in pack_assigns}
     for a in pack_assigns:
@@ -443,78 +425,14 @@ def balance_downstream_load(
     O(n log n).  Chạy trên cold + stabilize pass (UI nhận lịch cân); KHÔNG chạy
     khi re-schedule thật của Go (phân công thợ là một phần của stability ở đó).
     Mutates `assignments` in place (machine_id).  Returns số task được đổi máy.
+
+    A1a: thân hàm delegate sang ``placement.relabel_balance`` (bản hợp nhất với
+    ``balance_linking_load`` — tương đương fuzz-đối-chiếu trong
+    tests/test_placement_helpers.py).
     """
-    info = {t["task_id"]: t for t in all_tasks}
-    machine_ids = [
-        r["id"] for r in resources if str(r.get("operation", "")).lower() in ops
-    ]
-    if len(machine_ids) < 2:
-        return 0
-    res_by_id = {r["id"]: r for r in resources}
-
-    def _unavail(m_id: str) -> List[Any]:
-        return [
-            (int(w["start"]), int(w["end"]))
-            for w in res_by_id.get(m_id, {}).get("unavailability", []) or []
-            if int(w["end"]) > int(w["start"])
-        ]
-
-    def _avail_at(m_id: str) -> int:
-        return int(res_by_id.get(m_id, {}).get("available_at_min", 0) or 0)
-
-    op_assigns = [
-        a for a in assignments
-        if str(info.get(a["task_id"], {}).get("operation", "")).lower() in ops
-        and a.get("machine_id")
-    ]
-    if len(op_assigns) < 2:
-        return 0
-
-    busy: Dict[str, List[Any]] = {m: list(_unavail(m)) for m in machine_ids}
-    load: Dict[str, int] = {m: 0 for m in machine_ids}
-
-    def _free(m_id: str, s: int, e: int) -> bool:
-        if s < _avail_at(m_id):
-            return False
-        return not any(s < be and e > bs for bs, be in busy[m_id])
-
-    # Pinned tasks are immovable: pre-place them on their current machine.
-    movable: List[Dict[str, Any]] = []
-    for a in op_assigns:
-        t = info.get(a["task_id"], {})
-        if t.get("is_pinned"):
-            m = a["machine_id"]
-            busy.setdefault(m, []).append((a["start_time"], a["end_time"]))
-            load[m] = load.get(m, 0) + (a["end_time"] - a["start_time"])
-        else:
-            movable.append(a)
-
-    changed = 0
-    # Deterministic order: by start, then end, then task_id.
-    for a in sorted(movable, key=lambda x: (x["start_time"], x["end_time"], x["task_id"])):
-        s, e = a["start_time"], a["end_time"]
-        t = info.get(a["task_id"], {})
-        compat = set(t.get("compatible_resource_ids") or []) & set(machine_ids)
-        cands = [m for m in machine_ids if m in compat] if compat else list(machine_ids)
-        eligible = [m for m in cands if _free(m, s, e)]
-        if not eligible:
-            # Keep current machine (must remain feasible there — it was before).
-            m = a["machine_id"]
-        else:
-            m = min(eligible, key=lambda x: (load[x], x))
-        if m != a["machine_id"]:
-            changed += 1
-        a["machine_id"] = m
-        busy.setdefault(m, []).append((s, e))
-        load[m] = load.get(m, 0) + (e - s)
-
-    if changed:
-        used = sum(1 for m in machine_ids if load.get(m, 0) > 0)
-        logger.info(
-            f"⚖️ {label} load-balance: re-assigned {changed} task(s) → "
-            f"{used}/{len(machine_ids)} machines used (timing unchanged)."
-        )
-    return changed
+    return relabel_balance(
+        assignments, all_tasks, resources, config, ops=ops, label=label,
+    )
 
 
 def fifo_swap_ironing(
@@ -533,37 +451,89 @@ def fifo_swap_ironing(
     KHÔNG muộn đi giây nào — nhưng left-shift bị luật monotone cấm (phải dời muộn
     blocker), còn solver kẹt FEASIBLE không tự thấy.
 
+    Với iron, guard "đơn không muộn hơn" dùng PROXY max iron-end của đơn (packing
+    chưa solve).  Gọi MỘT LẦN tại site phase-4, TRƯỚC khi packing solve (packing bám
+    theo end mới); các site muộn hơn (re-glue/hole-closing) KHÔNG gọi vì packing đã
+    chốt, dời muộn iron sẽ gãy chuỗi.  Cơ chế/guard chi tiết: _fifo_swap_downstream.
+    """
+    return _fifo_swap_downstream(
+        assignments, all_tasks, config, dep_ends,
+        ops=("iron", "ironing"),
+        flag="enable_ironing_fifo_swap",
+        label="Ironing",
+        use_due_cap=False,
+    )
+
+
+def fifo_swap_packing(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    dep_ends: Dict[str, int],
+) -> int:
+    """FIFO-swap cho PACKING — cùng cái bẫy iron nhưng ở phase cuối.
+
+    Ca thực đo được (CP_1783586686707912847): P1-WMMkf9wYUm SLICE_1 (51′) ready @643
+    nhưng cả hai cửa sổ trống lúc đó (W_PACKING_01/05) bị các task 3-phút ready-SAU
+    (@667/@649, due 1679 — slack >1000′) chiếm đúng giữa → phải lùi tới 670 → trễ đơn
+    2′; P1-WG9IlBWKGw trễ 3′ cùng cơ chế.  Swap các blocker tí hon ra sau cứu cả hai
+    đơn mà không ai muộn đi.
+
+    AN TOÀN HƠN iron: packing là op CUỐI nên guard "đơn không muộn hơn" dùng đúng
+    max packing-end của đơn (chính là end đơn), không phải proxy; không có hạ nguồn
+    nào phải bám theo.  Gọi sau left_shift_cold_packing trong _solve_phases_4_5.
+    """
+    return _fifo_swap_downstream(
+        assignments, all_tasks, config, dep_ends,
+        ops=("pack", "packing"),
+        flag="enable_packing_fifo_swap",
+        label="Packing",
+        use_due_cap=True,
+    )
+
+
+def _fifo_swap_downstream(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    dep_ends: Dict[str, int],
+    *,
+    ops: tuple,
+    flag: str,
+    label: str,
+    use_due_cap: bool,
+) -> int:
+    """Core FIFO-swap dùng chung cho iron/packing (A1a-style: một bản, tham số hoá).
+
     Cơ chế: với mỗi task w đang CHỜ (start > release), thử đặt w tại release trên một
     máy tương thích; tập blocker B = các task chồng cửa sổ đó.  Chỉ nhận swap khi MỌI
     blocker t ∈ B:
       * không pinned và release_t > release_w (đúng nghĩa inversion — t đến sau);
-      * re-seat được tại slot trống sớm nhất ≥ release_t sao cho:
-          - end mới của t ≤ end CŨ của w (nhóm task liên quan không dài ra),
-          - end mới của t ≤ max iron-end hiện tại của ĐƠN t (đơn nó không muộn hơn),
-          - t không chuyển từ ON_TIME sang LATE.
-    → không đơn nào muộn đi theo cấu trúc; w chỉ sớm lên.  Gọi MỘT LẦN tại site
-    phase-4, TRƯỚC khi packing solve (packing bám theo end mới); các site muộn hơn
-    (re-glue/hole-closing) KHÔNG gọi vì packing đã chốt, dời muộn iron sẽ gãy chuỗi.
+      * re-seat được tại slot trống sớm nhất ≥ release_t sao cho end mới của t
+        ≤ end CŨ của w (nhóm task liên quan không dài ra) VÀ:
+          - use_due_cap=False (iron): new_e ≤ max end hiện tại của ĐƠN t trong phase
+            (proxy — packing chưa solve, không so due được) và t không chuyển từ
+            ON_TIME sang LATE;
+          - use_due_cap=True (packing, op CUỐI): new_e ≤ DUE của t — end đơn = max
+            packing-end nên tardiness đơn không tăng và không task nào lật LATE;
+            proxy iron ở đây từ chối oan blocker mà đơn nó chỉ có một packing task
+            (case CP_1783586686707912847).  Không có due → rơi về proxy như iron.
+    → không đơn nào muộn đi theo cấu trúc; w chỉ sớm lên.
     Deterministic; mutates in place; trả về số cặp swap đã nhận.
     """
-    if not config.get("enable_ironing_fifo_swap", True):
+    if not config.get(flag, True):
         return 0
     info = {t["task_id"]: t for t in all_tasks}
-    iron_ids = {
+    op_ids = {
         t["task_id"] for t in all_tasks
-        if str(t.get("operation", "")).lower() in ("iron", "ironing")
+        if str(t.get("operation", "")).lower() in ops
     }
-    iron_assigns = [a for a in assignments if a["task_id"] in iron_ids]
+    iron_assigns = [a for a in assignments if a["task_id"] in op_ids]
     if len(iron_assigns) < 2:
         return 0
 
     def _release(t_id: str) -> int:
-        t = info[t_id]
-        rel = int(t.get("start_after_min", 0) or 0)
-        for d in (t.get("final_depends_on") or []):
-            if d in dep_ends:
-                rel = max(rel, int(dep_ends[d]))
-        return rel
+        return release_from_deps(info[t_id], dep_ends)
 
     def _due(t_id: str) -> Optional[int]:
         v = info.get(t_id, {}).get("due_at_min")
@@ -605,7 +575,8 @@ def fifo_swap_ironing(
             win_s, win_e = w_rel, w_rel + w_dur
             blockers = [
                 t for t in busy[m]
-                if t is not w and int(t["start_time"]) < win_e and int(t["end_time"]) > win_s
+                if t is not w
+                and overlaps(int(t["start_time"]), int(t["end_time"]), win_s, win_e)
             ]
             if not blockers:
                 continue  # cửa sổ trống — việc của left-shift, không phải swap
@@ -642,9 +613,19 @@ def fifo_swap_ironing(
                 new_e = new_s + t_dur
                 o = t.get("order_id") or t["task_id"]
                 t_due = _due(t["task_id"])
-                if (new_e > w_old_end
+                if use_due_cap:
+                    bad = (
+                        new_e > w_old_end
+                        or (t_due is not None and new_e > t_due)
+                        or (t_due is None and new_e > order_max_end.get(o, new_e))
+                    )
+                else:
+                    bad = (
+                        new_e > w_old_end
                         or new_e > order_max_end.get(o, new_e)
-                        or (t_due is not None and int(t["end_time"]) <= t_due < new_e)):
+                        or (t_due is not None and int(t["end_time"]) <= t_due < new_e)
+                    )
+                if bad:
                     ok = False
                     break
                 occupied[new_m].append((new_s, new_e))
@@ -673,7 +654,7 @@ def fifo_swap_ironing(
 
     if swapped:
         logger.info(
-            f"   🔁 Ironing FIFO-swap: {swapped} inversion(s) fixed — earlier-ready "
+            f"   🔁 {label} FIFO-swap: {swapped} inversion(s) fixed — earlier-ready "
             f"slice takes the machine, later-ready blocker re-seated (no order later)."
         )
     return swapped

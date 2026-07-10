@@ -31,6 +31,11 @@ from app.engine.shared import (
     extract_results,
     make_solver,
 )
+from .placement import (  # A1a shared helpers
+    bump_earliest,
+    earliest_candidates,
+    earliest_sweep as _earliest_gap,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1011,17 +1016,21 @@ def _earliest_nonfrag_start(
     placed intervals are `placed` (list of (s, e, order), sorted by s), such that the
     task (a) does not overlap any existing interval and (b) does NOT increase the
     machine's order-reentry (A…B…A) count — so spreading never fragments an order or
-    splits another order's run.  Returns None if no such start exists."""
+    splits another order's run.  Returns None if no such start exists.
+
+    A1a: thân hàm delegate sang ``placement.earliest_candidates`` với hook
+    ``accept`` = guard re-entry (tương đương fuzz-đối-chiếu trong
+    tests/test_placement_helpers.py)."""
     base_re = _reentries([o for _, _, o in placed])
-    candidates = sorted({release} | {e for _, e, _ in placed if e >= release})
-    for cs in candidates:
-        ce = cs + dur
-        if any(s < ce and e > cs for s, e, _ in placed):  # overlaps an interval
-            continue
+
+    def _no_new_reentry(cs: int, ce: int) -> bool:
         merged = sorted(placed + [(cs, ce, order)])
-        if _reentries([o for _, _, o in merged]) <= base_re:
-            return cs
-    return None
+        return _reentries([o for _, _, o in merged]) <= base_re
+
+    return earliest_candidates(
+        [(s, e) for s, e, _ in placed], release, dur,
+        accept=_no_new_reentry,
+    )
 
 
 def spread_cold_knitting(
@@ -1146,19 +1155,6 @@ def spread_cold_knitting(
             f"feasible compatible machines (parallelised serial tails, downstream untouched)."
         )
     return moved
-
-
-def _earliest_gap(busy: List[tuple], release: int, dur: int) -> int:
-    """Earliest start ≥ release for a `dur`-long task on a serial machine whose occupied
-    intervals are `busy` (sorted [s, e)); fits the first big-enough gap, else appends."""
-    t = release
-    for s, e in busy:
-        if e <= t:
-            continue
-        if s >= t + dur:
-            break
-        t = max(t, e)
-    return t
 
 
 def balance_cold_knitting(
@@ -1512,6 +1508,184 @@ def reorder_contiguous_knitting(
     return {"start": new_start, "end": new_end}
 
 
+def _yarn_key(task: Dict[str, Any]) -> tuple:
+    """Setup-comparison key for the yarn/creel state a knitting task needs.
+
+    `color_config` is the Go-side YarnConfig string `SỢI:SỐ_CUỘN` (multi-yarn
+    `A:2|B:1`) — two tasks with the same string need the SAME creel setup, so
+    running them back-to-back costs no changeover.  Go sometimes sends a lookup
+    error sentence instead of data ("No yarn requirements found for this design
+    and color." — observed on 205/312 tasks of real payloads), and the machine
+    field is sometimes a bare colour name; NEVER compare those raw (all broken
+    tasks would "match" each other across colours).  A real config always
+    contains ':', so anything without one falls back to (color, substance) —
+    the same key washing compatibility uses.
+    """
+    cc = str(task.get("color_config") or "").strip()
+    if ":" in cc:
+        return ("cfg", cc)
+    return ("fallback", str(task.get("color") or ""), str(task.get("substance") or ""))
+
+
+def _yarn_reentries(keys: List[tuple]) -> int:
+    """Number of extra runs: a yarn config appearing in ≥2 separate runs of this
+    time-ordered key sequence means the machine was set up for it, switched away,
+    and had to be re-set — each such return is one avoidable double changeover."""
+    runs: List[tuple] = []
+    for k in keys:
+        if not runs or runs[-1] != k:
+            runs.append(k)
+    return len(runs) - len(set(runs))
+
+
+def repair_yarn_config_reentry(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """COLD-only candidate: kill A→B→A yarn-config re-entries on knitting machines.
+
+    Rule (user 2026-07-09): interleaving orders on a machine is fine ONLY between
+    tasks with the same yarn config (`color_config`, SỢI:SỐ_CUỘN) — returning to a
+    config the machine already left means tearing the creel down and setting it up
+    again.  The solver has no objective term for adjacent-task config, so slack-due
+    filler slices land after a different-config block while same-config machines
+    sit idle (measured CP_1783583062535099757: 6 machines went :2 → :5 → :2 though
+    5+ machines still in :2 state had finished — 12 avoidable creel changes).
+
+    For each re-entry run (a maximal same-config run whose config already appeared
+    earlier on that machine), relocate the WHOLE run — atomically, else not at all —
+    appending each task to a compatible machine whose current tail has the SAME
+    yarn config (or which is empty).  Appending after a matching tail can never
+    create a new re-entry on the target.
+
+    Guards (per task, before any commit):
+      * pinned/in-progress runs are immovable;
+      * new_end ≤ max(baseline end, due − downstream_chain_min) — a tight or late
+        task is never pushed past its baseline (same cap as the contiguity reorder);
+      * new_end ≤ the layout's knitting makespan — never extends the tail;
+      * whole-candidate `_knitting_workforce_ok` + strict global re-entry decrease.
+
+    NOT monotone (moved tasks start later), so the caller runs it as a relayout
+    candidate: phases 2–5 are re-solved and it is accepted only if total lateness
+    does not rise (`Pipeline._try_knitting_relayout`).  The source-machine hole is
+    compacted by the left-shift that already follows an accepted relayout.
+    Deterministic: runs by (machine, start); targets by (earliest start, machine).
+    Returns {"start", "end", "machine"} over ALL knitting tasks, or None.
+    """
+    info = {t["task_id"]: t for t in all_tasks}
+    knit = [a for a in assignments
+            if str(info.get(a["task_id"], {}).get("operation", "")).lower() == "knitting"]
+    if len(knit) < 2:
+        return None
+
+    key_of = {a["task_id"]: _yarn_key(info[a["task_id"]]) for a in knit}
+    busy: Dict[str, List[List[Any]]] = {}
+    for a in knit:
+        busy.setdefault(a["machine_id"], []).append(
+            [int(a["start_time"]), int(a["end_time"]), a["task_id"]]
+        )
+    for m in busy:
+        busy[m].sort()
+
+    def _machine_keys(m: str) -> List[tuple]:
+        return [key_of[tid] for _, _, tid in busy[m]]
+
+    base_reent = sum(_yarn_reentries(_machine_keys(m)) for m in busy)
+    if base_reent == 0:
+        return None
+
+    # Per-task latest safe end — identical cap to reorder_contiguous_knitting: a
+    # task at/past (due − chain) keeps its baseline end as the bound, so a tight
+    # or late task never moves later; the pipeline-wide verify is the real gate.
+    chain_min = _compute_downstream_chain_min(all_tasks)
+    cap: Dict[str, int] = {}
+    for a in knit:
+        tid = a["task_id"]
+        due = int(info[tid].get("due_at_min", 0) or 0)
+        safe = (due - int(chain_min.get(tid, 0))) if due else 10**15
+        cap[tid] = max(int(a["end_time"]), safe)
+    knit_makespan = max(int(a["end_time"]) for a in knit)
+
+    # Offending runs: maximal same-key runs whose key already ran earlier on the
+    # machine.  Deterministic order: (machine, run start).
+    offending: List[tuple] = []
+    for m in sorted(busy):
+        seen: set = set()
+        run: List[List[Any]] = []
+        for iv in busy[m] + [[None, None, None]]:  # sentinel flushes last run
+            if run and (iv[2] is None or key_of[iv[2]] != key_of[run[0][2]]):
+                k = key_of[run[0][2]]
+                if k in seen:
+                    offending.append((m, list(run)))
+                seen.add(k)
+                run = []
+            if iv[2] is not None:
+                run.append(iv)
+
+    new_pos: Dict[str, tuple] = {}  # tid → (machine, start, end)
+    for m, run in offending:
+        if any(info[tid].get("is_pinned") for _, _, tid in run):
+            continue
+        staged: List[tuple] = []
+        ok = True
+        for s0, e0, tid in run:
+            dur = e0 - s0
+            rel = int(info[tid].get("start_after_min", 0) or 0)
+            k = key_of[tid]
+            compat = set(info[tid].get("compatible_resource_ids") or [])
+            best = None  # (start, machine)
+            for m2 in sorted(busy):
+                if m2 == m or (compat and m2 not in compat):
+                    continue
+                tail = busy[m2][-1] if busy[m2] else None
+                if tail is not None and key_of[tail[2]] != k:
+                    continue  # different config at the tail → would just move the churn
+                st = max(tail[1] if tail else 0, rel)
+                if st + dur > cap[tid] or st + dur > knit_makespan:
+                    continue
+                if best is None or (st, m2) < best:
+                    best = (st, m2)
+            if best is None:
+                ok = False
+                break
+            st, m2 = best
+            busy[m2].append([st, st + dur, tid])  # later tasks of the run stack after
+            staged.append((tid, m2, st, st + dur))
+        if not ok:
+            for tid, m2, st, en in staged:
+                busy[m2].remove([st, en, tid])
+            continue
+        for tid, m2, st, en in staged:
+            busy[m] = [iv for iv in busy[m] if iv[2] != tid]
+            new_pos[tid] = (m2, st, en)
+
+    if not new_pos:
+        return None
+
+    cand_reent = sum(_yarn_reentries(_machine_keys(m)) for m in busy)
+    if cand_reent >= base_reent:
+        return None
+
+    new_start = {a["task_id"]: int(a["start_time"]) for a in knit}
+    new_end = {a["task_id"]: int(a["end_time"]) for a in knit}
+    new_machine = {a["task_id"]: a["machine_id"] for a in knit}
+    for tid, (m2, st, en) in new_pos.items():
+        new_start[tid], new_end[tid], new_machine[tid] = st, en, m2
+
+    knitting_tasks = [t for t in all_tasks
+                      if str(t.get("operation", "")).lower() in ("knitting", "capacity_block")]
+    if not _knitting_workforce_ok(new_start, new_end, knitting_tasks, config):
+        logger.info("🧶 Yarn-config repair: candidate exceeds workforce cap — skipped.")
+        return None
+
+    logger.info(
+        f"🧶 Yarn-config repair: candidate moves {len(new_pos)} task(s) to same-config "
+        f"machines, config re-entries {base_reent}→{cand_reent} — verifying downstream…"
+    )
+    return {"start": new_start, "end": new_end, "machine": new_machine}
+
+
 def _panel_index(task_id: str) -> int:
     """Trailing _<int> of a knitting batch id (BATCH_0-641_7 → 7); 0 if none."""
     tail = task_id.rsplit("_", 1)[-1]
@@ -1695,16 +1869,10 @@ def parallelize_component_pos(
             # back-fill được vào chính cửa sổ mình vừa nhả (CP_1783308395880305537:
             # 649–651 bị văng 152→9841, lật LATE → gate reject cả 4 garment).  Vòng
             # bump-past-overlap tự hội tụ về gap sớm nhất đủ dur, nên bỏ tail là đủ
-            # để back-fill.
-            st = max(release, avail_at.get(m, 0))
-            moved = True
-            while moved:
-                moved = False
-                for ws, we in fixed_busy.get(m, []):
-                    if st < we and st + dur > ws:
-                        st = we
-                        moved = True
-            return st
+            # để back-fill.  (A1a: vòng bump = placement.bump_earliest, nguyên văn.)
+            return bump_earliest(
+                fixed_busy.get(m, []), max(release, avail_at.get(m, 0)), dur,
+            )
 
         new_start = {}
         new_end = {}
@@ -1783,13 +1951,9 @@ def parallelize_component_pos(
                     st = _machine_earliest(m, release, dur)
                     guard = 0
                     while dur > 0 and not _occ_fits(st, st + dur):
-                        st = _next_release(st)
-                        moved = True
-                        while moved:
-                            moved = False
-                            for ws, we in fixed_busy.get(m, []):
-                                if st < we and st + dur > ws:
-                                    st = we; moved = True
+                        st = bump_earliest(
+                            fixed_busy.get(m, []), _next_release(st), dur,
+                        )
                         guard += 1
                         if guard > 100000:
                             ok = False; break

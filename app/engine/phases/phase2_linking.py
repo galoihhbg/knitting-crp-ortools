@@ -26,6 +26,12 @@ from app.engine.shared import (
     extract_results,
     make_solver,
 )
+from .placement import (  # A1a shared helpers
+    avail_at,
+    earliest_sweep,
+    relabel_balance,
+    unavail_windows,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,78 +66,15 @@ def balance_linking_load(
     Pinned linking (đang chạy) là mỏ neo bất động — giữ nguyên máy.  Deterministic
     O(n log n).  KHÔNG chạy khi re-schedule (máy là một phần của stability ở đó).
     Mutates `assignments` in place (machine_id).  Returns số task được đổi máy.
+
+    A1a: thân hàm delegate sang ``placement.relabel_balance`` (bản hợp nhất với
+    ``balance_downstream_load`` — tương đương fuzz-đối-chiếu trong
+    tests/test_placement_helpers.py).
     """
-    info = {t["task_id"]: t for t in all_tasks}
-    link_machine_ids = [
-        r["id"] for r in resources if r.get("operation", "").lower() in PHASE2_OPS
-    ]
-    if len(link_machine_ids) < 2:
-        return 0
-    res_by_id = {r["id"]: r for r in resources}
-
-    def _unavail(m_id: str) -> List[Any]:
-        return [
-            (int(w["start"]), int(w["end"]))
-            for w in res_by_id.get(m_id, {}).get("unavailability", []) or []
-            if int(w["end"]) > int(w["start"])
-        ]
-
-    def _avail_at(m_id: str) -> int:
-        return int(res_by_id.get(m_id, {}).get("available_at_min", 0) or 0)
-
-    link_assigns = [
-        a for a in assignments
-        if info.get(a["task_id"], {}).get("operation", "").lower() in PHASE2_OPS
-        and a.get("machine_id")
-    ]
-    if len(link_assigns) < 2:
-        return 0
-
-    busy: Dict[str, List[Any]] = {m: list(_unavail(m)) for m in link_machine_ids}
-    load: Dict[str, int] = {m: 0 for m in link_machine_ids}
-
-    def _free(m_id: str, s: int, e: int) -> bool:
-        if s < _avail_at(m_id):
-            return False
-        return not any(s < be and e > bs for bs, be in busy[m_id])
-
-    # Pinned linking tasks are immovable: pre-place them on their current machine.
-    movable: List[Dict[str, Any]] = []
-    for a in link_assigns:
-        t = info.get(a["task_id"], {})
-        if t.get("is_pinned"):
-            m = a["machine_id"]
-            busy.setdefault(m, []).append((a["start_time"], a["end_time"]))
-            load[m] = load.get(m, 0) + (a["end_time"] - a["start_time"])
-        else:
-            movable.append(a)
-
-    changed = 0
-    # Deterministic order: by start, then end, then task_id.
-    for a in sorted(movable, key=lambda x: (x["start_time"], x["end_time"], x["task_id"])):
-        s, e = a["start_time"], a["end_time"]
-        t = info.get(a["task_id"], {})
-        compat = set(t.get("compatible_resource_ids") or []) & set(link_machine_ids)
-        cands = [m for m in link_machine_ids if m in compat] if compat else list(link_machine_ids)
-        eligible = [m for m in cands if _free(m, s, e)]
-        if not eligible:
-            # Keep current machine (must remain feasible there — it was before).
-            m = a["machine_id"]
-        else:
-            m = min(eligible, key=lambda x: (load[x], x))
-        if m != a["machine_id"]:
-            changed += 1
-        a["machine_id"] = m
-        busy.setdefault(m, []).append((s, e))
-        load[m] = load.get(m, 0) + (e - s)
-
-    if changed:
-        used = sum(1 for m in link_machine_ids if load.get(m, 0) > 0)
-        logger.info(
-            f"⚖️ Linking load-balance: re-assigned {changed} task(s) → "
-            f"{used}/{len(link_machine_ids)} machines used (timing unchanged)."
-        )
-    return changed
+    return relabel_balance(
+        assignments, all_tasks, resources, config,
+        ops=frozenset(PHASE2_OPS), label="Linking",
+    )
 
 
 def left_shift_cold_linking(
@@ -172,14 +115,10 @@ def left_shift_cold_linking(
     res_by_id = {r["id"]: r for r in resources}
 
     def _unavail(m_id: str):
-        return [
-            (int(w["start"]), int(w["end"]))
-            for w in (res_by_id.get(m_id, {}).get("unavailability") or [])
-            if int(w["end"]) > int(w["start"])
-        ]
+        return unavail_windows(res_by_id.get(m_id, {}))
 
     def _avail_at(m_id: str) -> int:
-        return int(res_by_id.get(m_id, {}).get("available_at_min", 0) or 0)
+        return avail_at(res_by_id.get(m_id, {}))
 
     # Current upstream knitting timing (post knitting left-shift/spread) for the lb.
     k_start = {a["task_id"]: int(a["start_time"]) for a in assignments}
@@ -279,15 +218,6 @@ def left_shift_cold_linking(
     for m in placed:
         placed[m].sort()
 
-    def _earliest(plist: List[tuple], release: int, dur: int) -> int:
-        cur = release
-        for s, e in plist:
-            if s >= cur + dur:
-                return cur
-            if e > cur:
-                cur = e
-        return cur
-
     cur_m = dict(orig_m)
     cur_s = dict(orig_s)
     free = sorted(
@@ -307,7 +237,7 @@ def left_shift_cold_linking(
 
         best_m, best_s = orig_m[t_id], orig_s[t_id]  # guaranteed-available fallback
         for m in sorted(compat):
-            s = _earliest(placed.get(m, []), max(release, _avail_at(m)), dur)
+            s = earliest_sweep(placed.get(m, []), max(release, _avail_at(m)), dur)
             if s < best_s or (s == best_s and m < best_m):
                 best_m, best_s = m, s
 

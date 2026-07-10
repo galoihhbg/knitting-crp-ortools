@@ -28,6 +28,7 @@ from .phases.phase1_knitting import (
     left_shift_cold_knitting,
     parallelize_component_pos,
     reorder_contiguous_knitting,
+    repair_yarn_config_reentry,
     solve_knitting,
     spread_cold_knitting,
 )
@@ -53,6 +54,7 @@ from .phases.phase4_downstream import (
     Phase4Result,
     balance_downstream_load,
     fifo_swap_ironing,
+    fifo_swap_packing,
     left_shift_cold_ironing,
     left_shift_cold_packing,
     solve_downstream,
@@ -188,7 +190,7 @@ class Pipeline:
         p3, p4, p5 = chain
 
         # ── Knitting relayout refinement (cold solve only) ────────────────
-        # ONE verified pass combining two knitting-layout transforms that share a
+        # ONE verified pass combining three knitting-layout transforms that share a
         # SINGLE phases-2–5 re-solve (instead of one re-solve each):
         #   1. parallel component-PO — the solver may knit a garment's component POs
         #      (front 0-641 / back 0-642) SERIALLY, so the first complete panel isn't
@@ -198,12 +200,17 @@ class Pipeline:
         #   2. order-contiguity — the solver stalls at FEASIBLE so its secondary
         #      contiguity term never optimises; re-sequence each machine so an order's
         #      tasks run contiguously ("dứt điểm đơn đó").
-        # Neither is monotone (both can push a yielding order later), so the merged
+        #   3. yarn-config re-entry repair — a slack-due filler task dropped after a
+        #      different-config block forces the machine back into a yarn config it
+        #      already left (:2→:5→:2 = double creel change); move it to a compatible
+        #      machine whose tail already holds that config.
+        # None of these is monotone (each can push a yielding order later), so the merged
         # candidate is re-solved (cheaper verify budget) and accepted ONLY if total
         # pipeline lateness does not increase.
         if not self.reschedule_hint and (
             self.config.get("enable_knitting_parallel_pos", True)
             or self.config.get("enable_knitting_contiguity_reorder", False)
+            or self.config.get("enable_knitting_yarn_config_repair", True)
         ):
             refined = self._try_knitting_relayout(
                 p2_tasks, all_resources, global_horizon, p1, p2, p3, p4, p5,
@@ -663,6 +670,18 @@ class Pipeline:
             if moved:
                 p5.end_times = {a["task_id"]: a["end_time"] for a in p5.assignments}
 
+        # FIFO-swap packing: sau left-shift vẫn còn ca một slice ready-TRƯỚC phải chờ
+        # vì task ready-SAU chiếm đúng cửa sổ máy (CP_1783586686707912847: 2 đơn trễ
+        # 2-3 phút vì các task 3-phút slack >1000' chiếm giữa cửa sổ; left-shift bị
+        # luật monotone cấm dời blocker).  Packing là op CUỐI nên guard dùng thẳng
+        # DUE của blocker (không cần proxy như iron) và không có hạ nguồn phải bám
+        # theo — gọi ở đây là chốt.
+        moved = fifo_swap_packing(
+            p5.assignments, self.tasks, self.config, all_end_times_iron,
+        )
+        if moved:
+            p5.end_times = {a["task_id"]: a["end_time"] for a in p5.assignments}
+
         return p4, p5
 
     def _total_lateness(self, ends: Dict[str, int]) -> Tuple[int, int]:
@@ -786,19 +805,21 @@ class Pipeline:
         p4: "Phase4Result",
         p5: "Phase4Result",
     ):
-        """ONE verified knitting-relayout pass that COMBINES two candidate transforms,
+        """ONE verified knitting-relayout pass that COMBINES three candidate transforms,
         so they share a SINGLE phases-2–5 re-solve instead of one each:
 
           1. parallel component-PO  — dedicate machines per component PO so a garment's
              POs knit in parallel (first panel ready sooner; feeds linking early).
           2. order-contiguity        — re-sequence each machine so an order's tasks run
              contiguously (no A→B→A interleave).
+          3. yarn-config repair      — move tasks that force a machine back into a yarn
+             config it already left onto a machine whose tail matches their config.
 
-        (2) runs ON TOP of (1)'s layout, then the merged candidate is re-solved through
-        phases 2–5 (on the cheaper ``_verify_config`` budget) and accepted ONLY if total
-        pipeline lateness (Σ tardiness AND late-order count) does not increase.  Either
-        transform alone, both, or neither may apply.  Returns the refined phase results
-        or None (keep the solver plan)."""
+        (2) runs ON TOP of (1)'s layout and (3) on the merge of both, then the merged
+        candidate is re-solved through phases 2–5 (on the cheaper ``_verify_config``
+        budget) and accepted ONLY if total pipeline lateness (Σ tardiness AND late-order
+        count) does not increase.  Any subset of the transforms may apply.  Returns the
+        refined phase results or None (keep the solver plan)."""
         info = {t["task_id"]: t for t in self.tasks}
 
         cand_p = (
@@ -825,8 +846,6 @@ class Pipeline:
             reorder_contiguous_knitting(interim, self.tasks, self.config)
             if self.config.get("enable_knitting_contiguity_reorder", False) else None
         )
-        if cand_p is None and cand_c is None:
-            return None
 
         # Merge: machine + times from the parallel layout, then overlay contiguity times.
         final_start: Dict[str, int] = {}
@@ -843,6 +862,31 @@ class Pipeline:
         if cand_c is not None:
             final_start.update(cand_c["start"])
             final_end.update(cand_c["end"])  # machine unchanged by per-machine reorder
+
+        # 3. yarn-config re-entry repair — runs on the MERGED layout (it needs the
+        #    final per-machine sequences): relocate slack-due tasks that force a
+        #    machine back into a yarn config it already left (:2→:5→:2) onto a
+        #    compatible machine whose tail holds the matching config.
+        cand_y = None
+        if self.config.get("enable_knitting_yarn_config_repair", True):
+            merged: List[Dict[str, Any]] = []
+            for a in interim:
+                tid = a["task_id"]
+                if tid in final_start:
+                    b = dict(a)
+                    b["start_time"] = final_start[tid]
+                    b["end_time"] = final_end[tid]
+                    b["machine_id"] = final_machine[tid]
+                    merged.append(b)
+                else:
+                    merged.append(a)
+            cand_y = repair_yarn_config_reentry(merged, self.tasks, self.config)
+        if cand_p is None and cand_c is None and cand_y is None:
+            return None
+        if cand_y is not None:
+            final_start.update(cand_y["start"])
+            final_end.update(cand_y["end"])
+            final_machine.update(cand_y["machine"])
 
         p1b = self._rebuild_p1_from_knitting(p1, final_start, final_end, final_machine)
 
@@ -888,7 +932,11 @@ class Pipeline:
             )
             return None
         what = "+".join(
-            x for x in (("parallel-PO" if cand_p else None), ("contiguity" if cand_c else None)) if x
+            x for x in (
+                ("parallel-PO" if cand_p else None),
+                ("contiguity" if cand_c else None),
+                ("yarn-config" if cand_y else None),
+            ) if x
         )
         logger.info(
             f"✨ Knitting relayout ACCEPTED ({what}): Σ lateness {base_late}→{cand_late}, "

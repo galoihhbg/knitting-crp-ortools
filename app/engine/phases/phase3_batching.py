@@ -35,6 +35,11 @@ from app.engine.shared import (
     extract_results,
     make_solver,
 )
+from .placement import (  # A1a shared helpers
+    earliest_candidates,
+    overlaps,
+    release_from_deps,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1386,7 +1391,7 @@ def flush_unwashed_end_of_shift(
 
     def _free(machine: str, s: int, e: int) -> bool:
         for (bs, be) in machine_busy.get(machine, ()):
-            if s < be and bs < e:  # overlap
+            if overlaps(s, e, bs, be):
                 return False
         return True
 
@@ -1400,8 +1405,8 @@ def flush_unwashed_end_of_shift(
         t = info[tid]
         if t.get("is_pinned"):
             continue
-        deps = [end_of[d] for d in (t.get("final_depends_on") or []) if d in end_of]
-        ready = max(deps) if deps else 0
+        # Quirk giữ nguyên: ready washing bỏ qua start_after_min (như bản gốc).
+        ready = release_from_deps(t, end_of, include_start_after=False)
         T = next((b for b in bounds if b > ready), None)
         if T is None:
             continue
@@ -1537,9 +1542,10 @@ def left_shift_cold_washing(
 
     ready_of: Dict[str, int] = {}
     for a in wash_assigns:
-        t = info[a["task_id"]]
-        deps = [end_of[d] for d in (t.get("final_depends_on") or []) if d in end_of]
-        ready_of[a["task_id"]] = max(deps) if deps else 0
+        # Quirk giữ nguyên: ready washing bỏ qua start_after_min (như bản gốc).
+        ready_of[a["task_id"]] = release_from_deps(
+            info[a["task_id"]], end_of, include_start_after=False,
+        )
 
     def _qty(a: Dict[str, Any]) -> float:
         return float(a.get("quantity", info[a["task_id"]].get("qty", 0)) or 0)
@@ -1628,25 +1634,14 @@ def left_shift_cold_washing(
     def _straddles(s: int, e: int) -> bool:
         return any(s < b < e for b in bounds)
 
-    def _free(m: str, s: int, e: int) -> bool:
-        for (bs, be) in machine_busy.get(m, ()):
-            if s < be and bs < e:
-                return False
-        return True
-
     def _earliest(m: str, release: int, dur: int, limit: int) -> Optional[int]:
         """Earliest s ≥ release with [s, s+dur] free, boundary-safe, and s < limit."""
-        cands = {release}
-        for (bs, be) in machine_busy.get(m, ()):
-            cands.add(be)
-        for b in bounds:
-            cands.add(b)  # start exactly at a break → next shift
-        for s in sorted(c for c in cands if release <= c < limit):
-            if _straddles(s, s + dur):
-                continue
-            if _free(m, s, s + dur):
-                return s
-        return None
+        return earliest_candidates(
+            list(machine_busy.get(m, ())), release, dur,
+            extra_candidates=bounds,  # start exactly at a break → next shift
+            limit=limit,
+            accept=lambda s, e: not _straddles(s, e),
+        )
 
     # Free-window pass: rescue tasks still stranded after the merge pass (no earlier
     # cycle had room / matching group) by pulling them into an earlier idle gap.
