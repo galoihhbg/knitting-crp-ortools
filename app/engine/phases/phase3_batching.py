@@ -261,11 +261,14 @@ def _solve_group(
             K = min(K, int(max_k))
         K = max(1, K)
 
-    # Tier-1: K auto-cap — reduce K toward min_batches to stay within budget.
-    # Only effective when K has slack above min_batches; safe because min_batches
-    # is the theoretical minimum for feasibility.
+    # Tier-1: K auto-cap — reduce K to stay within budget, but NEVER below the
+    # min_batches+2 safety floor (bounded by n).  min_batches chỉ là tối thiểu
+    # SỐ HỌC: cắt về đó là zero-slack bin-packing, cộng ma sát (release rải,
+    # co-location gate theo deadline, ranh giới ca) làm solver hết det-budget ở
+    # UNKNOWN → fallback drop cả nhóm (CP_1783650446710927481: K 33→31 →
+    # UNKNOWN 18s → 331 wash task CAPACITY_FULL → job infeasible).
     if K > 0 and n * K > _BOOLVAR_BUDGET:
-        K_capped = max(min_batches, _BOOLVAR_BUDGET // max(1, n))
+        K_capped = max(min(n, min_batches + 2), _BOOLVAR_BUDGET // max(1, n))
         if K_capped < K:
             logger.info(
                 f"   💡 Group {group_key}: K {K}→{K_capped} "

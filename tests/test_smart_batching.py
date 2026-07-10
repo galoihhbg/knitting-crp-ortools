@@ -576,3 +576,96 @@ def test_large_group_triggers_chunking_no_machine_conflict():
                 f"Machine {m_id} at t={tp}: demand={demand} > capacity={batch_cap} — "
                 "cross-chunk machine conflict (handoff not working)"
             )
+
+
+def _tier1_tasks(n: int, qty: float) -> List[Dict[str, Any]]:
+    return [
+        {
+            **_make_washing_task(f"W{i}", f"ORD_{i}", 60, 5000, ["WM_00"]),
+            "qty": qty,
+            "color": "red",
+            "substance": "cotton",
+        }
+        for i in range(n)
+    ]
+
+
+def test_tier1_cap_never_strips_kfloor_slack(caplog):
+    """
+    Regression CP_1783650446710927481: Tier-1 BoolVar auto-cap used to cut K
+    down to min_batches, stripping the +2 slack the K-floor guarantees.  The
+    resulting zero-slack bin-packing timed out (UNKNOWN) and the fallback
+    dropped the whole group → job infeasible.
+
+    Setup mirrors the real payload at test scale: 40 tasks × qty 10, capacity
+    50 → min_batches=8, K=10 (floor).  Budget 300 < 40×10=400 triggers Tier-1,
+    and chunk_size=√(300×50)≈122 > 40 keeps Tier-2 off (same as production:
+    331 tasks < 500).  Old code capped K to max(8, 300//40=7)=8 (zero slack);
+    fixed code must keep K at the min_batches+2 floor.
+    """
+    import logging
+    import app.engine.phases.phase3_batching as p3mod
+    from app.engine.phases.phase3_batching import solve_washing
+
+    original_budget = p3mod._BOOLVAR_BUDGET
+    try:
+        p3mod._BOOLVAR_BUDGET = 300
+        with caplog.at_level(logging.INFO, logger="app.engine.phases.phase3_batching"):
+            result = solve_washing(
+                tasks=_tier1_tasks(40, 10.0),
+                resources=[_make_resource("WM_00")],
+                config=_make_config(washing_batch_capacity=50, max_search_time=30),
+                p2_end_times={},
+                shift_ends=[],
+                horizon=5000,
+            )
+    finally:
+        p3mod._BOOLVAR_BUDGET = original_budget
+
+    group_lines = [r.message for r in caplog.records if "K=" in r.message]
+    assert any("K=10" in m for m in group_lines), (
+        f"Expected group solved with K=10 (min_batches+2 floor), got: {group_lines}"
+    )
+    assert not any("K 10→" in r.message for r in caplog.records), (
+        "Tier-1 cap reduced K below the min_batches+2 safety floor"
+    )
+    assert result.status == "feasible"
+    scheduled_ids = {a["task_id"] for a in result.assignments}
+    assert len(scheduled_ids) == 40, "Tasks silently dropped (fallback path taken)"
+
+
+def test_tier1_cap_reduces_to_floor_not_min_batches(caplog):
+    """
+    When config washing_num_slots inflates K far above the floor, Tier-1 must
+    still cap — but land exactly on min_batches+2, never on min_batches.
+    Same group as above, washing_num_slots=30 → K=30 → 40×30=1200 > 300 →
+    cap to 10 (floor), not 8 (old behaviour).
+    """
+    import logging
+    import app.engine.phases.phase3_batching as p3mod
+    from app.engine.phases.phase3_batching import solve_washing
+
+    original_budget = p3mod._BOOLVAR_BUDGET
+    try:
+        p3mod._BOOLVAR_BUDGET = 300
+        with caplog.at_level(logging.INFO, logger="app.engine.phases.phase3_batching"):
+            result = solve_washing(
+                tasks=_tier1_tasks(40, 10.0),
+                resources=[_make_resource("WM_00")],
+                config=_make_config(
+                    washing_batch_capacity=50, max_search_time=30,
+                    washing_num_slots=30,
+                ),
+                p2_end_times={},
+                shift_ends=[],
+                horizon=5000,
+            )
+    finally:
+        p3mod._BOOLVAR_BUDGET = original_budget
+
+    cap_lines = [r.message for r in caplog.records if "K 30→" in r.message]
+    assert cap_lines and "K 30→10" in cap_lines[0], (
+        f"Tier-1 must cap to the min_batches+2 floor (10), got: {cap_lines}"
+    )
+    assert result.status == "feasible"
+    assert len({a["task_id"] for a in result.assignments}) == 40
