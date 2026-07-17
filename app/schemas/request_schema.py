@@ -43,12 +43,19 @@ class SolverTask(BaseModel):
     task_id: str = Field(alias="task_id")
     original_order_id: str = Field(alias="original_order_id")
     group_id: str = Field(alias="group_id")
-    # Đơn (sales-order) mà task này thuộc về — khóa gom dyelot: mọi batch/panel
-    # cùng order_group_id PHẢI dùng chung 1 dyelot per VI (tránh lệch màu khi ghép
-    # thành 1 sản phẩm).  Một đơn có thể bị rolling-wave tách thành nhiều batch
-    # (vd BATCH_0-665 + BATCH_0-666 cùng đơn "W9xTMuuLxR-1-200-200").  Để trống ""
-    # khi payload cũ chưa gửi — khi đó dyelot gom theo original_order_id như cũ.
+    # ITEM (sản phẩm ghép) mà task này thuộc về — khóa gom DYELOT: mọi batch/panel
+    # CÙNG order_group_id PHẢI dùng chung 1 dyelot per VI (tránh lệch màu khi ghép
+    # thành 1 sản phẩm).  Một item có thể bị rolling-wave tách thành nhiều batch
+    # (vd BATCH_0-665 + BATCH_0-666 cùng item "W9xTMuuLxR-1-200-200").  MỨC ITEM,
+    # KHÔNG phải mức đơn khách: các item khác nhau trong cùng một đơn được phép khác
+    # dyelot.  Để trống "" khi payload cũ chưa gửi — dyelot gom theo original_order_id.
     order_group_id: str = Field(default="", alias="order_group_id")
+    # ĐƠN KHÁCH (sales order) mà task này thuộc về — khóa gom CO-COMPLETION: tất cả
+    # item của một đơn phải knit cùng wave & xong gần cùng lúc để ship được (đơn chỉ
+    # ship khi MỌI item xong).  Coarser hơn order_group_id (một ship_group_id gom
+    # nhiều order_group_id/item).  CHỈ ảnh hưởng sequencing/objective knitting —
+    # KHÔNG đụng dyelot.  Để trống "" → knitting gom theo original_order_id như cũ.
+    ship_group_id: str = Field(default="", alias="ship_group_id")
     operation: str = Field(alias="operation")
     qty: float = Field(alias="qty")
     total_qty: float = Field(alias="total_qty")

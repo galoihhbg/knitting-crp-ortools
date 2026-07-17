@@ -1017,19 +1017,25 @@ def apply_order_cluster_objective(
     bỏ trống vài ca, rồi chạy tiếp ("làm tư hôm trước, mấy ngày sau mới xong").
     Công nhân theo dõi theo ĐƠN nên WIP dở dang nằm chờ là pain thật.
 
-    Phạt span (max_end − min_start) theo `order_group_id`.  Trọng số nằm DƯỚI
-    lateness (×100) nên solver chỉ gom khi KHÔNG làm trễ đơn: dư slack thì gom
-    miễn phí, deadline chặt thì lateness vẫn thắng (đã chứng minh ép liền mạch
-    lúc chặt sẽ trễ → khi đó số hạng này tự nhường).  Cold-only (caller gate).
+    Phạt span (max_end − min_start) theo `ship_group_id` (ĐƠN KHÁCH — coarser hơn
+    order_group_id/item; xem note granularity dưới).  Trọng số nằm DƯỚI lateness
+    (×100) nên solver chỉ gom khi KHÔNG làm trễ đơn: dư slack thì gom miễn phí,
+    deadline chặt thì lateness vẫn thắng (đã chứng minh ép liền mạch lúc chặt sẽ trễ
+    → khi đó số hạng này tự nhường).  Cold-only (caller gate).
+
+    LƯU Ý granularity: khóa gom là `ship_group_id` (đơn khách), KHÔNG phải
+    `order_group_id` (item, khóa dyelot).  Các item khác nhau của một đơn được phép
+    khác dyelot, nhưng vẫn phải xong gần cùng lúc để ship → co-completion ở mức đơn,
+    dyelot ở mức item, hai trường tách biệt.
     """
     terms: List[Any] = []
     lateness_scale = min(max(1, horizon // 1000), 50)
     task_map = {t["task_id"]: t for t in tasks}
 
-    # Group by order_group_id (the SALES order), knitting tasks only.
+    # Group by ship_group_id (the customer/sales order), knitting tasks only.
     groups: Dict[str, List[str]] = {}
     for t in tasks:
-        og = t.get("order_group_id")
+        og = t.get("ship_group_id")
         t_id = t["task_id"]
         if og and t_id in task_vars and t.get("operation", "").lower() == "knitting":
             groups.setdefault(og, []).append(t_id)
@@ -1059,6 +1065,15 @@ def apply_order_cluster_objective(
         span = model.NewIntVar(0, horizon, f"ord_span_{og}")
         model.Add(span == o_end - o_start)
         terms.append(span * cluster_w)
+
+        # Co-COMPLETE the order EARLY, not merely close together.  Span alone is
+        # satisfied by clustering the items anywhere on the timeline (all late, but
+        # tight); a customer order can only ship once its LAST item is done, so the
+        # ship-ready time is o_end.  Penalise o_end (same band, below lateness) so the
+        # solver, once an order's items sit in one wave, pulls the whole block as early
+        # as its slack allows instead of finishing one item on day 1 and stranding the
+        # rest.  Below lateness ⇒ never trades tardiness; only spends free slack.
+        terms.append(o_end * cluster_w)
 
     return terms
 

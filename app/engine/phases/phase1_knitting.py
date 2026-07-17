@@ -715,12 +715,20 @@ def _solve_knitting_chunked(
     pinned = [t for t in knitting_tasks if t.get("is_pinned")]
     free = [t for t in knitting_tasks if not t.get("is_pinned")]
 
-    # Group whole orders together (never split an order's slices across waves, so
-    # slice-sync stays intact) and order them EDD-first (earliest due date), then
-    # earliest start_after, then highest priority, then order_id for a stable tie.
+    # Group whole SALES ORDERS together (never split a customer order's items/slices
+    # across waves) and order them EDD-first (earliest due date), then earliest
+    # start_after, then highest priority, then order_id for a stable tie.
+    # Key = ship_group_id (the customer/sales order shared by all its items) when Go
+    # sends it, else fall back to original_order_id (single component ⇒ old behaviour).
+    # This keeps every item of one shippable order in the SAME wave so they knit
+    # contiguously and finish together — a customer order split across waves is exactly
+    # what pins its early items on day 1 and strands the rest days later ("làm item 1,
+    # mãi sau mới xong").  NOTE: ship_group_id (đơn khách, coarse) ≠ order_group_id
+    # (item, khóa dyelot) — dùng nhầm order_group_id sẽ chỉ gom được 1 item, không gom
+    # cả đơn.  Dyelot vẫn dùng order_group_id riêng, không đụng ở đây.
     by_order: Dict[str, List[Dict[str, Any]]] = {}
     for t in free:
-        oid = t.get("original_order_id", "") or t["task_id"]
+        oid = t.get("ship_group_id") or t.get("original_order_id", "") or t["task_id"]
         by_order.setdefault(oid, []).append(t)
 
     def _order_key(oid: str):
