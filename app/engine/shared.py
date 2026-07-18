@@ -1008,6 +1008,7 @@ def apply_order_cluster_objective(
     task_vars: Dict[str, Dict[str, Any]],
     tasks: List[Dict[str, Any]],
     horizon: int,
+    weight_mult: int = 1,
 ) -> List[Any]:
     """Gom mỗi SALES-ORDER vào một cửa sổ thời gian liền mạch.
 
@@ -1049,8 +1050,12 @@ def apply_order_cluster_objective(
         weight = 10 ** (6 - max_priority)
         # Below order_flow's component span (//20) — a gentle nudge that breaks the
         # solver's lateness-neutral ties toward whole-order continuity without
-        # disturbing component packing or trading any tardiness.
-        cluster_w = (weight * lateness_scale) // 20
+        # disturbing component packing or trading any tardiness.  `weight_mult`
+        # (config order_cluster_mult, default 1) scales this up when the caller wants
+        # order-blocks enforced harder in a SATURATED pool (all items late ⇒ the tie
+        # the gentle nudge relies on disappears, so it needs more weight to still pull
+        # each order into a contiguous block instead of interleaving).
+        cluster_w = (weight * lateness_scale * max(1, int(weight_mult))) // 20
 
         if cluster_w <= 0:
             continue
@@ -1074,6 +1079,70 @@ def apply_order_cluster_objective(
         # as its slack allows instead of finishing one item on day 1 and stranding the
         # rest.  Below lateness ⇒ never trades tardiness; only spends free slack.
         terms.append(o_end * cluster_w)
+
+    return terms
+
+
+def apply_order_start_sync_objective(
+    model: cp_model.CpModel,
+    task_vars: Dict[str, Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+    horizon: int,
+    weight_mult: int = 0,
+) -> List[Any]:
+    """Cho các item của MỘT đơn khách knit SONG SONG — khởi động cùng lúc, mỗi item
+    một máy — thay vì item lớn bị dồn ra sau các knit ngắn của đơn khác.
+
+    Bối cảnh: đơn normal mang due HẰNG SỐ (chỉ để objective có mục tiêu, xem note
+    is_normal), nên `apply_soft_deadlines` thoái hóa thành Σ(end)×100 = SPT: việc
+    ngắn chạy trước, item LỚN (critical-path của đơn) bị đẩy muộn → các item cùng đơn
+    KHÔNG chạy cùng lúc, WIP nằm chờ.  `apply_order_cluster_objective` phạt SPAN nhưng
+    nằm DƯỚI ×100 nên bị SPT át (đo: nâng order_cluster_mult gần như không đổi
+    start-spread).  Hàm này phạt riêng START-spread (max_start − min_start) mỗi
+    ship_group để kéo các item khởi động cùng lúc.
+
+    ⚠️ Trọng số NẰM TRONG băng lateness (10^(6−priority) × weight_mult) — để giành máy
+    sớm cho item lớn, nó PHẢI thắng lực SPT ×100, nên nó ĐÁNH ĐỔI average completion
+    lấy co-start/co-completion.  Đây là trade CÓ CHỦ Ý, opt-in qua config
+    start_sync_mult (default 0 = OFF, model byte-identical).  Trần vật lý: số item
+    co-start đồng thời ≤ số máy → không phải đơn nào cũng co-start được cùng lúc, solver
+    xếp theo đợt.  Cold-only (caller gate), knitting-only, bỏ pinned/capacity_block.
+    """
+    terms: List[Any] = []
+    mult = max(0, int(weight_mult))
+    if mult <= 0:
+        return terms
+    task_map = {t["task_id"]: t for t in tasks}
+
+    groups: Dict[str, List[str]] = {}
+    for t in tasks:
+        og = t.get("ship_group_id")
+        t_id = t["task_id"]
+        if (
+            og
+            and t_id in task_vars
+            and t.get("operation", "").lower() == "knitting"
+            and not t.get("is_pinned", False)
+        ):
+            groups.setdefault(og, []).append(t_id)
+
+    for og, t_ids in sorted(groups.items()):
+        # Need ≥2 items for a start-spread to exist; a 1-item order is trivially synced.
+        if len(t_ids) <= 1:
+            continue
+
+        max_priority = min((int(task_map[tid].get("priority", 5)) for tid in t_ids), default=3)
+        weight = (10 ** (6 - max_priority)) * mult
+
+        s_min = model.NewIntVar(0, horizon, f"ssync_min_{og}")
+        s_max = model.NewIntVar(0, horizon, f"ssync_max_{og}")
+        for tid in t_ids:
+            model.Add(s_min <= task_vars[tid]["start"])
+            model.Add(s_max >= task_vars[tid]["start"])
+
+        spread = model.NewIntVar(0, horizon, f"ssync_spread_{og}")
+        model.Add(spread == s_max - s_min)
+        terms.append(spread * weight)
 
     return terms
 

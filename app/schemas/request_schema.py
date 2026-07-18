@@ -178,6 +178,26 @@ class SolverConfig(BaseModel):
     # added lateness; the residual is structural (concurrent-machine limit).
     enable_knitting_contiguity: bool = True
     knitting_contiguity_mult: int = 4
+    # Scales the in-solver order-cluster (sales-order span + o_end) penalty weight
+    # (apply_order_cluster_objective).  Default 1 = current gentle nudge.  Higher →
+    # push each customer order into a tighter/earlier block harder.  NOTE: on
+    # lateness-bound (overloaded) payloads the in-solver term is largely inert (solver
+    # stalls at FEASIBLE before optimising secondary terms — same as contiguity_mult),
+    # so the effective lever there is the post-pass reorder, not this weight.
+    order_cluster_mult: int = 1
+    # Per-order START-SYNC objective (cold solve only, apply_order_start_sync_objective).
+    # Penalise each sales order's knitting START-spread (max_start − min_start over its
+    # items) so the items run in PARALLEL — one machine each, launched together — instead
+    # of one item being deferred behind other orders' short knits (SPT scatters them).
+    # 0 = OFF (default → baseline byte-identical).  Higher → co-start harder.  Sits in the
+    # lateness band on purpose: to reserve early parallel machines for an order's big item
+    # it MUST out-weigh the ×100 SPT pull, so it trades average completion for co-start /
+    # co-completion (a deliberate, opted-in trade; capped by machine count — not all
+    # orders can co-start at once).  See order_cluster_mult for the softer span-only nudge.
+    # EFFECTIVE default is ON at 500 (engine reads config.get(...,500); Go sends 0 to
+    # disable).  Schema mirrors the effective default for documentation — cf. the other
+    # intentional schema-vs-effective params (workers, sameqty_relink, contiguity_reorder).
+    start_sync_mult: int = 500
     # Knitting order-contiguity POST-PASS (cold solve only).  The in-solve penalty
     # above is provably inert on overloaded payloads: the solver stops at FEASIBLE
     # while minimising lateness (×10^7) and never optimises the secondary contiguity

@@ -19,6 +19,7 @@ from ortools.sat.python import cp_model
 from app.engine.shared import (
     apply_identical_task_symmetry,
     apply_order_cluster_objective,
+    apply_order_start_sync_objective,
     apply_order_flow_objective,
     apply_panel_sync_objective,
     apply_slice_sync_objective,
@@ -487,13 +488,33 @@ def solve_knitting(
         # window so an order isn't started, abandoned for shifts, then resumed.
         # Below lateness → clusters only when free (see apply_order_cluster_objective).
         if config.get("enable_order_cluster_objective", True):
-            cluster_terms = apply_order_cluster_objective(model, task_vars, knitting_tasks, horizon)
+            cluster_terms = apply_order_cluster_objective(
+                model, task_vars, knitting_tasks, horizon,
+                weight_mult=int(config.get("order_cluster_mult", 1)),
+            )
             if cluster_terms:
                 logger.info(
                     f"   🧷 Phase1 order-cluster objective: {len(cluster_terms)} sales-order "
                     f"span(s) penalised for WIP continuity."
                 )
             obj_terms += cluster_terms
+        # Per-order START-SYNC: co-launch each sales order's items on parallel machines
+        # so none waits.  EFFECTIVE default ON at 500 (config unset → 500; Go may send 0
+        # to disable, or another int to retune — tuning sweet spot 500: start-spread −47%,
+        # makespan also drops, avg completion +4.8%).  In the lateness band ⇒ trades
+        # average completion for co-start (accepted).  See objective docstring.
+        _ss_raw = config.get("start_sync_mult", 500)
+        _ss_mult = int(_ss_raw) if _ss_raw is not None else 500
+        if _ss_mult > 0:
+            ss_terms = apply_order_start_sync_objective(
+                model, task_vars, knitting_tasks, horizon, weight_mult=_ss_mult,
+            )
+            if ss_terms:
+                logger.info(
+                    f"   🔗 Phase1 start-sync objective: {len(ss_terms)} sales-order "
+                    f"start-spread(s) penalised (mult={_ss_mult}) for parallel co-start."
+                )
+            obj_terms += ss_terms
         # B1: pull each panel's component batches to finish together (the max-end
         # gates its linking slice).  Commensurate scale → nudge, not override.
         if config.get("enable_panel_sync_objective", True) and panel_meta:
