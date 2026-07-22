@@ -212,6 +212,20 @@ class SolverConfig(BaseModel):
     # machines carrying a pinned/in-progress task are left untouched.  Costs ~1 extra
     # phases-2–5 pass when a candidate is found.
     enable_knitting_contiguity_reorder: bool = True
+    # Knitting config-continuity reorder (cold-path relayout candidate, verified).  Re-
+    # sequences the FREE knit tasks on each machine so same-yarn runs are contiguous and
+    # the run matching the machine's entry (pinned-tail) config runs first — cutting creel
+    # re-entries when new orders are appended after pinned work (contiguity reorder skips
+    # pinned-anchor machines, so this covers the reschedule-append case).  Default ON.
+    enable_knitting_config_continuity: bool = True
+    # In-solver YARN setup-cost (cold solve only).  Penalises each EXTRA yarn config
+    # (color_config) assigned to a machine → the solver dedicates machines to a config so
+    # the creel is torn down as few times as possible.  With config-continuity packing each
+    # config into one run, distinct-configs-per-machine = the machine's changeover count, so
+    # this minimises total creel changes.  Banded below lateness (never makes an order late).
+    # Default ON.  Verified on synthetic 3A+3B/2-machine: 2 changeovers → 0.
+    enable_knitting_yarn_setup_cost: bool = True
+    knitting_yarn_setup_mult: int = 4
     # Knitting cross-machine SPREAD post-pass (cold solve only).  The solver stalls at
     # FEASIBLE and sometimes serialises a PO's tail onto ONE machine while other
     # compatible machines sit idle (measured: 17 tasks of one PO piled on a single
@@ -359,6 +373,20 @@ class DyelotStock(BaseModel):
     packing_size: float
 
 
+class InProductionDyelot(BaseModel):
+    """Đơn in-production (converted/pinned) đã cam kết một dyelot trên một máy.
+    Cho post-pass dyelot pin đơn đó vào lot đã cam kết + co-lot đơn mới chung máy.
+    Một dòng / (order, vi, máy)."""
+    order: str
+    vi: str
+    dyelot: str
+    machine_id: str
+    start_time: int = 0
+    net_kg: float = 0.0
+    slots: int = 0
+    committed_kg: float = 0.0
+
+
 class SolverPayload(BaseModel):
     job_id: str
     config: SolverConfig
@@ -374,4 +402,7 @@ class SolverPayload(BaseModel):
     # The dyelot post-pass uses it to size a fresh dyelot for a zero-stock vi
     # (whole-roll / creel-up gross needs a roll size). Empty → net floor fallback.
     vi_packing_size: Dict[str, float] = Field(default_factory=dict)
+    # In-production (converted/pinned) orders' committed dye lots + knit footprint,
+    # so the dyelot post-pass pins them and co-lots a sharing new order.
+    in_production: List[InProductionDyelot] = Field(default_factory=list)
     reschedule_hint: Optional[RescheduleHint] = None

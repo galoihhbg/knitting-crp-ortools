@@ -74,6 +74,7 @@ def allocate_dyelots(
     dyelot_stock: Optional[List[Dict[str, Any]]],
     config: Dict[str, Any],
     vi_packing: Optional[Dict[str, float]] = None,
+    in_production: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Allocate one dyelot per (order, VI), flush-optimized, per VI independently.
 
@@ -162,10 +163,79 @@ def allocate_dyelots(
             run[0] += kg
             run[1] = max(run[1], slots)
 
-    # vi → sorted list of lots
+    # In-production (converted/pinned) orders: inject their committed knit units so
+    # they participate in the per-VI solve. Otherwise they are invisible (excluded
+    # from config.Orders; their PIN_ tasks carry no main_yarn_consumption), so no
+    # flush relationship exists for a new order to co-lot against, and the order
+    # already being knitted would be free to drift onto a different lot.
+    # pinned_lot[vi][order] = the lot to fix. committed_by[vi][dyelot] = the PICKED
+    # creel kg to re-count into that lot's capacity (see below).
+    pinned_lot: Dict[str, Dict[str, str]] = {}
+    committed_by: Dict[str, Dict[str, float]] = {}
+    _committed_seen = set()   # (vi, order, dyelot) — committed_kg is repeated per machine row
+    _inprod_pool_net: Dict[Tuple[str, str], float] = {}  # (vi, order) → pooled remaining net
+    for s in (in_production or []):
+        vi = str(s.get("vi", ""))
+        order = str(s.get("order", ""))
+        dyelot = s.get("dyelot")
+        machine = s.get("machine_id")
+        if not vi or not order or not dyelot or machine is None:
+            continue
+        dyelot = str(dyelot)
+        start = int(s.get("start_time", 0) or 0)
+        kg = float(s.get("net_kg", 0) or 0)          # per-machine (already split by Go)
+        tid = f"INPROD_{order}_{machine}_{start}"
+        vi_order_kg.setdefault(vi, {}).setdefault(order, 0.0)
+        vi_order_kg[vi][order] += kg
+        # Real machine placement — for FLUSH adjacency with new orders only.
+        vi_machine_units.setdefault(vi, {}).setdefault(machine, []).append((start, tid, order))
+        # CAPACITY: pool the in-production order's remaining net into ONE bucket
+        # (not per-machine). Its creel is already mounted (re-counted via
+        # committed_kg into the lot cap below), so charging per-machine whole-roll +
+        # creel-up for an order spread across many machines would balloon its gross
+        # far past the lot and make the forced pin infeasible (→ whole VI dropped).
+        _inprod_pool_net[(vi, order)] = _inprod_pool_net.get((vi, order), 0.0) + kg
+        pinned_lot.setdefault(vi, {})[order] = dyelot
+        key = (vi, order, dyelot)
+        if key not in _committed_seen:                # count committed_kg ONCE per order
+            _committed_seen.add(key)
+            committed_by.setdefault(vi, {}).setdefault(dyelot, 0.0)
+            committed_by[vi][dyelot] += float(s.get("committed_kg", 0) or 0)
+
+    # One pooled capacity bucket per in-production (vi, order): whole-roll on the
+    # POOLED remaining net, slots 0 (no creel-up floor — the cones are already
+    # mounted and paid for via committed_kg). A unique per-order machine key keeps
+    # it out of any real machine's flush sequence.
+    for (vi, order), net in _inprod_pool_net.items():
+        vi_mo.setdefault(vi, {}).setdefault(f"__INPROD_POOL_{order}", {})[order] = [net, 0]
+
+    # vi → sorted list of lots (copies — we mutate remaining_kg below).
     lots_by_vi: Dict[str, List[Dict[str, Any]]] = {}
     for d in dyelot_stock:
-        lots_by_vi.setdefault(d["vi"], []).append(d)
+        lots_by_vi.setdefault(d["vi"], []).append(dict(d))
+    # Re-count the in-production PICKED creel into its lot's capacity. Picked yarn
+    # has left the warehouse (no longer in dyelot_stock.remaining_kg) but is on the
+    # machine, and a co-lotted new order inherits it. Adding committed_by back
+    # makes free-post-pick + creel ≈ free-pre-pick, so a re-schedule after picking
+    # co-lots the same as before picking. A fully-committed lot with no free row
+    # gets a synthetic one (0 free, then the creel is added). Any pinned lot with
+    # no creel is still ensured present so the pin stays representable.
+    def _ensure_lot(vi, dyelot):
+        lots = lots_by_vi.setdefault(vi, [])
+        for l in lots:
+            if str(l.get("dyelot", "")) == dyelot:
+                return l
+        l = {"vi": vi, "dyelot": dyelot, "remaining_kg": 0.0,
+             "packing_size": float((vi_packing or {}).get(vi, 0) or 0) or 1.0}
+        lots.append(l)
+        return l
+    for vi, by_dyelot in committed_by.items():
+        for dyelot, creel_kg in by_dyelot.items():
+            lot = _ensure_lot(vi, dyelot)
+            lot["remaining_kg"] = float(lot.get("remaining_kg", 0) or 0) + creel_kg
+    for vi, by_order in pinned_lot.items():
+        for dyelot in set(by_order.values()):
+            _ensure_lot(vi, dyelot)
     for vi in lots_by_vi:
         lots_by_vi[vi].sort(key=lambda d: str(d.get("dyelot", "")))
 
@@ -210,7 +280,8 @@ def allocate_dyelots(
             continue
 
         res = _solve_vi(vi, order_kg, lots, vi_machine_units.get(vi, {}),
-                        vi_mo.get(vi, {}), solver_config)
+                        vi_mo.get(vi, {}), solver_config,
+                        pinned_lot_vi=pinned_lot.get(vi))
         assignments.extend(res["assignments"])
         flush_points.extend(res["flush_points"])
         unassigned.extend(res["unassigned"])
@@ -379,6 +450,7 @@ def _solve_vi(
     machine_units: Dict[Any, List[Tuple[int, str, str]]],
     machine_order: Dict[Any, Dict[str, List[float]]],
     config: Dict[str, Any],
+    pinned_lot_vi: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """One independent CP-SAT model for a single VI.
 
@@ -438,6 +510,22 @@ def _solve_vi(
     for o in orders:
         model.Add(sum(x[o]) + una[o] == 1)        # 1 dyelot per order per VI
         model.Add(assigned[o] == 1 - una[o])
+
+    # Pin in-production (converted/pinned) orders to their committed dye lot — the
+    # solver must not move an order already being knitted onto a different lot.
+    # Forcing x[o][d]=1 also forces una[o]=0/assigned[o]=1 (via exactly_one). The
+    # min-flush objective then pulls a sharing new order onto the same lot when its
+    # gross fits the lot's free capacity. The lot is guaranteed present in `lots`
+    # (allocate_dyelots adds a synthetic row when fully committed), so d is found.
+    if pinned_lot_vi:
+        lot_index = {str(lots[d].get("dyelot", "")): d for d in range(n_lots)}
+        for o in orders:
+            want = pinned_lot_vi.get(o)
+            if want is None:
+                continue
+            d = lot_index.get(str(want))
+            if d is not None:
+                model.Add(x[o][d] == 1)
 
     # Capacity — reuse-aware per-(machine, lot) roll model (C).
     _add_roll_capacity(model, x, orders, n_lots, demand_g, cap_g, pk_g, machine_order,

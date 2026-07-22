@@ -10,6 +10,7 @@ Provides:
   extract_results        — post-solve assignment/overload extraction
 """
 import math
+import os
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -17,6 +18,14 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from ortools.sat.python import cp_model
 
 logger = logging.getLogger(__name__)
+
+# On a re-schedule after convert, machine_materials is still empty (yarn not
+# physically loaded), so Go cannot populate resources[].color_config. The
+# converted order's PINNED task carries the machine's committed yarn instead.
+# When enabled, build_resource_model derives each knitting machine's current
+# config from its last pinned task so affinity can pull same-yarn new orders
+# onto it. Enabled by default; CP_DERIVE_MACHINE_CONFIG=0 disables.
+_DERIVE_MACHINE_CONFIG = os.getenv("CP_DERIVE_MACHINE_CONFIG", "1") != "0"
 
 # Default deterministic-time budget per CP-SAT solve when config omits
 # `max_deterministic_time`.  Deterministic units, NOT wall seconds — on hard
@@ -515,6 +524,49 @@ def make_solver(
 # Affinity
 # ---------------------------------------------------------------------------
 
+def hydrate_machine_affinity_from_pins(
+    tasks: List[Dict[str, Any]],
+    resource_map: Dict[str, Dict[str, Any]],
+) -> int:
+    """Suy trạng thái sợi/thiết kế HIỆN TẠI của mỗi máy knit từ task PINNED cuối cùng.
+
+    Trên reschedule, Go gửi `color_config` TRÊN pinned task nhưng để TRỐNG
+    `resources[].color_config` — mà `compute_affinity_penalty` chỉ đọc chỗ sau.  Không
+    có nó, affinity coi MỌI máy là "cold" như nhau (cùng cold-start penalty) → đơn nối
+    tiếp xếp theo máy rảnh sớm nhất, đổi sợi thừa (đo thực tế: 3 đổi sợi lẽ ra 1).
+
+    Lấy `color_config`/`design_item_id` của pinned task có `pinned_end_time` LỚN NHẤT
+    trên mỗi máy làm trạng thái đi vào lúc nối đơn, ghi vào resource_map — CHỈ cho máy
+    KNITTING và CHỈ khi resource chưa có config (không đè config thật Go gửi, vd máy
+    đang chạy dở).  Nguồn là pinned task có color_config (chỉ knit mới mang sợi).  Trả
+    về số máy đã hydrate.  Idempotent.
+    """
+    latest: Dict[str, Tuple[int, str, str]] = {}
+    for t in tasks:
+        if not t.get("is_pinned"):
+            continue
+        cfg = t.get("color_config") or ""
+        m = t.get("pinned_machine_id")
+        if not cfg or not m:
+            continue
+        pe = t.get("pinned_end_time")
+        pe = int(pe) if pe is not None else 0
+        if m not in latest or pe > latest[m][0]:
+            latest[m] = (pe, cfg, t.get("design_item_id") or "")
+
+    n = 0
+    for m, (_, cfg, design) in latest.items():
+        r = resource_map.get(m)
+        if r is None or str(r.get("operation", "")).lower() != "knitting":
+            continue
+        if not r.get("color_config"):
+            r["color_config"] = cfg
+            if design and not r.get("design_item_id"):
+                r["design_item_id"] = design
+            n += 1
+    return n
+
+
 def compute_affinity_penalty(
     resource: Dict[str, Any], task_design: str, task_color_str: str
 ) -> int:
@@ -552,6 +604,55 @@ def compute_affinity_penalty(
         penalty += swaps * _PENALTY_PER_ROLL_SWAP
 
     return penalty
+
+
+def seed_resource_config_from_pins(
+    tasks: List[Dict[str, Any]], resource_map: Dict[str, Dict[str, Any]]
+) -> int:
+    """Fill each machine's current color_config / design_item_id from the LAST
+    pinned task on it (max pinned_end_time), but only when the resource itself
+    carries none.
+
+    Why: on a re-schedule after convert, machine_materials is empty so
+    resources[].color_config arrives blank for every machine. Without a current
+    config, compute_affinity_penalty scores every machine as cold-start
+    (identical penalty), so a new order is NOT pulled onto the machine whose
+    converted (pinned) task already commits it to the same yarn. The pinned task
+    now carries the real yarn config (Go side), so the machine's committed
+    config is exactly its last pinned task.
+
+    Only fills EMPTY resource configs → a real Go-sent config is never
+    overwritten, and a cold solve (no pins) is a no-op. Returns the number of
+    resources whose color_config was filled (for logging).
+    """
+    best: Dict[str, Tuple[int, str, str]] = {}
+    for t in tasks:
+        if not t.get("is_pinned"):
+            continue
+        machine = t.get("pinned_machine_id")
+        if not machine:
+            continue
+        cc = str(t.get("color_config") or "").strip()
+        dii = str(t.get("design_item_id") or "").strip()
+        if not cc and not dii:
+            continue
+        end_raw = t.get("pinned_end_time")
+        end = int(end_raw) if end_raw is not None else 0
+        prev = best.get(machine)
+        if prev is None or end >= prev[0]:
+            best[machine] = (end, cc, dii)
+
+    filled = 0
+    for machine, (_, cc, dii) in best.items():
+        res = resource_map.get(machine)
+        if res is None:
+            continue
+        if cc and not str(res.get("color_config") or "").strip():
+            res["color_config"] = cc
+            filled += 1
+        if dii and not str(res.get("design_item_id") or "").strip():
+            res["design_item_id"] = dii
+    return filled
 
 
 # ---------------------------------------------------------------------------
@@ -687,6 +788,19 @@ def build_resource_model(
     # its real slot and a new task gets booked on top of it.
     for t in tasks:
         normalize_pinned_window(t)
+
+    # ── Derive machine current config from pins (re-schedule affinity) ──────
+    # Blank resources[].color_config on a post-convert re-schedule would make
+    # every machine look cold-start to affinity; seed each machine's config
+    # from its last pinned task so same-yarn new orders are pulled onto the
+    # machine already committed to that yarn. Only when affinity is active
+    # (knitting) and only fills empty configs.
+    if use_affinity and _DERIVE_MACHINE_CONFIG:
+        filled = seed_resource_config_from_pins(tasks, resource_map)
+        if filled:
+            logger.info(
+                f"   🧶 Affinity: seeded current yarn config for {filled} machine(s) from pinned tasks"
+            )
 
     # ── Step 1: create start/end IntVars ────────────────────────────────────
     for t in tasks:

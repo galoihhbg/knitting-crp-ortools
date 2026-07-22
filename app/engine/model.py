@@ -100,6 +100,11 @@ class Engine:
         # Default roll size per thread vi (incl. zero-stock vis) — lets the dyelot
         # post-pass size a fresh lot for a vi with no current stock.
         self.vi_packing_size: Dict[str, float] = payload.get("vi_packing_size") or {}
+        # In-production (converted/pinned) orders already committed to a dye lot:
+        # [{order, vi, dyelot, machine_id, start_time, net_kg, slots, committed_kg}].
+        # Lets the dyelot post-pass pin them to their committed lot and co-lot a
+        # sharing new order. Empty when the Go backend sends no pinned work.
+        self.in_production = payload.get("in_production") or []
 
     def solve(self) -> Dict[str, Any]:
         if not self.tasks:
@@ -128,6 +133,7 @@ class Engine:
         dyelot_out = allocate_dyelots(
             self.tasks, result.get("assignments", []), self.dyelot_stock, self.config,
             vi_packing=self.vi_packing_size,
+            in_production=self.in_production,
         )
         result.update(dyelot_out)
         return result

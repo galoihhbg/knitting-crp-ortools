@@ -21,6 +21,7 @@ from app.engine.shared import (
     apply_order_cluster_objective,
     apply_order_start_sync_objective,
     apply_order_flow_objective,
+    hydrate_machine_affinity_from_pins,
     apply_panel_sync_objective,
     apply_slice_sync_objective,
     apply_soft_deadlines,
@@ -350,6 +351,16 @@ def solve_knitting(
 
     resource_map: Dict[str, Dict[str, Any]] = {r["id"]: r for r in resources}
 
+    # Reschedule: derive each knit machine's CURRENT yarn/design from its last pinned
+    # task so affinity can keep same-config orders on the machine already loaded with it
+    # (Go fills color_config on pinned tasks but leaves resources[].color_config empty).
+    _n_hydrated = hydrate_machine_affinity_from_pins(knitting_tasks, resource_map)
+    if _n_hydrated:
+        logger.info(
+            f"   🧵 Phase1 affinity hydrate: {_n_hydrated} machine(s) got current yarn "
+            f"state from pinned tasks (reschedule continuity)."
+        )
+
     _log_task_diagnostics(knitting_tasks, horizon)
 
     model = cp_model.CpModel()
@@ -542,6 +553,23 @@ def solve_knitting(
                     f"penalised for hosting extra POs (w={setup_w})."
                 )
             obj_terms += setup_terms
+
+        # Yarn-config setup cost: penalise each EXTRA yarn config per machine so the solver
+        # dedicates machines to a config (fewer creel changes).  In-solver, banded below
+        # lateness.  Default ON — user priority ("tiết kiệm lắm").  Weight in the affinity
+        # band (×10×scale) so it can actually steer machine choice, not be a dead tie-break.
+        if config.get("enable_knitting_yarn_setup_cost", True):
+            yscale = min(max(1, horizon // 1000), 50)
+            yarn_w = max(1, yscale * 10 * int(config.get("knitting_yarn_setup_mult", 4)))
+            yarn_terms = _apply_yarn_setup_cost(
+                model, task_vars, knitting_tasks, resource_map, yarn_w
+            )
+            if yarn_terms:
+                logger.info(
+                    f"   🧶 Phase1 yarn setup-cost: {len(yarn_terms)} machine(s) "
+                    f"penalised for hosting extra yarn configs (w={yarn_w})."
+                )
+            obj_terms += yarn_terms
 
     # Reified-keep + hints-only on knitting.  apply_stability_objective is
     # NOT called here (it would double-stabilize via soft time penalty +
@@ -1567,6 +1595,136 @@ def _yarn_reentries(keys: List[tuple]) -> int:
     return len(runs) - len(set(runs))
 
 
+def reorder_config_continuity(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Candidate: re-sequence the FREE knit tasks on each machine so same-yarn runs are
+    contiguous and the run matching the machine's ENTRY config (its last PINNED/earlier
+    task's yarn) runs FIRST — no creel change at the join.
+
+    Motivating case (reschedule append): a machine ends its pinned work in config X, then
+    new orders are appended in an order that returns the machine to X only AFTER running a
+    different config (X…Y…X = an avoidable creel re-entry).  `repair_yarn_config_reentry`
+    kills A→B→A by RELOCATING a run to another machine; this pass instead REORDERS the free
+    runs IN PLACE, which also covers machines carrying a pinned anchor (the contiguity
+    reorder skips those) — the common reschedule shape.
+
+    Only NON-PINNED knit tasks move, and only within the contiguous slot window they already
+    occupy (packed from the earliest free start; the machine's busy window/tail end is never
+    extended).  Pinned tasks stay verbatim.  Guards mirror the other relayout candidates:
+      * new_end ≤ max(baseline end, due − downstream_chain_min) per task (never later);
+      * whole-candidate `_knitting_workforce_ok`;
+      * accept only if total machine yarn re-entries STRICTLY decrease.
+    NOT monotone (a yielding run starts later) → caller runs it as a relayout candidate and
+    re-solves phases 2–5, accepting only if pipeline lateness does not rise.  Deterministic.
+    Returns {"start", "end"} over the moved knitting tasks, or None.
+    """
+    info = {t["task_id"]: t for t in all_tasks}
+    by_machine: Dict[str, List[Dict[str, Any]]] = {}
+    for a in assignments:
+        t = info.get(a["task_id"])
+        if t is None or t.get("operation", "").lower() != "knitting":
+            continue
+        by_machine.setdefault(a["machine_id"], []).append(a)
+    if not by_machine:
+        return None
+
+    base_start = {a["task_id"]: a["start_time"] for v in by_machine.values() for a in v}
+    base_end = {a["task_id"]: a["end_time"] for v in by_machine.values() for a in v}
+
+    new_start: Dict[str, int] = dict(base_start)
+    new_end: Dict[str, int] = dict(base_end)
+    base_reentry_total = 0
+    cand_reentry_total = 0
+
+    for _m, items in by_machine.items():
+        seq = sorted(items, key=lambda a: (a["start_time"], a["task_id"]))
+        base_reentry_total += _yarn_reentries([_yarn_key(info[a["task_id"]]) for a in seq])
+
+        free = [a for a in seq if not info[a["task_id"]].get("is_pinned")]
+        # Need ≥2 free tasks with ≥2 distinct configs for a reorder to matter.
+        if len(free) < 2 or len({_yarn_key(info[a["task_id"]]) for a in free}) < 2:
+            cand_reentry_total += _yarn_reentries([_yarn_key(info[a["task_id"]]) for a in seq])
+            continue
+
+        free_ids = {a["task_id"] for a in free}
+        # Reorder is confined to the block the free tasks already occupy: pack them
+        # contiguously from their earliest start, and never end past the block's current
+        # tail (so the machine's knitting makespan is never extended).  Since the packed
+        # block has the same total duration, this holds unless a start_after release pushes
+        # a task out — then the machine is left verbatim.  Lateness itself is gated by the
+        # downstream re-solve (a due-based per-task cap is useless here: normal orders carry
+        # a constant due=1, which would pin every task to its baseline end and block any
+        # reorder).
+        free_start0 = min(a["start_time"] for a in free)
+        free_tail = max(a["end_time"] for a in free)
+        preceding = [a for a in seq if a["task_id"] not in free_ids and a["start_time"] < free_start0]
+        entry_key = _yarn_key(info[preceding[-1]["task_id"]]) if preceding else None
+
+        # Group free tasks by yarn key; keep each group's tasks in original order.
+        groups: Dict[tuple, List[Dict[str, Any]]] = {}
+        for a in sorted(free, key=lambda x: (x["start_time"], x["task_id"])):
+            groups.setdefault(_yarn_key(info[a["task_id"]]), []).append(a)
+        # Order groups: entry-matching group first, then by each group's earliest start.
+        gkeys = sorted(
+            groups,
+            key=lambda k: (
+                0 if k == entry_key else 1,
+                min(x["start_time"] for x in groups[k]),
+                str(k),
+            ),
+        )
+
+        prev_end = free_start0
+        cand_s: Dict[str, int] = {}
+        cand_e: Dict[str, int] = {}
+        safe = True
+        for k in gkeys:
+            for a in groups[k]:
+                tid = a["task_id"]
+                sa = int(info[tid].get("start_after_min", 0) or 0)
+                dur = int(a["end_time"]) - int(a["start_time"])
+                ns = max(sa, prev_end)
+                if ns + dur > free_tail:
+                    safe = False
+                    break
+                cand_s[tid] = ns
+                cand_e[tid] = ns + dur
+                prev_end = ns + dur
+            if not safe:
+                break
+
+        if not safe:
+            cand_reentry_total += _yarn_reentries([_yarn_key(info[a["task_id"]]) for a in seq])
+            continue
+
+        # Re-entry count of the candidate sequence for this machine.
+        cand_seq = sorted(
+            seq,
+            key=lambda a: (cand_s.get(a["task_id"], a["start_time"]), a["task_id"]),
+        )
+        cand_reentry_total += _yarn_reentries([_yarn_key(info[a["task_id"]]) for a in cand_seq])
+        new_start.update(cand_s)
+        new_end.update(cand_e)
+
+    if cand_reentry_total >= base_reentry_total:
+        return None
+
+    knitting_tasks = [t for t in all_tasks
+                      if t.get("operation", "").lower() in ("knitting", "capacity_block")]
+    if not _knitting_workforce_ok(new_start, new_end, knitting_tasks, config):
+        logger.info("🧵 Knitting config-continuity reorder: candidate exceeds workforce cap — skipped.")
+        return None
+
+    logger.info(
+        f"🧵 Knitting config-continuity reorder: candidate cuts yarn re-entries "
+        f"{base_reentry_total}→{cand_reentry_total} — verifying downstream…"
+    )
+    return {"start": new_start, "end": new_end}
+
+
 def repair_yarn_config_reentry(
     assignments: List[Dict[str, Any]],
     all_tasks: List[Dict[str, Any]],
@@ -2436,6 +2594,68 @@ def _apply_po_setup_cost(
         if len(actives) <= 1:
             continue  # ≤1 candidate PO → never an extra setup
         extra = model.NewIntVar(0, len(actives), f"setup_extra_{r_id}")
+        model.Add(extra >= sum(actives) - 1)  # extra ≥ 0 by domain ⇒ = max(0, Σ−1)
+        terms.append(extra * setup_w)
+    return terms
+
+
+def _apply_yarn_setup_cost(
+    model: cp_model.CpModel,
+    task_vars: Dict[str, Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+    resource_map: Dict[str, Dict[str, Any]],
+    setup_w: int,
+) -> List[Any]:
+    """SOFT yarn-setup cost: each EXTRA yarn config assigned to a machine costs `setup_w`.
+
+    Switching a knitting machine's creel between yarn configs (`color_config`, SỢI:SỐ_CUỘN)
+    costs real (unmodeled) creel tear-down + re-thread.  For every (yarn_config, machine)
+    reify ``cfg_on_m`` = "this config has ≥1 task on this machine" (OR of the task→machine
+    literals); per machine penalise ``max(0, Σ_cfg cfg_on_m − 1)`` — the first config is
+    free, every additional config on the machine pays one setup.  Minimising this drives
+    SAME-config tasks onto the SAME machine (dedicate machines to a yarn) so the creel is
+    torn down as few times as possible.  Combined with `reorder_config_continuity` (which
+    packs each config into ONE contiguous run per machine), distinct-configs-per-machine
+    equals the machine's changeover count — so this minimises total creel changes.
+
+    Yarn identity via `_yarn_key` (handles the "No yarn"/lookup-error sentinel → falls back
+    to color/substance, same as the reorder/repair passes).  Banded below lateness (caller
+    scales `setup_w`) so it never makes an order late — it only spends free slack to
+    consolidate.  Free (non-pinned) knitting tasks only (pinned creel state is handled by
+    the affinity/reorder passes).  Deterministic.  Returns objective terms.
+    """
+    if setup_w <= 0:
+        return []
+    cfg_groups: Dict[tuple, List[Dict[str, Any]]] = {}
+    for t in tasks:
+        if t.get("operation", "").lower() == "knitting" and not t.get("is_pinned", False):
+            cfg_groups.setdefault(_yarn_key(t), []).append(t)
+
+    machine_cfgs: Dict[str, List[Any]] = {r_id: [] for r_id in resource_map}
+    for idx, (_key, ctasks) in enumerate(sorted(cfg_groups.items(), key=lambda kv: str(kv[0]))):
+        for r_id in resource_map:
+            lits = []
+            for t in ctasks:
+                tv = task_vars.get(t["task_id"])
+                if tv is None:
+                    continue
+                lit = next(
+                    (l for l in tv["literals"] if l.Name().endswith(f"_on_{r_id}")),
+                    None,
+                )
+                if lit is not None:
+                    lits.append(lit)
+            if not lits:
+                continue
+            cfg_on_m = model.NewBoolVar(f"yarncfg{idx}_{r_id}")
+            model.AddMaxEquality(cfg_on_m, lits)  # True iff this config touches r_id
+            machine_cfgs[r_id].append(cfg_on_m)
+
+    terms: List[Any] = []
+    for r_id, actives in sorted(machine_cfgs.items()):
+        if len(actives) <= 1:
+            continue  # ≤1 candidate config → never an extra setup
+        extra = model.NewIntVar(0, len(actives), f"yarn_extra_{r_id}")
         model.Add(extra >= sum(actives) - 1)  # extra ≥ 0 by domain ⇒ = max(0, Σ−1)
         terms.append(extra * setup_w)
     return terms

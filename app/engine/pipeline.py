@@ -27,6 +27,7 @@ from .phases.phase1_knitting import (
     balance_cold_knitting,
     left_shift_cold_knitting,
     parallelize_component_pos,
+    reorder_config_continuity,
     reorder_contiguous_knitting,
     repair_yarn_config_reentry,
     solve_knitting,
@@ -211,6 +212,7 @@ class Pipeline:
             self.config.get("enable_knitting_parallel_pos", True)
             or self.config.get("enable_knitting_contiguity_reorder", False)
             or self.config.get("enable_knitting_yarn_config_repair", True)
+            or self.config.get("enable_knitting_config_continuity", True)
         ):
             refined = self._try_knitting_relayout(
                 p2_tasks, all_resources, global_horizon, p1, p2, p3, p4, p5,
@@ -888,6 +890,28 @@ class Pipeline:
             final_start.update(cand_c["start"])
             final_end.update(cand_c["end"])  # machine unchanged by per-machine reorder
 
+        # 2b. config-continuity reorder — in-place per-machine re-sequence of the FREE
+        #     knit tasks so same-yarn runs are contiguous and the run matching each
+        #     machine's entry (pinned-tail) config runs first.  Covers pinned-anchor
+        #     machines (contiguity reorder skips those) — the reschedule-append case.
+        cand_r = None
+        if self.config.get("enable_knitting_config_continuity", True):
+            merged_c: List[Dict[str, Any]] = []
+            for a in interim:
+                tid = a["task_id"]
+                if tid in final_start:
+                    b = dict(a)
+                    b["start_time"] = final_start[tid]
+                    b["end_time"] = final_end[tid]
+                    b["machine_id"] = final_machine[tid]
+                    merged_c.append(b)
+                else:
+                    merged_c.append(a)
+            cand_r = reorder_config_continuity(merged_c, self.tasks, self.config)
+        if cand_r is not None:
+            final_start.update(cand_r["start"])
+            final_end.update(cand_r["end"])  # machine unchanged by per-machine reorder
+
         # 3. yarn-config re-entry repair — runs on the MERGED layout (it needs the
         #    final per-machine sequences): relocate slack-due tasks that force a
         #    machine back into a yarn config it already left (:2→:5→:2) onto a
@@ -906,7 +930,7 @@ class Pipeline:
                 else:
                     merged.append(a)
             cand_y = repair_yarn_config_reentry(merged, self.tasks, self.config)
-        if cand_p is None and cand_c is None and cand_y is None:
+        if cand_p is None and cand_c is None and cand_r is None and cand_y is None:
             return None
         if cand_y is not None:
             final_start.update(cand_y["start"])

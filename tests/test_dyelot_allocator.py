@@ -600,3 +600,105 @@ def test_no_slots_is_backward_compatible():
 
     assert len(res["order_dyelot_assignment"]) == 1
     assert res["dyelot_unassigned"] == []
+
+
+# ---------------------------------------------------------------------------
+# in_production signal — pin converted orders + co-lot a sharing new order
+# ---------------------------------------------------------------------------
+
+def test_in_production_pins_and_co_lots_new_order():
+    """A NEW order sharing a machine + vi with an in-production order lands on the
+    in-production lot (min-flush), not the smaller lot drain-small would pick."""
+    tasks = [_knit_task("t_new", "NEW", {"3039": 4}, slots={"3039": 1})]
+    assigns = [_assign("t_new", "SK1", 100)]
+    dyelot_stock = [
+        {"vi": "3039", "dyelot": "dyelot03", "remaining_kg": 100, "packing_size": 10},
+        {"vi": "3039", "dyelot": "dyelot99", "remaining_kg": 30, "packing_size": 10},
+    ]
+    vi_packing = {"3039": 10}
+    in_prod = [{"order": "INPROD", "vi": "3039", "dyelot": "dyelot03",
+                "machine_id": "SK1", "start_time": 0, "net_kg": 20, "slots": 1,
+                "committed_kg": 20}]
+
+    # Baseline (no signal): drain-small tie-break prefers the SMALLER lot.
+    base = allocate_dyelots(tasks, assigns, dyelot_stock, CFG, vi_packing=vi_packing)
+    base_new = next(a["dyelot"] for a in base["order_dyelot_assignment"]
+                    if a["order"] == "NEW")
+    assert base_new == "dyelot99"
+
+    # With the signal: INPROD pinned; NEW co-lotted onto dyelot03 (no flush).
+    out = allocate_dyelots(tasks, assigns, dyelot_stock, CFG,
+                           vi_packing=vi_packing, in_production=in_prod)
+    amap = {a["order"]: a["dyelot"] for a in out["order_dyelot_assignment"]}
+    assert amap["INPROD"] == "dyelot03"
+    assert amap["NEW"] == "dyelot03"
+
+
+def test_in_production_lot_absent_from_stock_is_still_pinned():
+    """A committed lot with no free dyelot_stock row (fully committed) still pins
+    via the synthetic lot row sized to committed_kg."""
+    tasks = [_knit_task("t_new", "NEW", {"3039": 4}, slots={"3039": 1})]
+    assigns = [_assign("t_new", "SK1", 100)]
+    dyelot_stock = [{"vi": "3039", "dyelot": "dyelotFREE", "remaining_kg": 50, "packing_size": 10}]
+    in_prod = [{"order": "INPROD", "vi": "3039", "dyelot": "dyelotGONE",
+                "machine_id": "SK1", "start_time": 0, "net_kg": 10, "slots": 1,
+                "committed_kg": 10}]
+    out = allocate_dyelots(tasks, assigns, dyelot_stock, CFG,
+                           vi_packing={"3039": 10}, in_production=in_prod)
+    amap = {a["order"]: a["dyelot"] for a in out["order_dyelot_assignment"]}
+    assert amap["INPROD"] == "dyelotGONE"
+
+
+def test_in_production_absent_signal_is_noop():
+    """No in_production (or None) → unchanged legacy behaviour."""
+    tasks = [_knit_task("t_new", "NEW", {"3039": 4}, slots={"3039": 1})]
+    assigns = [_assign("t_new", "SK1", 100)]
+    stock = [{"vi": "3039", "dyelot": "dyelotA", "remaining_kg": 50, "packing_size": 10}]
+    a = allocate_dyelots(tasks, assigns, stock, CFG, vi_packing={"3039": 10})
+    b = allocate_dyelots(tasks, assigns, stock, CFG, vi_packing={"3039": 10}, in_production=None)
+    assert a["order_dyelot_assignment"] == b["order_dyelot_assignment"]
+
+
+def test_in_production_picked_creel_restores_capacity_for_co_lot():
+    """Case 2/3: after picking + receipt, the committed lot's FREE stock dropped
+    below the cohort need, but the picked creel (committed_kg, no longer in
+    dyelot_stock) added back to capacity makes co-lot feasible again — the new
+    order stays on the in-production lot instead of pulling a fresh lot."""
+    tasks = [_knit_task("t_new", "NEW", {"3039": 4}, slots={"3039": 1})]  # gross 10
+    assigns = [_assign("t_new", "SK1", 100)]
+    # dyelot03 free is only 5kg after picking; dyelot02 (fresh) has plenty.
+    dyelot_stock = [
+        {"vi": "3039", "dyelot": "dyelot03", "remaining_kg": 5, "packing_size": 10},
+        {"vi": "3039", "dyelot": "dyelot02", "remaining_kg": 500, "packing_size": 10},
+    ]
+    # 30kg of dyelot03 picked creel sits on SK1 for the in-production order.
+    in_prod = [{"order": "INPROD", "vi": "3039", "dyelot": "dyelot03",
+                "machine_id": "SK1", "start_time": 0, "net_kg": 10, "slots": 1,
+                "committed_kg": 30}]
+    out = allocate_dyelots(tasks, assigns, dyelot_stock, CFG,
+                           vi_packing={"3039": 10}, in_production=in_prod)
+    amap = {a["order"]: a["dyelot"] for a in out["order_dyelot_assignment"]}
+    assert amap["INPROD"] == "dyelot03"
+    assert amap["NEW"] == "dyelot03"   # co-lotted thanks to the re-counted creel
+
+
+def test_in_production_many_machines_does_not_inflate_gross():
+    """An in-production order mounted on MANY machines (tiny remaining net each,
+    slots>0) must not blow its gross up per-machine and make the forced pin
+    infeasible (which dropped the whole VI → empty allocation). Pooled charge keeps
+    it feasible so both it and a sharing new order land on the committed lot."""
+    machines = [f"M{i}" for i in range(20)]
+    in_prod = [{"order": "INPROD", "vi": "3039", "dyelot": "dyelot03",
+                "machine_id": m, "start_time": 0, "net_kg": 0.1, "slots": 2,
+                "committed_kg": 300} for m in machines]
+    tasks = [_knit_task("t_new", "NEW", {"3039": 4}, slots={"3039": 1})]
+    assigns = [_assign("t_new", "M0", 500)]  # shares M0 with INPROD → flush pair
+    dyelot_stock = [
+        {"vi": "3039", "dyelot": "dyelot03", "remaining_kg": 20, "packing_size": 10},
+        {"vi": "3039", "dyelot": "dyelot02", "remaining_kg": 1000, "packing_size": 10},
+    ]
+    out = allocate_dyelots(tasks, assigns, dyelot_stock, CFG,
+                           vi_packing={"3039": 10}, in_production=in_prod)
+    amap = {a["order"]: a["dyelot"] for a in out["order_dyelot_assignment"]}
+    assert amap.get("INPROD") == "dyelot03"   # pin feasible (gross not inflated)
+    assert amap.get("NEW") == "dyelot03"       # co-lotted
