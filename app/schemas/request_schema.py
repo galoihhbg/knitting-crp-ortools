@@ -56,7 +56,13 @@ class SolverTask(BaseModel):
     # nhiều order_group_id/item).  CHỈ ảnh hưởng sequencing/objective knitting —
     # KHÔNG đụng dyelot.  Để trống "" → knitting gom theo original_order_id như cũ.
     ship_group_id: str = Field(default="", alias="ship_group_id")
-    operation: str = Field(alias="operation")
+    operation: str = Field(
+        alias="operation",
+        description=(
+            "Solver operation, including capacity_block for knitting workforce "
+            "windows and capacity_block_linking for linking workforce windows."
+        ),
+    )
     qty: float = Field(alias="qty")
     total_qty: float = Field(alias="total_qty")
     priority: int = Field(alias="priority")

@@ -174,3 +174,42 @@ def test_linking_left_shift_respects_worker_unavailability():
     l0 = next(a for a in asg if a["task_id"] == "L0")
     # earliest feasible: W2 at 100 (panel ready) — not inside W1's 0-500 window
     assert l0["start_time"] == 100 and l0["machine_id"] == "W2"
+
+
+def test_linking_left_shift_rejects_busy_machine_at_fallback_time():
+    """A lexicographically earlier worker must not win the fallback-time tie when its
+    actual earliest free slot is later than the fallback."""
+    workers = ["W1", "W2"]
+    knit = [_knit_task("K0")]
+    knit_asg = [_knit_assign("K0", "M", 0, 100)]
+    links = [
+        {
+            **_link_task("L_BLOCK", duration=600, deps=[], workers=["W1"]),
+            "is_pinned": True,
+        },
+        _link_task("L0", duration=100, deps=["K0"], workers=workers),
+    ]
+    link_asg = [
+        {
+            "task_id": "L_BLOCK",
+            "machine_id": "W1",
+            "start_time": 100,
+            "end_time": 700,
+            "status": "ON_TIME",
+        },
+        {
+            "task_id": "L0",
+            "machine_id": "W2",
+            "start_time": 500,
+            "end_time": 600,
+            "status": "ON_TIME",
+        },
+    ]
+    asg = knit_asg + link_asg
+    resources = _workers(workers, unavail={"W2": [{"start": 0, "end": 500}]})
+
+    left_shift_cold_linking(asg, knit + links, resources, {})
+
+    l0 = next(a for a in asg if a["task_id"] == "L0")
+    assert (l0["machine_id"], l0["start_time"]) == ("W2", 500)
+    assert _no_overlap(asg)

@@ -1,16 +1,17 @@
 """
 Shift-worker variability tests.
 
-Go creates pinned DUMMY tasks to block workers during shifts they are not
-assigned to.  These tests exercise failure modes that arise when the
-number of workers differs between shifts:
+Linking uses real LM_* machines, with pinned capacity_block_linking tasks
+limiting concurrency when fewer workers than machines are available.
+Legacy pinned DUMMY fixtures remain where tests specifically exercise
+pinned-task guards and overlap handling.
 
   Class 0 — Healthy baseline:
       Worker count changes between shifts; solver uses only the workers
       that are free in each window.  Should always be feasible.
 
   Class 1 — Same-machine overlap:
-      Two DUMMY tasks share the same W_ machine with overlapping [start, end)
+      Two DUMMY tasks share the same serial machine with overlapping [start, end)
       windows.  AddNoOverlap on that machine becomes hard-infeasible.
       Reproduces the "5 workers feasible / 10 workers infeasible" regression.
 
@@ -20,7 +21,7 @@ number of workers differs between shifts:
 
   Class 3 — Missing resource guard:
       A DUMMY task is pinned to a machine that Go omitted from the resources
-      list (e.g. W_LINKING_09 added to dummies before Go updated resources).
+      list (e.g. LM_09 added to dummies before Go updated resources).
       The auto-register guard should keep the model feasible.
 
   Class 4 — Pinned task vs unavailability overlap (new):
@@ -87,6 +88,33 @@ def _resource(r_id: str, operation: str = "linking") -> Dict[str, Any]:
         "design_item_id": "",
         "color_config": "",
         "available_at_min": 0,
+    }
+
+
+def _linking_machines(n: int):
+    return [_resource(f"LM_{i:02d}", operation="linking") for i in range(1, n + 1)]
+
+
+def _capa_block_linking(task_id, start, end, demand):
+    return {
+        "task_id": task_id,
+        "original_order_id": task_id,
+        "group_id": "DUMMY",
+        "operation": "capacity_block_linking",
+        "qty": 1,
+        "total_qty": 1,
+        "priority": 0,
+        "final_depends_on": [],
+        "start_after_min": start,
+        "due_at_min": end,
+        "duration": end - start,
+        "is_pinned": True,
+        "pinned_start_time": start,
+        "pinned_end_time": end,
+        "demand": demand,
+        "compatible_resource_ids": [],
+        "design_item_id": "",
+        "color_config": "",
     }
 
 
@@ -216,15 +244,15 @@ class TestHealthyShiftBlocking:
 
     def test_single_worker_blocked_during_one_shift(self):
         """
-        3 workers, one blocked during [480, 960).
-        2 real tasks with duration 200 — both fit outside or on the 2 unblocked workers.
+        3 machines, but only 2 workers available during [480, 960).
+        2 real tasks with duration 200 fit within the available workforce capacity.
         """
-        resources = [_resource(f"W_LINKING_0{i}") for i in range(1, 4)]
-        all_ids = [f"W_LINKING_0{i}" for i in range(1, 4)]
+        resources = _linking_machines(3)
+        all_ids = [resource["id"] for resource in resources]
         tasks = [
             _task("LINK_A", all_ids, duration=200),
             _task("LINK_B", all_ids, duration=200),
-            _dummy("DUMMY_NIGHT_03", "W_LINKING_03", 480, 960),
+            _capa_block_linking("CAPA_BLOCK_LINKING_NIGHT", 480, 960, demand=1),
         ]
         result = _solve(resources, tasks)
         assert result["status"] == "feasible"
@@ -232,9 +260,9 @@ class TestHealthyShiftBlocking:
         assert len(assigns) == 2
 
     def test_5_workers_all_shifts_covered(self):
-        """5 workers, no dummy tasks → 5 real tasks schedule freely."""
-        resources = [_resource(f"W_LINKING_0{i}") for i in range(1, 6)]
-        all_ids = [f"W_LINKING_0{i}" for i in range(1, 6)]
+        """5 workers for 5 machines, so no capacity block is needed."""
+        resources = _linking_machines(5)
+        all_ids = [resource["id"] for resource in resources]
         tasks = [_task(f"LINK_{i}", all_ids, duration=100) for i in range(5)]
         result = _solve(resources, tasks)
         assert result["status"] == "feasible"
@@ -243,18 +271,16 @@ class TestHealthyShiftBlocking:
     def test_10_workers_5_blocked_per_shift(self):
         """
         Reproduces the user's regression scenario:
-        10 workers, workers 6-10 blocked during the night shift [480, 960).
+        10 machines, but only 5 workers available during [480, 960).
         8 real tasks — should remain feasible (10 workers give more room, not less).
         """
-        resources = [_resource(f"W_LINKING_{i:02d}") for i in range(1, 11)]
-        all_ids = [f"W_LINKING_{i:02d}" for i in range(1, 11)]
-        # Block workers 6-10 during night shift
-        dummies = [
-            _dummy(f"DUMMY_NIGHT_{i:02d}", f"W_LINKING_{i:02d}", 480, 960)
-            for i in range(6, 11)
-        ]
+        resources = _linking_machines(10)
+        all_ids = [resource["id"] for resource in resources]
+        capacity_block = _capa_block_linking(
+            "CAPA_BLOCK_LINKING_NIGHT", 480, 960, demand=5
+        )
         real_tasks = [_task(f"LINK_{i}", all_ids, duration=100) for i in range(8)]
-        result = _solve(resources, real_tasks + dummies)
+        result = _solve(resources, real_tasks + [capacity_block])
         assert result["status"] == "feasible"
         assert len(_real_assignments(result)) == 8
 
@@ -263,11 +289,11 @@ class TestHealthyShiftBlocking:
         CA SÁNG block [0, 480) and CA TỐI block [480, 960) are adjacent, not overlapping.
         Real task must start ≥ 960 (machine free after both blocks end).
         """
-        resources = [_resource("W_LINKING_01")]
+        resources = [_resource("LM_01")]
         tasks = [
-            _task("LINK_X", ["W_LINKING_01"], duration=100),
-            _dummy("DUMMY_SANG", "W_LINKING_01", 0, 480),
-            _dummy("DUMMY_TOI", "W_LINKING_01", 480, 960),
+            _task("LINK_X", ["LM_01"], duration=100),
+            _dummy("DUMMY_SANG", "LM_01", 0, 480),
+            _dummy("DUMMY_TOI", "LM_01", 480, 960),
         ]
         result = _solve(resources, tasks)
         assert result["status"] == "feasible"
@@ -281,11 +307,11 @@ class TestHealthyShiftBlocking:
         Day 1 afternoon [480, 1440), Day 2 afternoon [1920, 2880).
         Real task should be scheduled in the free windows [0,480) or [1440,1920).
         """
-        resources = [_resource("W_LINKING_09")]
+        resources = [_resource("LM_09")]
         tasks = [
-            _task("LINK_X", ["W_LINKING_09"], duration=100),
-            _dummy("DUMMY_D1_AFT", "W_LINKING_09", 480, 1440),
-            _dummy("DUMMY_D2_AFT", "W_LINKING_09", 1920, 2880),
+            _task("LINK_X", ["LM_09"], duration=100),
+            _dummy("DUMMY_D1_AFT", "LM_09", 480, 1440),
+            _dummy("DUMMY_D2_AFT", "LM_09", 1920, 2880),
         ]
         result = _solve(resources, tasks)
         assert result["status"] == "feasible"
@@ -311,17 +337,17 @@ class TestPinnedOverlapInfeasibility:
         Previously, this caused AddNoOverlap to instantly return INFEASIBLE.
         Now, _sanitize_dummy_tasks should merge them into a single solid block.
         """
-        resources = [_resource("W_LINKING_09")]
+        resources = [_resource("LM_09")]
         tasks = [
-            _task("LINK_X", ["W_LINKING_09"], duration=100),
+            _task("LINK_X", ["LM_09"], duration=100),
             # Morning shifts
-            _dummy("DUMMY_WK1_MOR", "W_LINKING_09", 0, 480),
-            _dummy("DUMMY_WK2_MOR", "W_LINKING_09", 0, 480),
+            _dummy("DUMMY_WK1_MOR", "LM_09", 0, 480),
+            _dummy("DUMMY_WK2_MOR", "LM_09", 0, 480),
             # Afternoon shifts overlapping with morning slightly
-            _dummy("DUMMY_WK1_AFT", "W_LINKING_09", 400, 960),
-            _dummy("DUMMY_WK3_AFT", "W_LINKING_09", 400, 960),
+            _dummy("DUMMY_WK1_AFT", "LM_09", 400, 960),
+            _dummy("DUMMY_WK3_AFT", "LM_09", 400, 960),
             # Completely enclosed shift
-            _dummy("DUMMY_WK4_NOON", "W_LINKING_09", 200, 300),
+            _dummy("DUMMY_WK4_NOON", "LM_09", 200, 300),
         ]
         # Total merged block should be [0, 960].
         # Real task should be scheduled at 960+.
@@ -336,11 +362,11 @@ class TestPinnedOverlapInfeasibility:
         Now that we merge overlapping dummies automatically, this old test
         (which asserted 'infeasible') is actually expected to be FEASIBLE.
         """
-        resources = [_resource("W_LINKING_09"), _resource("W_LINKING_10")]
+        resources = [_resource("LM_09"), _resource("LM_10")]
         tasks = [
-            _task("LINK_X", ["W_LINKING_09", "W_LINKING_10"], duration=100),
-            _dummy("DUMMY_A", "W_LINKING_09", 0, 600),
-            _dummy("DUMMY_B", "W_LINKING_09", 500, 900),  # overlaps DUMMY_A
+            _task("LINK_X", ["LM_09", "LM_10"], duration=100),
+            _dummy("DUMMY_A", "LM_09", 0, 600),
+            _dummy("DUMMY_B", "LM_09", 500, 900),  # overlaps DUMMY_A
         ]
         result = _solve(resources, tasks)
         assert result["status"] == "feasible" # Changed from infeasible to feasible due to fix
@@ -350,21 +376,21 @@ class TestPinnedOverlapInfeasibility:
         Now that we merge overlapping dummies automatically, this old test
         (which asserted 'infeasible') is actually expected to be FEASIBLE.
         """
-        resources = [_resource("W_LINKING_09")]
+        resources = [_resource("LM_09")]
         tasks = [
-            _dummy("DUMMY_SANG", "W_LINKING_09", 0, 481),   # should end at 480
-            _dummy("DUMMY_TOI",  "W_LINKING_09", 480, 960),  # starts at 480
+            _dummy("DUMMY_SANG", "LM_09", 0, 481),   # should end at 480
+            _dummy("DUMMY_TOI",  "LM_09", 480, 960),  # starts at 480
         ]
         result = _solve(resources, tasks)
         assert result["status"] == "feasible" # Changed from infeasible to feasible due to fix
 
     def test_non_overlapping_dummies_on_same_machine_still_feasible(self):
         """Sanity: [0,480) and [480,960) do NOT overlap — solver is fine."""
-        resources = [_resource("W_LINKING_09")]
+        resources = [_resource("LM_09")]
         tasks = [
-            _task("LINK_X", ["W_LINKING_09"], duration=100),
-            _dummy("DUMMY_SANG", "W_LINKING_09", 0, 480),
-            _dummy("DUMMY_TOI",  "W_LINKING_09", 480, 960),
+            _task("LINK_X", ["LM_09"], duration=100),
+            _dummy("DUMMY_SANG", "LM_09", 0, 480),
+            _dummy("DUMMY_TOI",  "LM_09", 480, 960),
         ]
         result = _solve(resources, tasks)
         assert result["status"] == "feasible"
@@ -374,12 +400,12 @@ class TestPinnedOverlapInfeasibility:
         Now that we merge overlapping dummies automatically, this old test
         (which asserted 'infeasible') is actually expected to be FEASIBLE.
         """
-        resources = [_resource("W_LINKING_09"), _resource("W_LINKING_10")]
+        resources = [_resource("LM_09"), _resource("LM_10")]
         tasks = [
-            _task("LINK_X", ["W_LINKING_09", "W_LINKING_10"], duration=100),
-            _dummy("DUMMY_A", "W_LINKING_09", 0, 600),
-            _dummy("DUMMY_B", "W_LINKING_09", 500, 900),  # overlaps DUMMY_A on _09
-            # W_LINKING_10 is completely free — but that doesn't rescue the model
+            _task("LINK_X", ["LM_09", "LM_10"], duration=100),
+            _dummy("DUMMY_A", "LM_09", 0, 600),
+            _dummy("DUMMY_B", "LM_09", 500, 900),  # overlaps DUMMY_A on _09
+            # LM_10 is completely free — but that doesn't rescue the model
         ]
         result = _solve(resources, tasks)
         assert result["status"] == "feasible" # Changed from infeasible to feasible due to fix
@@ -390,11 +416,11 @@ class TestUserLogScenario:
 
     def test_user_log_contiguous_dummy_tasks(self):
         """
-        The user shared a log of 65 dummy tasks on W_LINKING_06 covering 40+ days.
+        The user shared a log of 65 dummy tasks on LM_06 covering 40+ days.
         They don't overlap, they just cover almost the entire horizon.
         We'll verify if this specifically triggers INFEASIBLE.
         """
-        resources = [_resource("W_LINKING_06")]
+        resources = [_resource("LM_06")]
         
         # We simulate the exact Start/End boundaries from the user log
         # to see if the solver chokes on the total duration, bounds, or gap structure.
@@ -416,10 +442,10 @@ class TestUserLogScenario:
         
         tasks = []
         for i, (s, e) in enumerate(intervals):
-            tasks.append(_dummy(f"DUMMY_WK6_{i}", "W_LINKING_06", s, e))
+            tasks.append(_dummy(f"DUMMY_WK6_{i}", "LM_06", s, e))
             
         # Add a real task that must be scheduled
-        tasks.append(_task("LINK_X", ["W_LINKING_06"], duration=200))
+        tasks.append(_task("LINK_X", ["LM_06"], duration=200))
         
         result = _solve(resources, tasks)
         # Verify if it's feasible or fails for an obscure reason
@@ -434,12 +460,12 @@ class TestUserLogScenario:
         But lateness is bounded [0, horizon=40320].
         If lateness constraints are applied to dummy tasks, this evaluates to INFEASIBLE.
         """
-        resources = [_resource("W_LINKING_06")]
+        resources = [_resource("LM_06")]
         
         tasks = [
-            _task("LINK_X", ["W_LINKING_06"], duration=200),
+            _task("LINK_X", ["LM_06"], duration=200),
             # Send a dummy task that ends at 90,000 but has 0 duration mapped in payload.
-            _dummy("DUMMY_HUGE", "W_LINKING_06", 89000, 90000),
+            _dummy("DUMMY_HUGE", "LM_06", 89000, 90000),
         ]
         
         # Override the dummy duration to 0 to simulate Go backend not counting it
@@ -458,18 +484,18 @@ class TestUserLogScenario:
         reproduce this exact combination to identify the constraint violation.
         """
         resources = [
-            _resource("W_LINKING_01"), _resource("W_LINKING_02"),
+            _resource("LM_01"), _resource("LM_02"),
             _resource("DT1EMNycYAMjWLe"), _resource("W_WASHING_05"),
             _resource("W_IRONING_05"), _resource("W_PACKING_05"),
             _resource("W_IRONING_04"), _resource("W_IRONING_03"),
             _resource("W_PACKING_04"), _resource("W_PACKING_03"),
-            _resource("DT7hPmDj15YcFQW"), _resource("W_LINKING_05"),
+            _resource("DT7hPmDj15YcFQW"), _resource("LM_05"),
         ]
         
         # Real tasks (free)
         tasks = [
             _task("BATCH_0-657_1", ["DT1EMNycYAMjWLe"], duration=100, operation="knitting"),
-            _task("LINKING_1", ["W_LINKING_01", "W_LINKING_02"], duration=100, operation="linking"),
+            _task("LINKING_1", ["LM_01", "LM_02"], duration=100, operation="linking"),
             _task("WASH_1", ["W_WASHING_05"], duration=100, operation="washing"),
         ]
         
@@ -486,7 +512,7 @@ class TestUserLogScenario:
             }
             
         tasks.append(__pinned("PIN_11_BATCH", ["DT7hPmDj15YcFQW"], 0, 10, op="knitting"))
-        tasks.append(__pinned("PIN_11_LINKING", ["W_LINKING_05"], 11, 61, op="linking"))
+        tasks.append(__pinned("PIN_11_LINKING", ["LM_05"], 11, 61, op="linking"))
         tasks.append(__pinned("PIN_11_WASH", ["W_WASHING_05"], 62, 114, op="washing"))
         tasks.append(__pinned("PIN_11_IRON", ["W_IRONING_05"], 121, 141, op="ironing"))
         
@@ -526,11 +552,11 @@ class TestUserLogScenario:
         Both workers blocked [0, 500).  Real task duration=100 fits after 500.
         Should be feasible — task just starts at ≥ 500.
         """
-        resources = [_resource("W_LINKING_01"), _resource("W_LINKING_02")]
+        resources = [_resource("LM_01"), _resource("LM_02")]
         tasks = [
-            _task("LINK_X", ["W_LINKING_01", "W_LINKING_02"], duration=100),
-            _dummy("DUMMY_01", "W_LINKING_01", 0, 500),
-            _dummy("DUMMY_02", "W_LINKING_02", 0, 500),
+            _task("LINK_X", ["LM_01", "LM_02"], duration=100),
+            _dummy("DUMMY_01", "LM_01", 0, 500),
+            _dummy("DUMMY_02", "LM_02", 0, 500),
         ]
         result = _solve(resources, tasks)
         assert result["status"] == "feasible"
@@ -538,16 +564,16 @@ class TestUserLogScenario:
         assert assigns["LINK_X"]["start_time"] >= 500
 
     def test_partial_block_leaves_window_open(self):
-        """Only W_LINKING_01 is blocked; W_LINKING_02 is free → task uses W_LINKING_02."""
-        resources = [_resource("W_LINKING_01"), _resource("W_LINKING_02")]
+        """Only LM_01 is blocked; LM_02 is free → task uses LM_02."""
+        resources = [_resource("LM_01"), _resource("LM_02")]
         tasks = [
-            _task("LINK_X", ["W_LINKING_01", "W_LINKING_02"], duration=100),
-            _dummy("DUMMY_01", "W_LINKING_01", 0, HORIZON),
+            _task("LINK_X", ["LM_01", "LM_02"], duration=100),
+            _dummy("DUMMY_01", "LM_01", 0, HORIZON),
         ]
         result = _solve(resources, tasks)
         assert result["status"] == "feasible"
         assigns = _real_assignments(result)
-        assert assigns["LINK_X"]["machine_id"] == "W_LINKING_02"
+        assert assigns["LINK_X"]["machine_id"] == "LM_02"
 
 
 # ── Class 3: Missing resource guard ──────────────────────────────────────
@@ -562,14 +588,14 @@ class TestMissingResourceGuard:
 
     def test_dummy_on_unlisted_machine_auto_registered(self):
         """
-        W_LINKING_03 is absent from resources but a DUMMY pins to it.
-        Real tasks only use W_LINKING_01 and W_LINKING_02 — should still be feasible.
+        LM_03 is absent from resources but a DUMMY pins to it.
+        Real tasks only use LM_01 and LM_02 — should still be feasible.
         """
-        resources = [_resource("W_LINKING_01"), _resource("W_LINKING_02")]
-        # W_LINKING_03 intentionally omitted from resources
+        resources = [_resource("LM_01"), _resource("LM_02")]
+        # LM_03 intentionally omitted from resources
         tasks = [
-            _task("LINK_A", ["W_LINKING_01", "W_LINKING_02"], duration=100),
-            _dummy("DUMMY_EXTRA", "W_LINKING_03", 0, 480),
+            _task("LINK_A", ["LM_01", "LM_02"], duration=100),
+            _dummy("DUMMY_EXTRA", "LM_03", 0, 480),
         ]
         result = _solve(resources, tasks)
         assert result["status"] == "feasible"
@@ -578,13 +604,13 @@ class TestMissingResourceGuard:
 
     def test_real_task_on_unlisted_machine_remains_infeasible(self):
         """
-        A real (non-pinned) task lists only W_LINKING_99 as compatible, but that
+        A real (non-pinned) task lists only LM_99 as compatible, but that
         machine is absent from resources.  build_time_variables skips it →
         no_resource_tasks → infeasible.  The guard must NOT rescue non-pinned tasks.
         """
-        resources = [_resource("W_LINKING_01")]
+        resources = [_resource("LM_01")]
         tasks = [
-            _task("LINK_X", ["W_LINKING_99"], duration=100),  # W_99 not in resources
+            _task("LINK_X", ["LM_99"], duration=100),  # LM_99 not in resources
         ]
         result = _solve(resources, tasks)
         assert result["status"] == "infeasible"
@@ -592,15 +618,15 @@ class TestMissingResourceGuard:
     def test_10_workers_with_missing_resources_for_new_workers(self):
         """
         Exact reproduction: Go increases workers 5→10, updates dummy tasks but
-        forgets to update the resources list.  W_LINKING_06..10 exist only in
+        forgets to update the resources list.  LM_06..10 exist only in
         dummies, not in resources.  Auto-register should keep the model feasible.
         """
         # Only original 5 workers in resources
-        resources = [_resource(f"W_LINKING_0{i}") for i in range(1, 6)]
-        old_ids = [f"W_LINKING_0{i}" for i in range(1, 6)]
+        resources = [_resource(f"LM_0{i}") for i in range(1, 6)]
+        old_ids = [f"LM_0{i}" for i in range(1, 6)]
         # Dummies for new workers 6-10 — their machines are NOT in resources
         dummies = [
-            _dummy(f"DUMMY_NIGHT_{i:02d}", f"W_LINKING_{i:02d}", 480, 960)
+            _dummy(f"DUMMY_NIGHT_{i:02d}", f"LM_{i:02d}", 480, 960)
             for i in range(6, 11)
         ]
         real_tasks = [_task(f"LINK_{i}", old_ids, duration=100) for i in range(4)]
@@ -615,7 +641,7 @@ class TestMissingResourceGuard:
 
         ROOT CAUSE of the 5→10 worker regression: if pinned_machine_id=None,
         the original code did tv["r_ids"] = [None], and auto-register created
-        resource_map[None].  ALL dummy tasks (W_LINKING_06 and W_LINKING_07
+        resource_map[None].  ALL dummy tasks (LM_06 and LM_07
         with same shift window) were assigned to the same null machine →
         overlapping intervals → AddNoOverlap infeasible.
 
@@ -623,43 +649,43 @@ class TestMissingResourceGuard:
         compatible_resource_ids[0].  Each dummy goes to its correct machine.
         """
         resources = [
-            _resource("W_LINKING_01"),
-            _resource("W_LINKING_06"),
-            _resource("W_LINKING_07"),
+            _resource("LM_01"),
+            _resource("LM_06"),
+            _resource("LM_07"),
         ]
         # Two workers have the same shift window but Go forgot pinned_machine_id
         dummies = [
-            _dummy("DUMMY_06", "W_LINKING_06", 0, 480, pinned_machine_id=None),
-            _dummy("DUMMY_07", "W_LINKING_07", 0, 480, pinned_machine_id=None),
+            _dummy("DUMMY_06", "LM_06", 0, 480, pinned_machine_id=None),
+            _dummy("DUMMY_07", "LM_07", 0, 480, pinned_machine_id=None),
         ]
-        real_tasks = [_task("LINK_X", ["W_LINKING_01", "W_LINKING_06", "W_LINKING_07"], duration=100)]
+        real_tasks = [_task("LINK_X", ["LM_01", "LM_06", "LM_07"], duration=100)]
         result = _solve(resources, real_tasks + dummies)
         # Without the fix this was infeasible: both dummies → resource_map[None] → overlap
         assert result["status"] == "feasible"
         assigns = _real_assignments(result)
-        # Real task must avoid the blocked window on W_LINKING_06/07 and use W_LINKING_01
+        # Real task must avoid the blocked window on LM_06/07 and use LM_01
         # OR start after 480 on one of the others
         assert assigns["LINK_X"]["machine_id"] in (
-            "W_LINKING_01", "W_LINKING_06", "W_LINKING_07"
+            "LM_01", "LM_06", "LM_07"
         )
 
     def test_many_workers_null_pinned_machine_id_full_shift_coverage(self):
         """
         Reproduces the exact production failure:
-        - 10 linking workers (W_LINKING_01..10)
+        - 10 linking workers (LM_01..10)
         - Workers 06-10 have back-to-back dummies covering entire horizon
         - ALL dummies have pinned_machine_id=None (Go omits it)
         - Without fix: all 5×N dummy intervals land on resource_map[None], overlapping → infeasible
         - With fix: each falls back to its compatible_resource_ids[0], correctly spread
         """
-        resources = [_resource(f"W_LINKING_{i:02d}") for i in range(1, 11)]
-        all_ids = [f"W_LINKING_{i:02d}" for i in range(1, 11)]
+        resources = [_resource(f"LM_{i:02d}") for i in range(1, 11)]
+        all_ids = [f"LM_{i:02d}" for i in range(1, 11)]
 
         # Back-to-back shift blocks for workers 06-10 (simulating full horizon coverage)
         # Adjacent windows: [0,480), [480,960), [960,1440)
         dummies = []
         for worker in range(6, 11):
-            m = f"W_LINKING_{worker:02d}"
+            m = f"LM_{worker:02d}"
             for shift_start in range(0, 1440, 480):
                 dummies.append(
                     _dummy(
@@ -674,9 +700,9 @@ class TestMissingResourceGuard:
         assert result["status"] == "feasible"
         assigns = _real_assignments(result)
         assert len(assigns) == 5
-        # All real tasks should land on W_LINKING_01..05 (06-10 are fully blocked)
+        # All real tasks should land on LM_01..05 (06-10 are fully blocked)
         for a in assigns.values():
-            assert int(a["machine_id"].replace("W_LINKING_", "")) <= 5, (
+            assert int(a["machine_id"].replace("LM_", "")) <= 5, (
                 f"Task {a['task_id']} unexpectedly assigned to {a['machine_id']} "
-                "(should only use W_LINKING_01..05)"
+                "(should only use LM_01..05)"
             )

@@ -44,6 +44,12 @@ _DERIVE_MACHINE_CONFIG = os.getenv("CP_DERIVE_MACHINE_CONFIG", "1") != "0"
 # speed/quality sweet spot; raise per-run via config if a payload needs it.
 DEFAULT_MAX_DET_TIME: float = 12.0
 
+CAPACITY_BLOCK_OPS = frozenset({"capacity_block", "capacity_block_linking"})
+
+
+def is_capacity_block_op(operation: str) -> bool:
+    return (operation or "").lower() in CAPACITY_BLOCK_OPS
+
 
 # ---------------------------------------------------------------------------
 # Re-schedule stability — apply_stability_objective + StabilityStats
@@ -332,7 +338,7 @@ def compute_horizon(
 
     real_tasks = [
         t for t in tasks
-        if t.get("operation", "").lower() not in ("capacity_block",)
+        if not is_capacity_block_op(t.get("operation", ""))
     ]
     max_single = max((int(t.get("duration", 0)) for t in real_tasks), default=0)
     total_duration = sum(int(t.get("duration", 0)) for t in real_tasks)
@@ -392,7 +398,7 @@ def compute_global_horizon(
     op_tasks: Dict[str, List[Dict[str, Any]]] = {}
     for t in tasks:
         op = t.get("operation", "").lower()
-        if op == "capacity_block":
+        if is_capacity_block_op(op):
             continue
         op_tasks.setdefault(op, []).append(t)
 
@@ -808,7 +814,7 @@ def build_resource_model(
         compatible_ids = t.get("compatible_resource_ids", [])
         operation = t.get("operation", "").lower()
 
-        if operation != "capacity_block" and not compatible_ids:
+        if not is_capacity_block_op(operation) and not compatible_ids:
             logger.warning(f"⚠️ Task {t_id} has NO compatible resources — skipping.")
             no_resource_tasks.append(t)
             continue
@@ -827,7 +833,7 @@ def build_resource_model(
             lb = max(0, start_lb.get(t_id, 0))
             start_var = model.NewIntVar(lb, horizon, f"start_{t_id}")
             end_var = model.NewIntVar(lb, horizon, f"end_{t_id}")
-            if operation != "capacity_block":
+            if not is_capacity_block_op(operation):
                 duration_val = max(0, int(t.get("duration", 0)))
                 model.Add(end_var == start_var + duration_val)
             start_after = int(t.get("start_after_min", 0))
@@ -853,7 +859,7 @@ def build_resource_model(
         if t_id not in task_vars:
             continue
         operation = t.get("operation", "").lower()
-        if operation == "capacity_block":
+        if is_capacity_block_op(operation):
             continue
 
         tv = task_vars[t_id]
@@ -1012,7 +1018,7 @@ def apply_soft_deadlines(
         task = task_map.get(t_id, {})
         if task.get("is_pinned", False):
             continue
-        if task.get("operation", "").lower() == "capacity_block":
+        if is_capacity_block_op(task.get("operation", "")):
             continue
 
         priority = int(task.get("priority", 5))
@@ -1076,7 +1082,7 @@ def apply_order_flow_objective(
     for t in tasks:
         gid = t.get("group_id")
         t_id = t["task_id"]
-        if gid and t_id in task_vars and t.get("operation", "").lower() != "capacity_block":
+        if gid and t_id in task_vars and not is_capacity_block_op(t.get("operation", "")):
             groups.setdefault(gid, []).append(t_id)
 
     for gid, t_ids in sorted(groups.items()):
@@ -1318,7 +1324,7 @@ def apply_identical_task_symmetry(
         tv = task_vars.get(t_id)
         if tv is None or tv.get("is_pinned") or t.get("is_pinned"):
             continue
-        if t.get("operation", "").lower() == "capacity_block":
+        if is_capacity_block_op(t.get("operation", "")):
             continue
         # Slices are NOT fungible-for-ordering: the pipeline deliberately INTERLEAVES
         # slice_1 of every order (so a downstream consumer gets one slice from each
@@ -1380,7 +1386,7 @@ def apply_earliness_objective(
             continue
         if task.get("is_pinned", False):
             continue
-        if task.get("operation", "").lower() == "capacity_block":
+        if is_capacity_block_op(task.get("operation", "")):
             continue
         priority = int(task.get("priority", 5))
         weight = 10 ** (6 - priority)
@@ -1582,7 +1588,7 @@ def diagnose_infeasibility(
     solver_status: "infeasible" | "timeout" | "model_invalid"
     Returns one overload dict per non-capacity_block task.
     """
-    real_tasks = [t for t in tasks if t.get("operation", "").lower() != "capacity_block"]
+    real_tasks = [t for t in tasks if not is_capacity_block_op(t.get("operation", ""))]
 
     if solver_status == "timeout":
         return [
@@ -1719,7 +1725,7 @@ def _classify_root_cause(
             op = other_info.get("operation", "").lower()
             if op == "knitting":
                 concurrent_knitting += 1
-            elif op == "capacity_block":
+            elif is_capacity_block_op(op):
                 blocked_demand += int(other_info.get("demand", 0))
     if (concurrent_knitting + blocked_demand) >= config_max:
         return "WORKFORCE_SHORTAGE"
@@ -1782,7 +1788,7 @@ def extract_results(
         end_times[t_id] = end_val
 
         task = task_map.get(t_id, {})
-        if task.get("operation", "").lower() == "capacity_block":
+        if is_capacity_block_op(task.get("operation", "")):
             continue
 
         # Resolve assigned machine
