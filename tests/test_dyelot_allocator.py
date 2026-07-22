@@ -690,7 +690,7 @@ def test_in_production_many_machines_does_not_inflate_gross():
     machines = [f"M{i}" for i in range(20)]
     in_prod = [{"order": "INPROD", "vi": "3039", "dyelot": "dyelot03",
                 "machine_id": m, "start_time": 0, "net_kg": 0.1, "slots": 2,
-                "committed_kg": 300} for m in machines]
+                "committed_kg": 15} for m in machines]
     tasks = [_knit_task("t_new", "NEW", {"3039": 4}, slots={"3039": 1})]
     assigns = [_assign("t_new", "M0", 500)]  # shares M0 with INPROD → flush pair
     dyelot_stock = [
@@ -702,3 +702,114 @@ def test_in_production_many_machines_does_not_inflate_gross():
     amap = {a["order"]: a["dyelot"] for a in out["order_dyelot_assignment"]}
     assert amap.get("INPROD") == "dyelot03"   # pin feasible (gross not inflated)
     assert amap.get("NEW") == "dyelot03"       # co-lotted
+
+
+def test_in_production_shared_machines_creel_reuse_enables_colot():
+    """Reported case (CP_1784687188624193131): in-prod + new order run on the SAME
+    19 machines, both slots=2. Without creel reuse the new order's per-machine
+    creel-up (19×2×10=380kg) overflows dyelot03 and it drifts to dyelot02. With the
+    floor dropped on the mounted machines it co-lots onto dyelot03."""
+    machines = [f"M{i}" for i in range(19)]
+    # In-production WawskpLK96: dyelot03, picked (committed 319 ≈ 16.8/machine), slots 2.
+    in_prod = [{"order": "INPROD", "vi": "3039", "dyelot": "dyelot03",
+                "machine_id": m, "start_time": 0, "net_kg": 69.0/19, "slots": 2,
+                "committed_kg": 319.0/19} for m in machines]
+    # New WntA49Mfml: net 65 spread over the same 19 machines, slots 2.
+    tasks, assigns = [], []
+    for i, m in enumerate(machines):
+        tid = f"t_new_{i}"
+        tasks.append(_knit_task(tid, "NEW", {"3039": 65.0/19}, slots={"3039": 2}))
+        assigns.append(_assign(tid, m, 1000))
+    dyelot_stock = [
+        {"vi": "3039", "dyelot": "dyelot03", "remaining_kg": 120, "packing_size": 10},
+        {"vi": "3039", "dyelot": "dyelot02", "remaining_kg": 1000, "packing_size": 10},
+    ]
+    out = allocate_dyelots(tasks, assigns, dyelot_stock, CFG,
+                           vi_packing={"3039": 10}, in_production=in_prod)
+    amap = {a["order"]: a["dyelot"] for a in out["order_dyelot_assignment"]}
+    assert amap.get("INPROD") == "dyelot03"
+    assert amap.get("NEW") == "dyelot03", f"new order should co-lot, got {amap.get('NEW')}"
+
+
+def test_in_production_not_picked_keeps_floor():
+    """If the in-production creel is NOT picked (committed_kg=0 → cones not mounted),
+    the floor must NOT drop — the new order still needs its own cones. Here dyelot03
+    free (10kg) can't hold the new order's real creel-up, so it does NOT co-lot."""
+    machines = [f"M{i}" for i in range(19)]
+    in_prod = [{"order": "INPROD", "vi": "3039", "dyelot": "dyelot03",
+                "machine_id": m, "start_time": 0, "net_kg": 1.0, "slots": 2,
+                "committed_kg": 0.0} for m in machines]   # NOT picked
+    tasks, assigns = [], []
+    for i, m in enumerate(machines):
+        tid = f"t_new_{i}"
+        tasks.append(_knit_task(tid, "NEW", {"3039": 3.0}, slots={"3039": 2}))
+        assigns.append(_assign(tid, m, 1000))
+    dyelot_stock = [
+        {"vi": "3039", "dyelot": "dyelot03", "remaining_kg": 120, "packing_size": 10},
+        {"vi": "3039", "dyelot": "dyelot02", "remaining_kg": 1000, "packing_size": 10},
+    ]
+    out = allocate_dyelots(tasks, assigns, dyelot_stock, CFG,
+                           vi_packing={"3039": 10}, in_production=in_prod)
+    amap = {a["order"]: a["dyelot"] for a in out["order_dyelot_assignment"]}
+    assert amap.get("NEW") == "dyelot02", f"unpicked → floor kept → not co-lot; got {amap.get('NEW')}"
+
+
+def test_in_production_pool_colots_all_when_creel_pools(monkeypatch=None):
+    """Multiple NEW orders co-lotting an in-production lot on the SAME machines all
+    land on it when their combined NET fits (warehouse + mounted creel). The mounted
+    creel pools across the shared machines, so the per-machine whole-roll rounding
+    that would otherwise spill co-lottable orders to a 2nd lot is not charged.
+
+    Mirrors the real case CP_1784694487626128369: in-prod + 3 new on 19 machines,
+    net 69+170+150(+~28)=~417 ≤ dyelot03 supply 120 free + 319 creel = 439."""
+    machines = [f"M{i}" for i in range(19)]
+    in_prod = [{"order": "INPROD", "vi": "3039", "dyelot": "dyelot03",
+                "machine_id": m, "start_time": 0, "net_kg": 69.0/19, "slots": 2,
+                "committed_kg": 319.0/19} for m in machines]
+    tasks, assigns = [], []
+    for name, tot in (("N1", 170.0), ("N2", 150.0), ("N3", 28.0)):
+        for i, m in enumerate(machines):
+            tid = f"t_{name}_{i}"
+            tasks.append(_knit_task(tid, name, {"3039": tot/19}, slots={"3039": 2}))
+            assigns.append(_assign(tid, m, 1000))
+    dyelot_stock = [
+        {"vi": "3039", "dyelot": "dyelot03", "remaining_kg": 120, "packing_size": 10},
+        {"vi": "3039", "dyelot": "dyelot02", "remaining_kg": 1000, "packing_size": 10},
+    ]
+    out = allocate_dyelots(tasks, assigns, dyelot_stock, CFG,
+                           vi_packing={"3039": 10}, in_production=in_prod)
+    amap = {a["order"]: a["dyelot"] for a in out["order_dyelot_assignment"]}
+    for o in ("INPROD", "N1", "N2", "N3"):
+        assert amap.get(o) == "dyelot03", f"{o} should co-lot dyelot03, got {amap.get(o)}"
+
+
+def test_in_production_pool_still_respects_capacity():
+    """SAFETY: the pooled-net path must NOT over-promise. When the NEW orders' net
+    exceeds the in-production lot's real supply (warehouse + mounted creel), the
+    solver still caps what lands on it and spills the rest to another lot — it never
+    crams net beyond physical yarn (which Go commit would then find short)."""
+    machines = [f"M{i}" for i in range(5)]
+    # dyelot03: warehouse 20 + mounted creel 30 = 50 kg real supply. slots 2 mounted.
+    in_prod = [{"order": "INPROD", "vi": "3039", "dyelot": "dyelot03",
+                "machine_id": m, "start_time": 0, "net_kg": 5.0/5, "slots": 2,
+                "committed_kg": 30.0/5} for m in machines]
+    # Three NEW orders, net 40 each (120 total) — only ~1 can fit on dyelot03's 50.
+    tasks, assigns = [], []
+    for name in ("N1", "N2", "N3"):
+        for i, m in enumerate(machines):
+            tid = f"t_{name}_{i}"
+            tasks.append(_knit_task(tid, name, {"3039": 40.0/5}, slots={"3039": 2}))
+            assigns.append(_assign(tid, m, 1000))
+    dyelot_stock = [
+        {"vi": "3039", "dyelot": "dyelot03", "remaining_kg": 20, "packing_size": 10},
+        {"vi": "3039", "dyelot": "dyelot02", "remaining_kg": 1000, "packing_size": 10},
+    ]
+    out = allocate_dyelots(tasks, assigns, dyelot_stock, CFG,
+                           vi_packing={"3039": 10}, in_production=in_prod)
+    amap = {a["order"]: a["dyelot"] for a in out["order_dyelot_assignment"]}
+    net = {"INPROD": 5.0, "N1": 40.0, "N2": 40.0, "N3": 40.0}
+    on03 = sum(net[o] for o, lot in amap.items() if lot == "dyelot03")
+    # Placed net on dyelot03 must not exceed real supply (50) + at most one roll of
+    # whole-roll slack (10). Cramming all 4 (125) would blow past physical yarn.
+    assert on03 <= 60, f"dyelot03 over-promised: {on03}kg placed on 50kg supply"
+    assert amap.get("INPROD") == "dyelot03", "in-production order stays pinned"

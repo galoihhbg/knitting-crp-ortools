@@ -172,7 +172,13 @@ def allocate_dyelots(
     # creel kg to re-count into that lot's capacity (see below).
     pinned_lot: Dict[str, Dict[str, str]] = {}
     committed_by: Dict[str, Dict[str, float]] = {}
-    _committed_seen = set()   # (vi, order, dyelot) — committed_kg is repeated per machine row
+    # inprod_mounted[vi][machine][dyelot] = mounted cone count (slots) — ONLY on
+    # machines where the in-production order's creel is physically PICKED
+    # (committed_kg>0). A co-lotting new order reuses these cones, so its creel-up
+    # floor on such (machine, lot) drops to max(0, its_slots − mounted). Machines
+    # NOT yet picked keep the full floor (cones not there → new order must mount).
+    inprod_mounted: Dict[str, Dict[Any, Dict[str, int]]] = {}
+    _committed_seen = set()   # (vi, order, machine, dyelot) — committed_kg repeats per machine row
     _inprod_pool_net: Dict[Tuple[str, str], float] = {}  # (vi, order) → pooled remaining net
     for s in (in_production or []):
         vi = str(s.get("vi", ""))
@@ -184,6 +190,8 @@ def allocate_dyelots(
         dyelot = str(dyelot)
         start = int(s.get("start_time", 0) or 0)
         kg = float(s.get("net_kg", 0) or 0)          # per-machine (already split by Go)
+        slots = int(s.get("slots", 0) or 0)
+        committed_kg = float(s.get("committed_kg", 0) or 0)  # per-machine picked creel
         tid = f"INPROD_{order}_{machine}_{start}"
         vi_order_kg.setdefault(vi, {}).setdefault(order, 0.0)
         vi_order_kg[vi][order] += kg
@@ -196,11 +204,18 @@ def allocate_dyelots(
         # far past the lot and make the forced pin infeasible (→ whole VI dropped).
         _inprod_pool_net[(vi, order)] = _inprod_pool_net.get((vi, order), 0.0) + kg
         pinned_lot.setdefault(vi, {})[order] = dyelot
-        key = (vi, order, dyelot)
-        if key not in _committed_seen:                # count committed_kg ONCE per order
+        # Cap: re-count picked creel ONCE per (vi, order, machine, dyelot); summed
+        # across machines = the order's total leftover creel on this lot.
+        key = (vi, order, machine, dyelot)
+        if key not in _committed_seen:
             _committed_seen.add(key)
             committed_by.setdefault(vi, {}).setdefault(dyelot, 0.0)
-            committed_by[vi][dyelot] += float(s.get("committed_kg", 0) or 0)
+            committed_by[vi][dyelot] += committed_kg
+        # Mounted cones — only where physically picked (committed_kg>0).
+        if committed_kg > 0 and slots > 0:
+            md = inprod_mounted.setdefault(vi, {}).setdefault(machine, {})
+            if slots > md.get(dyelot, 0):
+                md[dyelot] = slots
 
     # One pooled capacity bucket per in-production (vi, order): whole-roll on the
     # POOLED remaining net, slots 0 (no creel-up floor — the cones are already
@@ -281,7 +296,9 @@ def allocate_dyelots(
 
         res = _solve_vi(vi, order_kg, lots, vi_machine_units.get(vi, {}),
                         vi_mo.get(vi, {}), solver_config,
-                        pinned_lot_vi=pinned_lot.get(vi))
+                        pinned_lot_vi=pinned_lot.get(vi),
+                        mounted_vi=inprod_mounted.get(vi),
+                        committed_vi=committed_by.get(vi))
         assignments.extend(res["assignments"])
         flush_points.extend(res["flush_points"])
         unassigned.extend(res["unassigned"])
@@ -392,7 +409,9 @@ def _cap_slack_g(demand_g, pk_g, machine_order, per_machine=True) -> int:
 
 
 def _add_roll_capacity(model, x, orders, n_lots, demand_g, cap_g, pk_g,
-                       machine_order, extra=None, per_machine=True) -> None:
+                       machine_order, extra=None, per_machine=True,
+                       mounted=None, lot_names=None,
+                       committed_g=None, inprod_pool=True) -> None:
     """Whole-roll capacity per dyelot.
 
     per_machine=True (default — CORRECT): per (machine, lot) the orders of a lot
@@ -421,26 +440,63 @@ def _add_roll_capacity(model, x, orders, n_lots, demand_g, cap_g, pk_g,
     missing = [o for o in orders if o not in with_machine]
     for d in range(n_lots):
         ub = (cap_g[d] + bump) // pk_g[d] + 1
+        # An IN-PRODUCTION lot (its picked creel re-counted into cap via
+        # committed_g[d] > 0) has that creel physically MOUNTED and pooling across
+        # the machines it runs on: the residual of one run feeds the next, so a
+        # co-lotting order draws from it instead of mounting fresh cones. Charging
+        # each machine its own whole-roll rounding of NET then over-reserves by
+        # ~(machines × ½ roll) and wrongly spills co-lottable orders to a second
+        # lot. So for such a lot the NET is pooled (one lot-level whole-roll bound,
+        # credited by the mounted creel), while the per-machine creel-up floor is
+        # KEPT — a run needing WIDER creel than mounted still charges the extra
+        # cones — and fresh rolls are bounded by WAREHOUSE (cap − committed) so the
+        # mounted creel is never double-counted. Non-in-production lots keep the
+        # strict per-machine model (parallel machines each mount their own cones).
+        cmt = (committed_g[d] if committed_g else 0)
+        pool_net = bool(inprod_pool and cmt > 0)
         lot_rolls = []
+        pooled_net_terms = []
         for m in machines:
             mo = machine_order[m]
             oz = [o for o in orders if o in mo]
             if not oz:
                 continue
             r = model.NewIntVar(0, ub, f"r_{d}_{m}")
-            model.Add(r * pk_g[d] >= sum(_g(mo[o][0]) * x[o][d] for o in oz))
+            net_m = sum(_g(mo[o][0]) * x[o][d] for o in oz)
+            if pool_net:
+                pooled_net_terms.append(net_m)   # net pools at lot level (below)
+            else:
+                model.Add(r * pk_g[d] >= net_m)   # per-machine whole-roll of net
+            # Creel-up floor per order. If an in-production order already mounts
+            # this lot's cones on machine m (mounted[m][lot_name]), a co-lotting
+            # order reuses them → its floor drops by the mounted count (kept even in
+            # the pooled-net path: a wider-creel run must still mount extra cones).
+            mnt = 0
+            if mounted and lot_names is not None:
+                mnt = mounted.get(m, {}).get(lot_names[d], 0)
             for o in oz:
-                s = int(mo[o][1])
+                s = int(mo[o][1]) - mnt
                 if s > 0:
                     model.Add(r * pk_g[d] >= s * pk_g[d] * x[o][d])  # creel floor
             lot_rolls.append(r)
         if missing:
             r = model.NewIntVar(0, ub, f"rm_{d}")
-            model.Add(r * pk_g[d] >= sum(demand_g[o] * x[o][d] for o in missing))
+            miss_net = sum(demand_g[o] * x[o][d] for o in missing)
+            if pool_net:
+                pooled_net_terms.append(miss_net)
+            else:
+                model.Add(r * pk_g[d] >= miss_net)
             lot_rolls.append(r)
         if lot_rolls:
-            cap = cap_g[d] + (extra[d] if extra is not None else 0)
-            model.Add(sum(lot_rolls) * pk_g[d] <= cap)
+            extra_d = (extra[d] if extra is not None else 0)
+            if pool_net:
+                # Mounted creel (committed) covers net poolingly; fresh rolls cover
+                # only the remainder and come from WAREHOUSE (cap − committed).
+                model.Add(sum(lot_rolls) * pk_g[d] + cmt >= sum(pooled_net_terms))
+                warehouse = cap_g[d] - cmt + extra_d
+                model.Add(sum(lot_rolls) * pk_g[d] <= (warehouse if warehouse > 0 else 0))
+            else:
+                model.Add(sum(lot_rolls) * pk_g[d] <= cap_g[d] + extra_d)
 
 
 def _solve_vi(
@@ -451,6 +507,8 @@ def _solve_vi(
     machine_order: Dict[Any, Dict[str, List[float]]],
     config: Dict[str, Any],
     pinned_lot_vi: Optional[Dict[str, str]] = None,
+    mounted_vi: Optional[Dict[Any, Dict[str, int]]] = None,
+    committed_vi: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """One independent CP-SAT model for a single VI.
 
@@ -527,9 +585,18 @@ def _solve_vi(
             if d is not None:
                 model.Add(x[o][d] == 1)
 
-    # Capacity — reuse-aware per-(machine, lot) roll model (C).
+    # Capacity — reuse-aware per-(machine, lot) roll model (C). mounted lets a
+    # co-lotting order reuse an in-production order's already-mounted cones
+    # (creel-up floor drops on those machines).
+    lot_names = [str(lots[d].get("dyelot", "")) for d in range(n_lots)]
+    # Per-lot picked-creel kg (grams) re-counted into cap — drives the pooled-net
+    # capacity for in-production lots (creel physically pools across their machines).
+    committed_g = ([_g((committed_vi or {}).get(lot_names[d], 0)) for d in range(n_lots)]
+                   if per_machine else None)
     _add_roll_capacity(model, x, orders, n_lots, demand_g, cap_g, pk_g, machine_order,
-                       per_machine=per_machine)
+                       per_machine=per_machine, mounted=mounted_vi, lot_names=lot_names,
+                       committed_g=committed_g,
+                       inprod_pool=bool(config.get("enable_dyelot_inprod_pool", True)))
 
     # used[d]: 1 iff lot d carries any order.  Drives tier-3 (min lots) + tier-4.
     used = [model.NewBoolVar(f"used_{vi}_{d}") for d in range(n_lots)]
