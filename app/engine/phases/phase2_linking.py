@@ -28,14 +28,14 @@ from app.engine.shared import (
 )
 from .placement import (  # A1a shared helpers
     avail_at,
-    earliest_sweep,
     relabel_balance,
     unavail_windows,
 )
 
 logger = logging.getLogger(__name__)
 
-PHASE2_OPS = frozenset({"linking"})
+PHASE2_OPS = frozenset({"linking", "capacity_block_linking"})
+PHASE2_MACHINE_OPS = frozenset({"linking"})
 
 
 def balance_linking_load(
@@ -73,7 +73,7 @@ def balance_linking_load(
     """
     return relabel_balance(
         assignments, all_tasks, resources, config,
-        ops=frozenset(PHASE2_OPS), label="Linking",
+        ops=frozenset(PHASE2_MACHINE_OPS), label="Linking",
     )
 
 
@@ -109,7 +109,7 @@ def left_shift_cold_linking(
     NOT applied on re-schedule.  Mutates `assignments` in place.  Returns #tasks moved.
     """
     info = {t["task_id"]: t for t in all_tasks}
-    workers = [r["id"] for r in resources if r.get("operation", "").lower() in PHASE2_OPS]
+    workers = [r["id"] for r in resources if r.get("operation", "").lower() in PHASE2_MACHINE_OPS]
     if not workers:
         return 0
     res_by_id = {r["id"]: r for r in resources}
@@ -126,7 +126,7 @@ def left_shift_cold_linking(
 
     link_assigns = [
         a for a in assignments
-        if info.get(a["task_id"], {}).get("operation", "").lower() in PHASE2_OPS
+        if info.get(a["task_id"], {}).get("operation", "").lower() in PHASE2_MACHINE_OPS
     ]
     if not link_assigns:
         return 0
@@ -208,6 +208,24 @@ def left_shift_cold_linking(
     orig_m = {a["task_id"]: a["machine_id"] for a in link_assigns}
     orig_s = {a["task_id"]: int(a["start_time"]) for a in link_assigns}
     dur_of = {a["task_id"]: int(a["end_time"]) - int(a["start_time"]) for a in link_assigns}
+    workforce_capacity = max(1, len(workers))
+    workforce_blocks = [
+        (
+            int(t.get("pinned_start_time", 0)),
+            int(t.get("pinned_end_time", 0)),
+            int(t.get("demand", 0)),
+        )
+        for t in all_tasks
+        if (t.get("operation") or "").lower() == "capacity_block_linking"
+        and t.get("is_pinned")
+        and t.get("pinned_start_time") is not None
+        and t.get("pinned_end_time") is not None
+        and int(t.get("demand", 0)) > 0
+    ]
+    workforce_slots = {
+        task_id: (orig_s[task_id], orig_s[task_id] + dur_of[task_id])
+        for task_id in orig_s
+    }
 
     # Seed: worker unavailability windows + every linking task at its original slot.
     placed: Dict[str, List[tuple]] = {m: list(_unavail(m)) for m in workers}
@@ -217,6 +235,70 @@ def left_shift_cold_linking(
         )
     for m in placed:
         placed[m].sort()
+
+    def _earliest(plist: List[tuple], release: int, dur: int) -> int:
+        cur = release
+        for s, e in plist:
+            if s >= cur + dur:
+                return cur
+            if e > cur:
+                cur = e
+        return cur
+
+    def _workforce_earliest(
+        machine_id: str, release: int, dur: int, latest_start: int
+    ) -> Optional[int]:
+        candidate = _earliest(placed.get(machine_id, []), release, dur)
+        while candidate < latest_start:
+            candidate_end = candidate + dur
+            event_points = {candidate}
+            event_points.update(
+                start
+                for start, _ in workforce_slots.values()
+                if candidate < start < candidate_end
+            )
+            event_points.update(
+                start
+                for start, _, _ in workforce_blocks
+                if candidate < start < candidate_end
+            )
+            violating_time = next(
+                (
+                    point
+                    for point in sorted(event_points)
+                    if (
+                        1
+                        + sum(
+                            start <= point < end
+                            for start, end in workforce_slots.values()
+                        )
+                        + sum(
+                            demand
+                            for start, end, demand in workforce_blocks
+                            if start <= point < end
+                        )
+                        > workforce_capacity
+                    )
+                ),
+                None,
+            )
+            if violating_time is None:
+                return candidate
+
+            release = min(
+                [
+                    end
+                    for start, end in workforce_slots.values()
+                    if start <= violating_time < end
+                ]
+                + [
+                    end
+                    for start, end, _ in workforce_blocks
+                    if start <= violating_time < end
+                ]
+            )
+            candidate = _earliest(placed.get(machine_id, []), release, dur)
+        return candidate if candidate == latest_start else None
 
     cur_m = dict(orig_m)
     cur_s = dict(orig_s)
@@ -234,16 +316,22 @@ def left_shift_cold_linking(
 
         m0, s0 = cur_m[t_id], cur_s[t_id]
         placed[m0].remove((s0, s0 + dur))
+        workforce_slots.pop(t_id)
 
         best_m, best_s = orig_m[t_id], orig_s[t_id]  # guaranteed-available fallback
         for m in sorted(compat):
-            s = earliest_sweep(placed.get(m, []), max(release, _avail_at(m)), dur)
+            s = _workforce_earliest(
+                m, max(release, _avail_at(m)), dur, best_s
+            )
+            if s is None:
+                continue
             if s < best_s or (s == best_s and m < best_m):
                 best_m, best_s = m, s
 
         cur_m[t_id], cur_s[t_id] = best_m, best_s
         placed.setdefault(best_m, []).append((best_s, best_s + dur))
         placed[best_m].sort()
+        workforce_slots[t_id] = (best_s, best_s + dur)
 
     moved = 0
     for a in assignments:
@@ -276,6 +364,86 @@ class Phase2Result:
     end_times: Dict[str, int] = field(default_factory=dict)
     solve_time_seconds: float = 0.0
     objective_value: Optional[float] = None
+
+
+def _apply_linking_workforce_constraints(
+    model: cp_model.CpModel,
+    task_vars: Dict[str, Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+    resource_map: Dict[str, Dict[str, Any]],
+    horizon: int,
+) -> None:
+    """Cap active linking work by the number of physical linking workers."""
+    del horizon  # Kept in the signature to mirror phase 1's workforce helper.
+    max_machines = max(
+        1,
+        sum(
+            1
+            for resource in resource_map.values()
+            if (resource.get("operation") or "").lower() in PHASE2_MACHINE_OPS
+        ),
+    )
+    task_map = {task["task_id"]: task for task in tasks}
+    intervals: List[Any] = []
+    demands: List[int] = []
+
+    for task_id, variables in task_vars.items():
+        task = task_map.get(task_id, {})
+        operation = (task.get("operation") or "").lower()
+        pinned_start = task.get("pinned_start_time")
+        pinned_end = task.get("pinned_end_time")
+        fully_pinned = (
+            task.get("is_pinned")
+            and pinned_start is not None
+            and pinned_end is not None
+        )
+        duration = (
+            int(pinned_end) - int(pinned_start)
+            if fully_pinned
+            else int(task.get("duration", 0))
+        )
+        if duration <= 0:
+            logger.warning(
+                f"   ⚠️ {operation} {task_id}: duration={duration} ≤ 0 — skipping workforce"
+            )
+            continue
+
+        if operation == "linking":
+            literals = variables.get("literals", [])
+            if literals:
+                active = model.NewBoolVar(f"linking_cumul_active_{task_id}")
+                model.AddMaxEquality(active, literals)
+                interval = model.NewOptionalIntervalVar(
+                    variables["start"],
+                    duration,
+                    variables["end"],
+                    active,
+                    f"linking_wf_iv_{task_id}",
+                )
+            else:
+                interval = model.NewIntervalVar(
+                    variables["start"],
+                    duration,
+                    variables["end"],
+                    f"linking_wf_iv_{task_id}",
+                )
+            intervals.append(interval)
+            demands.append(1)
+        elif operation == "capacity_block_linking":
+            demand = int(task.get("demand", 0))
+            if demand <= 0:
+                continue
+            interval = model.NewIntervalVar(
+                variables["start"],
+                duration,
+                variables["end"],
+                f"linking_wf_iv_{task_id}",
+            )
+            intervals.append(interval)
+            demands.append(demand)
+
+    if intervals:
+        model.AddCumulative(intervals, demands, max_machines)
 
 
 def solve_linking(
@@ -336,6 +504,9 @@ def solve_linking(
 
     task_vars, _, no_resource_tasks = build_resource_model(
         model, linking_tasks, resource_map, horizon, start_lb=start_lb
+    )
+    _apply_linking_workforce_constraints(
+        model, task_vars, linking_tasks, resource_map, horizon
     )
     if no_resource_tasks:
         ids = [t["task_id"] for t in no_resource_tasks]
