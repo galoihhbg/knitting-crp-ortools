@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 # All operations NOT handled by phases 1–3 land here
 UPSTREAM_OPS = frozenset({"knitting", "capacity_block", "linking", "washing"})
 
+# Default rolling-wave size (free downstream tasks per wave) when config omits
+# `downstream_chunk_size`.  Mirrors Phase-1 knitting's `_DEFAULT_KNIT_CHUNK`.
+_DEFAULT_DOWNSTREAM_CHUNK: int = 90
+
 
 @dataclass
 class Phase4Result:
@@ -60,6 +64,8 @@ def solve_downstream(
     horizon: Optional[int] = None,
     reschedule_hint: Optional[Dict[str, Any]] = None,
     workload_shrank: bool = False,
+    _wave: bool = False,            # internal: True when called for one rolling wave
+                                    # (prevents recursive re-chunking)
 ) -> Phase4Result:
     """
     Solve all downstream operations (ironing, packing, or any future op).
@@ -83,6 +89,26 @@ def solve_downstream(
 
     # Compute start lower-bounds from Phase 3 end times via final_depends_on
     start_lb = _compute_start_lb(downstream_tasks, p3_end_times)
+
+    # ── Rolling-wave (cuốn chiếu) for large payloads ─────────────────────────
+    # Ironing (618 tasks) is the second-slowest phase: one disjunctive model burns
+    # ~14–27 min in presolve + first-feasible (measured) because deterministic-time
+    # does not bound wall-time.  Downstream tasks depend ONLY on washing/upstream
+    # (already scheduled) — there are NO iron→iron / packing→packing deps — so the
+    # free tasks split into EDD-sorted whole-order waves, each solved with the
+    # previous waves pinned as fixed intervals, is exact for the ordering and only
+    # re-partitions machine packing (same rationale as Phase-1 knitting / Phase-2
+    # linking).  Each wave recomputes its start_lb from the (fixed) upstream ends, so
+    # the handoff needs no extra plumbing.  Opt-in by size so small payloads / tests
+    # stay byte-identical; packing (already fast/OPTIMAL) simply waves in a few
+    # instant sub-solves.
+    free_downstream = [t for t in downstream_tasks if not t.get("is_pinned")]
+    chunk_size = int(config.get("downstream_chunk_size", _DEFAULT_DOWNSTREAM_CHUNK))
+    if not _wave and chunk_size > 0 and len(free_downstream) > chunk_size:
+        return _solve_downstream_chunked(
+            downstream_tasks, resources, config, p3_end_times, horizon,
+            reschedule_hint, workload_shrank, chunk_size,
+        )
 
     resource_map: Dict[str, Dict[str, Any]] = {r["id"]: r for r in resources}
     model = cp_model.CpModel()
@@ -195,6 +221,151 @@ def solve_downstream(
         end_times=end_times,
         solve_time_seconds=solver.WallTime(),
         objective_value=solver.ObjectiveValue() if status_str == "feasible" else None,
+    )
+
+
+def _make_downstream_vp(asgn: Dict[str, Any], operation: str) -> Dict[str, Any]:
+    """Convert a solved wave assignment into a virtual-pinned downstream task.
+
+    Registers a FIXED interval on the assigned machine so the next wave's
+    build_resource_model (machine NoOverlap) accounts for the capacity already
+    consumed.  Downstream has no workforce cumulative (pure machine no-overlap), so
+    the vp only needs its machine + pinned window.  Mirrors phase-1/2's vp helpers.
+    """
+    s, e, m = asgn["start_time"], asgn["end_time"], asgn["machine_id"]
+    return {
+        "task_id":                 f"__vp_{asgn['task_id']}",
+        "operation":               operation,
+        "is_pinned":               True,
+        "pinned_machine_id":       m,
+        "pinned_start_time":       s,
+        "pinned_end_time":         e,
+        "compatible_resource_ids": [m],
+        "duration":                max(0, e - s),
+        "qty":                     asgn.get("quantity", 1),
+        "due_at_min":              999_999,
+        "start_after_min":         0,
+        "final_depends_on":        [],
+        "original_depends_on":     [],
+        "original_order_id":       "",
+        "group_id":                "",
+        "design_item_id":          "",
+        "color_config":            "",
+        "color":                   "",
+        "substance":               "",
+        "is_slice":                False,
+        "is_batch":                False,
+        "sub_tasks":               None,
+        "demand":                  1,
+        "worker_req":              1,
+        "material_demands":        {},
+    }
+
+
+def _solve_downstream_chunked(
+    downstream_tasks: List[Dict[str, Any]],
+    resources: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    p3_end_times: Dict[str, int],
+    horizon: int,
+    reschedule_hint: Optional[Dict[str, Any]],
+    workload_shrank: bool,
+    chunk_size: int,
+) -> Phase4Result:
+    """Rolling-wave downstream (ironing / packing): EDD-sorted whole-order waves, each
+    solved single-worker (deterministic) with previous waves pinned as fixed intervals.
+
+    Mirrors Phase-1 knitting's `_solve_knitting_chunked`.  Safe because downstream
+    tasks depend only on washing/upstream (already scheduled) — no intra-phase deps —
+    so the wave split re-partitions machine packing without breaking any ordering.
+    Each wave recomputes its start_lb from the (fixed) upstream ends inside
+    solve_downstream, so no extra plumbing is needed.  Determinism holds (single-worker
+    + fixed det budget + sorted waves + deterministic virtual-pin handoff)."""
+    op_by_id = {t["task_id"]: (t.get("operation") or "") for t in downstream_tasks}
+    pinned = [t for t in downstream_tasks if t.get("is_pinned")]
+    free = [t for t in downstream_tasks if not t.get("is_pinned")]
+
+    # Group whole SALES ORDERS together and order EDD-first — identical keying to
+    # knitting/linking so all phases wave the same orders together.
+    by_order: Dict[str, List[Dict[str, Any]]] = {}
+    for t in free:
+        oid = t.get("ship_group_id") or t.get("original_order_id", "") or t["task_id"]
+        by_order.setdefault(oid, []).append(t)
+
+    def _order_key(oid: str):
+        ts = by_order[oid]
+        return (
+            min(int(x.get("due_at_min") or horizon) for x in ts),
+            min(int(x.get("start_after_min", 0)) for x in ts),
+            -max(int(x.get("priority", 0)) for x in ts),
+            oid,
+        )
+
+    waves: List[List[Dict[str, Any]]] = []
+    cur: List[Dict[str, Any]] = []
+    for oid in sorted(by_order, key=_order_key):
+        if cur and len(cur) + len(by_order[oid]) > chunk_size:
+            waves.append(cur)
+            cur = []
+        cur.extend(by_order[oid])
+    if cur:
+        waves.append(cur)
+
+    logger.info(
+        f"🌀 Phase 4 (Downstream) rolling-wave: {len(free)} free + {len(pinned)} pinned "
+        f"→ {len(waves)} waves (≤{chunk_size} tasks/wave, EDD-sorted)"
+    )
+
+    virtual_pinned: List[Dict[str, Any]] = []
+    assignments: List[Dict[str, Any]] = []
+    overloads: List[Dict[str, Any]] = []
+    end_times: Dict[str, int] = {}
+    total_time = 0.0
+    pinned_ids = {t["task_id"] for t in pinned}
+    pinned_collected = False
+
+    for wi, wave in enumerate(waves):
+        wave_ids = {t["task_id"] for t in wave}
+        res = solve_downstream(
+            pinned + virtual_pinned + wave, resources, config,
+            p3_end_times=p3_end_times,
+            horizon=horizon,
+            reschedule_hint=reschedule_hint,
+            workload_shrank=workload_shrank,
+            _wave=True,
+        )
+        if res.status not in ("feasible", "empty"):
+            logger.error(
+                f"❌ Phase 4 downstream wave {wi + 1}/{len(waves)} status={res.status} "
+                f"— aborting rolling-wave"
+            )
+            return res
+
+        for a in res.assignments:
+            tid = a["task_id"]
+            if tid.startswith("__vp_"):
+                continue
+            if tid in wave_ids or (not pinned_collected and tid in pinned_ids):
+                assignments.append(a)
+                end_times[tid] = a["end_time"]
+        overloads.extend(o for o in res.overloads if o.get("task_id") in wave_ids)
+        pinned_collected = True
+        total_time += res.solve_time_seconds
+
+        # Handoff: pin this wave's solved tasks as fixed intervals for later waves.
+        for a in res.assignments:
+            if a["task_id"] in wave_ids and not a["task_id"].startswith("__vp_"):
+                virtual_pinned.append(
+                    _make_downstream_vp(a, op_by_id.get(a["task_id"], "iron"))
+                )
+
+    return Phase4Result(
+        status="feasible",
+        assignments=assignments,
+        overloads=overloads,
+        end_times=end_times,
+        solve_time_seconds=total_time,
+        objective_value=None,
     )
 
 

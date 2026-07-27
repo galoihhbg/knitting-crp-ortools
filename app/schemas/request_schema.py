@@ -106,11 +106,16 @@ class SolverConfig(BaseModel):
     max_factory_machines: int = 40
     random_seed: int = 42       # Fixed seed for deterministic output across runs
     num_search_workers: int = 8  # Set to 1 for byte-identical replay; 8 for production speed
-    # Primary stop criterion: deterministic units (≈ single-core seconds).
-    # None → auto-derive as max_search_time × num_search_workers (sum-across-workers
-    # heuristic).  Set explicit value to tune for unusual payload sizes / hardware.
-    # See make_solver() for full semantics.
-    max_deterministic_time: Optional[float] = None
+    # Primary stop criterion: deterministic units (≈ single-core seconds), applied
+    # PER CP-SAT solve (each rolling-wave / phase).  The large disjunctive models
+    # stall at FEASIBLE (LP bound frozen at root → never provably OPTIMAL), so the
+    # solver just burns this budget chasing an unreachable bound; the incumbent hits
+    # its diminishing-returns knee early, so a small budget is the main speed knob.
+    # Default 4.0 (was None→12): measured on a 3360-task payload the /solve
+    # double-solve dropped 66→25 min at det=4 with NO lateness regression (knitting
+    # 18→7 min/pass; the relayout verify auto-derives to det=2 = 4×0.5).  Raise it
+    # only if a payload needs more optimisation.  See make_solver() for full semantics.
+    max_deterministic_time: Optional[float] = 4.0
     washing_batch_capacity: int = 10
     max_washing_batches: Optional[int] = None
     # Số slot (K) tối đa cho washing batching.

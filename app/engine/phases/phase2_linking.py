@@ -37,6 +37,12 @@ logger = logging.getLogger(__name__)
 PHASE2_OPS = frozenset({"linking", "capacity_block_linking"})
 PHASE2_MACHINE_OPS = frozenset({"linking"})
 
+# Default rolling-wave size (free linking tasks per wave) when config omits
+# `linking_chunk_size`.  Mirrors Phase-1 knitting's `_DEFAULT_KNIT_CHUNK`: a
+# starting point, calibrate per deployment.  Lower = more waves, each with a
+# faster presolve/first-feasible (the dominant wall cost at scale).
+_DEFAULT_LINK_CHUNK: int = 90
+
 
 def balance_linking_load(
     assignments: List[Dict[str, Any]],
@@ -459,6 +465,8 @@ def solve_linking(
     start_lb_override: Optional[Dict[str, int]] = None,
     end_caps: Optional[Dict[str, int]] = None,
     all_pipeline_tasks: Optional[List[Dict[str, Any]]] = None,
+    _wave: bool = False,            # internal: True when called for one rolling wave
+                                    # (prevents recursive re-chunking)
 ) -> Phase2Result:
     """
     Solve the linking phase.
@@ -498,6 +506,28 @@ def solve_linking(
         )
     else:
         start_lb = _compute_start_lb(linking_tasks, p1_start_times, p1_end_times, translation_map)
+
+    # ── Rolling-wave (cuốn chiếu) for large payloads ─────────────────────────
+    # Solving all linking in ONE model burns unbounded wall-time at scale: the
+    # 626-task disjunctive model spends ~30 min in presolve + first-feasible even
+    # at det=12 (measured), because deterministic-time does not bound wall-time and
+    # the LP bound is frozen at the root so it never proves optimal.  Linking tasks
+    # depend ONLY on knitting (already scheduled) — there are NO linking→linking
+    # deps — so splitting the free tasks into EDD-sorted whole-order waves, each
+    # solved with the previous waves pinned as fixed intervals, is exact for the
+    # ordering and only re-partitions machine/workforce packing (identical rationale
+    # to Phase-1 knitting's rolling-wave).  The FIFO-by-PO floor is computed ONCE on
+    # the full set above and passed to each wave as start_lb_override, so a middle
+    # slice still floors on the right interchangeable panel.  Opt-in by size so small
+    # payloads / tests stay byte-identical.
+    free_linking = [t for t in linking_tasks if not t.get("is_pinned")]
+    chunk_size = int(config.get("linking_chunk_size", _DEFAULT_LINK_CHUNK))
+    if not _wave and chunk_size > 0 and len(free_linking) > chunk_size:
+        return _solve_linking_chunked(
+            linking_tasks, resources, config, p1_start_times, p1_end_times,
+            translation_map, horizon, reschedule_hint, workload_shrank,
+            start_lb, end_caps, all_pipeline_tasks, chunk_size,
+        )
 
     resource_map: Dict[str, Dict[str, Any]] = {r["id"]: r for r in resources}
     model = cp_model.CpModel()
@@ -601,6 +631,173 @@ def solve_linking(
         end_times=end_times,
         solve_time_seconds=solver.WallTime(),
         objective_value=solver.ObjectiveValue() if status_str == "feasible" else None,
+    )
+
+
+def _make_linking_vp(asgn: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert a solved wave assignment into a virtual-pinned linking task.
+
+    Registers a FIXED interval on the assigned worker so the next wave's
+    build_resource_model (machine NoOverlap) and _apply_linking_workforce_constraints
+    (cumulative over PHASE2_MACHINE_OPS) both account for the capacity already
+    consumed.  operation='linking' + is_pinned so the workforce cumulative counts it
+    (demand 1) exactly like a real linking task.  Mirrors phase-1's _make_knitting_vp.
+    """
+    s, e, m = asgn["start_time"], asgn["end_time"], asgn["machine_id"]
+    return {
+        "task_id":                 f"__vp_{asgn['task_id']}",
+        "operation":               "linking",
+        "is_pinned":               True,
+        "pinned_machine_id":       m,
+        "pinned_start_time":       s,
+        "pinned_end_time":         e,
+        "compatible_resource_ids": [m],
+        "duration":                max(0, e - s),
+        "qty":                     asgn.get("quantity", 1),
+        "due_at_min":              999_999,
+        "start_after_min":         0,
+        "final_depends_on":        [],
+        "original_depends_on":     [],
+        "original_order_id":       "",
+        "group_id":                "",
+        "design_item_id":          "",
+        "color_config":            "",
+        "color":                   "",
+        "substance":               "",
+        "is_slice":                False,
+        "is_batch":                False,
+        "sub_tasks":               None,
+        "wait_offsets":            [],
+        "demand":                  1,
+        "worker_req":              1,
+        "material_demands":        {},
+    }
+
+
+def _solve_linking_chunked(
+    linking_tasks: List[Dict[str, Any]],
+    resources: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    p1_start_times: Dict[str, int],
+    p1_end_times: Dict[str, int],
+    translation_map: Dict[str, str],
+    horizon: int,
+    reschedule_hint: Optional[Dict[str, Any]],
+    workload_shrank: bool,
+    start_lb: Dict[str, int],
+    end_caps: Optional[Dict[str, int]],
+    all_pipeline_tasks: Optional[List[Dict[str, Any]]],
+    chunk_size: int,
+) -> Phase2Result:
+    """Rolling-wave linking: EDD-sorted whole-order waves, each solved single-worker
+    (deterministic) with previous waves pinned as fixed intervals.
+
+    Mirrors Phase-1 knitting's `_solve_knitting_chunked`.  Safe because linking tasks
+    depend only on knitting (already scheduled) — no linking→linking deps — so the
+    wave split re-partitions machine/workforce packing without breaking any ordering.
+    The full-set start_lb (FIFO-by-PO floor) and end_caps are computed once by the
+    caller and SLICED to each wave via start_lb_override / end_caps so a middle slice
+    still floors on the right interchangeable panel and Pareto caps still bind.
+    Determinism holds (single-worker + fixed det budget + sorted waves + deterministic
+    virtual-pin handoff).  Re-schedule stability holds because apply_stability_objective
+    anchors each wave's own tasks (the full hint is passed; only in-wave tasks match).
+    """
+    pinned = [t for t in linking_tasks if t.get("is_pinned")]
+    free = [t for t in linking_tasks if not t.get("is_pinned")]
+
+    # Group whole SALES ORDERS together (never split a customer order's slices across
+    # waves) and order them EDD-first, then earliest start_after, then priority, then
+    # id — identical keying to knitting so both phases wave the same orders together.
+    by_order: Dict[str, List[Dict[str, Any]]] = {}
+    for t in free:
+        oid = t.get("ship_group_id") or t.get("original_order_id", "") or t["task_id"]
+        by_order.setdefault(oid, []).append(t)
+
+    def _order_key(oid: str):
+        ts = by_order[oid]
+        return (
+            min(int(x.get("due_at_min") or horizon) for x in ts),
+            min(int(x.get("start_after_min", 0)) for x in ts),
+            -max(int(x.get("priority", 0)) for x in ts),
+            oid,
+        )
+
+    waves: List[List[Dict[str, Any]]] = []
+    cur: List[Dict[str, Any]] = []
+    for oid in sorted(by_order, key=_order_key):
+        if cur and len(cur) + len(by_order[oid]) > chunk_size:
+            waves.append(cur)
+            cur = []
+        cur.extend(by_order[oid])
+    if cur:
+        waves.append(cur)
+
+    logger.info(
+        f"🌀 Phase 2 (Linking) rolling-wave: {len(free)} free + {len(pinned)} pinned "
+        f"→ {len(waves)} waves (≤{chunk_size} tasks/wave, EDD-sorted)"
+    )
+
+    virtual_pinned: List[Dict[str, Any]] = []
+    assignments: List[Dict[str, Any]] = []
+    overloads: List[Dict[str, Any]] = []
+    start_times: Dict[str, int] = {}
+    end_times: Dict[str, int] = {}
+    total_time = 0.0
+    pinned_ids = {t["task_id"] for t in pinned}
+    pinned_collected = False
+
+    for wi, wave in enumerate(waves):
+        wave_ids = {t["task_id"] for t in wave}
+        wave_lb = {tid: start_lb[tid] for tid in wave_ids if tid in start_lb}
+        wave_caps = (
+            {tid: end_caps[tid] for tid in wave_ids if tid in end_caps}
+            if end_caps else None
+        )
+        res = solve_linking(
+            pinned + virtual_pinned + wave, resources, config,
+            p1_start_times=p1_start_times,
+            p1_end_times=p1_end_times,
+            translation_map=translation_map,
+            horizon=horizon,
+            reschedule_hint=reschedule_hint,
+            workload_shrank=workload_shrank,
+            start_lb_override=wave_lb,
+            end_caps=wave_caps,
+            all_pipeline_tasks=all_pipeline_tasks,
+            _wave=True,
+        )
+        if res.status not in ("feasible", "empty"):
+            logger.error(
+                f"❌ Phase 2 linking wave {wi + 1}/{len(waves)} status={res.status} "
+                f"— aborting rolling-wave"
+            )
+            return res
+
+        for a in res.assignments:
+            tid = a["task_id"]
+            if tid.startswith("__vp_"):
+                continue
+            if tid in wave_ids or (not pinned_collected and tid in pinned_ids):
+                assignments.append(a)
+                start_times[tid] = a["start_time"]
+                end_times[tid] = a["end_time"]
+        overloads.extend(o for o in res.overloads if o.get("task_id") in wave_ids)
+        pinned_collected = True
+        total_time += res.solve_time_seconds
+
+        # Handoff: pin this wave's solved tasks as fixed intervals for later waves.
+        for a in res.assignments:
+            if a["task_id"] in wave_ids and not a["task_id"].startswith("__vp_"):
+                virtual_pinned.append(_make_linking_vp(a))
+
+    return Phase2Result(
+        status="feasible",
+        assignments=assignments,
+        overloads=overloads,
+        start_times=start_times,
+        end_times=end_times,
+        solve_time_seconds=total_time,
+        objective_value=None,
     )
 
 
