@@ -284,6 +284,42 @@ def test_small_lots_first():
     assert res["order_dyelot_assignment"] == [{"order": "A", "vi": VI, "dyelot": "SMALL"}]
 
 
+def test_buffer_lot_preferred_over_smaller_raw():
+    """A lot carrying Buffer-bin yarn (tier 4) wins over an equal-lot-count, equal-
+    flush smaller raw lot that drain-small (tier 5) would otherwise pick — so staged
+    buffer is drained before a fresh main-warehouse pull. Mirrors CP_..040829709:
+    orders fit either a small raw lot or a larger buffer lot; must choose buffer."""
+    VI = "V"
+    tasks = [_knit_task("u1", "A", {VI: 10.0})]
+    assigns = [_assign("u1", "M1", 0)]
+    # SMALL (12, all raw) would win on drain-small; BUFFER (500, half staged in the
+    # Buffer bin) must win because tier 4 prefers draining buffer.
+    stock = [
+        {"vi": VI, "dyelot": "SMALL", "remaining_kg": 12.0, "packing_size": 1.0},
+        {"vi": VI, "dyelot": "BUFFER", "remaining_kg": 500.0, "packing_size": 1.0,
+         "buffer_kg": 250.0},
+    ]
+    res = allocate_dyelots(tasks, assigns, stock, CFG)
+    assert res["order_dyelot_assignment"] == [{"order": "A", "vi": VI, "dyelot": "BUFFER"}]
+
+
+def test_buffer_never_opens_extra_lot():
+    """Buffer preference sits BELOW min-lots: it must not fragment. Two orders that
+    both fit one raw lot stay consolidated even though splitting one onto a buffer
+    lot would drain buffer — opening a second lot costs a full tier-3 unit."""
+    VI = "V"
+    tasks = [_knit_task("u1", "A", {VI: 10.0}), _knit_task("u2", "B", {VI: 10.0})]
+    assigns = [_assign("u1", "M1", 0), _assign("u2", "M1", 100)]
+    stock = [
+        {"vi": VI, "dyelot": "RAW", "remaining_kg": 100.0, "packing_size": 1.0},
+        {"vi": VI, "dyelot": "BUF", "remaining_kg": 100.0, "packing_size": 1.0,
+         "buffer_kg": 100.0},
+    ]
+    res = allocate_dyelots(tasks, assigns, stock, CFG)
+    lots = {a["dyelot"] for a in res["order_dyelot_assignment"]}
+    assert len(lots) == 1, f"expected one lot, got {lots}"
+
+
 # ---------------------------------------------------------------------------
 # 5. Determinism — two runs byte-identical (real payload)
 # ---------------------------------------------------------------------------

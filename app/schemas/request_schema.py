@@ -382,6 +382,9 @@ class DyelotStock(BaseModel):
     dyelot: str
     remaining_kg: float
     packing_size: float
+    # Phần của remaining_kg nằm ở bin Buffer (sợi đã staged). Post-pass ưu tiên mở
+    # lot có buffer (tier 4) để vét buffer trước khi xuất kho tổng. 0/thiếu = lot raw.
+    buffer_kg: float = 0.0
 
 
 class InProductionDyelot(BaseModel):

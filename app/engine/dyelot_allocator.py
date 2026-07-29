@@ -539,17 +539,27 @@ def _solve_vi(
                               demand lands on the lot that holds the most instead of
                               stranding on a nearly-full small lot while a big lot
                               sits idle (the production over-concentration bug).
-      (4) drain-small       — Σ used[d]·remaining_g[d] as a pure TIE-BREAK below the
-                              lot-count tier: among equal-lot-count, equal-flush
-                              solutions, consume the nearly-empty lot first.  Demoted
-                              from tier 3 (where it caused the over-concentration) so
-                              it can no longer drive cramming.
+      (4) prefer-buffer     — +Σ used[d]·buffer_g[d]; among equal-lot-count, equal-
+                              flush solutions, prefer a lot that carries Buffer-bin
+                              yarn. Staged buffer consumed here issues no fresh main-
+                              warehouse pull, so drain it before raw — but BELOW min-
+                              lots, so buffer never justifies opening an extra lot.
+      (5) drain-small       — Σ used[d]·remaining_g[d] as a pure TIE-BREAK below the
+                              buffer tier: among equal-lot-count, equal-flush, equal-
+                              buffer solutions, consume the nearly-empty lot first.
+                              Demoted from tier 3 (where it caused over-concentration)
+                              so it can no longer drive cramming.
     """
     orders = sorted(order_kg)
     n_lots = len(lots)
     demand_g = {o: _g(order_kg[o]) for o in orders}
     cap_g = [_g(l.get("remaining_kg", 0)) for l in lots]
     remaining_g = list(cap_g)
+    # Per-lot buffer stock (grams) — the portion of remaining_kg staged in the
+    # Buffer bin. Consuming it issues no fresh main-warehouse pull, so we bias lot
+    # selection toward lots that carry buffer (tier 4, below min-lots). Missing on
+    # synthetic/committed lots → 0.
+    buffer_g = [_g(l.get("buffer_kg", 0)) for l in lots]
     # Per-lot roll size in grams (≥1 so the ceil is well-defined even if
     # packing_size is missing / rounds to 0).
     pk_g = [max(_g(l.get("packing_size", 0)), 1) for l in lots]
@@ -598,11 +608,17 @@ def _solve_vi(
                        committed_g=committed_g,
                        inprod_pool=bool(config.get("enable_dyelot_inprod_pool", True)))
 
-    # used[d]: 1 iff lot d carries any order.  Drives tier-3 (min lots) + tier-4.
+    # used[d]: 1 iff lot d carries any order.  Drives tier-3 (min lots) + tier-4/5.
+    # EXACT indicator (both bounds): tier 4 rewards buffer via +used[d]·buffer_g, a
+    # positive coefficient, so used[d] must not be free to float to 1 on an empty
+    # buffer lot to harvest the reward — the upper bound ties it to real assignment.
+    # (Tiers 3/5 push used down, so the extra bound is slack there; it only matters
+    # once a positive term exists.)
     used = [model.NewBoolVar(f"used_{vi}_{d}") for d in range(n_lots)]
     for d in range(n_lots):
         for o in orders:
             model.Add(used[d] >= x[o][d])
+        model.Add(used[d] <= sum(x[o][d] for o in orders))
 
     # Flush points: per machine, adjacent VI-units of different orders.
     flush_terms = []          # (cut_var, machine, taskA, taskB, orderA, orderB)
@@ -630,29 +646,35 @@ def _solve_vi(
 
     # ── Lexicographic objective via data-bounded weights ─────────────────────
     # Tiers (high→low), folded into one Maximize:
-    #   (1) +assigned  (2) −flush  (3) −lots opened  (4) −drain-small tie-break
+    #   (1) +assigned  (2) −flush  (3) −lots opened  (4) +prefer-buffer  (5) −drain-small
     # Each tier's weight must dominate the MAX possible value of every lower tier
     # summed, so the optimum is exactly lexicographic.
     assigned_sum = sum(assigned[o] for o in orders)
     flush_sum = sum(cut for (cut, *_rest) in flush_terms)   # number of cohort cuts
     lots_sum = sum(used)                                    # distinct lots opened
+    buf_sum = sum(used[d] * buffer_g[d] for d in range(n_lots))     # prefer-buffer
     frag_sum = sum(used[d] * remaining_g[d] for d in range(n_lots))  # drain-small
 
     n_pairs = len(flush_terms)                              # max value of flush_sum
     max_frag = sum(remaining_g)                             # max value of frag_sum
+    max_buf = sum(buffer_g)                                 # max value of buf_sum
     k_frag = 1
-    # Opening one fewer lot must always beat any drain-small gain.
-    k_lots = k_frag * max_frag + 1
-    # One fewer flush must beat the worst (lots + drain-small) combined.
-    k_flush = k_lots * n_lots + k_frag * max_frag + 1
-    # Assigning one more order must beat the worst (flush + lots + drain-small)
-    # combined — so feasibility is never traded for a lower tier (this is also why
-    # a VI with no flush pairs still assigns: k_assign carries the lots+frag bound).
-    k_assign = k_flush * n_pairs + k_lots * n_lots + k_frag * max_frag + 1
+    # Draining one buffer-gram must beat any drain-small gain (buffer is staged;
+    # consuming it avoids a fresh main-warehouse pull — worth more than emptying a
+    # small raw lot). Below min-lots, so it never opens an extra lot just for buffer.
+    k_buf = k_frag * max_frag + 1
+    # Opening one fewer lot must always beat any (buffer + drain-small) gain.
+    k_lots = k_buf * max_buf + k_frag * max_frag + 1
+    # One fewer flush must beat the worst (lots + buffer + drain-small) combined.
+    k_flush = k_lots * n_lots + k_buf * max_buf + k_frag * max_frag + 1
+    # Assigning one more order must beat the worst lower-tier sum — so feasibility is
+    # never traded for a lower tier (also why a VI with no flush pairs still assigns).
+    k_assign = k_flush * n_pairs + k_lots * n_lots + k_buf * max_buf + k_frag * max_frag + 1
     model.Maximize(
         k_assign * assigned_sum
         - k_flush * flush_sum
         - k_lots * lots_sum
+        + k_buf * buf_sum
         - k_frag * frag_sum
     )
 
