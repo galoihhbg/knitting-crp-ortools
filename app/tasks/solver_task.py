@@ -104,13 +104,10 @@ def optimize_schedule(self, payload: dict):
         job_id = payload.get("job_id")
         logger.info(f"[Task {self.request.id}] Starting job_id={job_id}")
 
-        try:
-            os.makedirs("/app/logs", exist_ok=True)
-            with open(f"/app/logs/solver_input_{job_id}.json", "w") as f:
-                json.dump(payload, f, indent=2)
-            logger.info(f"[Task {self.request.id}] Dumped input payload to /app/logs/solver_input_{job_id}.json")
-        except Exception as e:
-            logger.error(f"[Task {self.request.id}] Failed to dump input payload: {e}")
+        # The solver_input debug log is no longer written to /app/logs. The Go
+        # backend uploads the exact payload it POSTs (identical to this dict) to
+        # object storage as solver_input and links it on the capacity_planning_jobs
+        # record — see attachDebugLog on the Go side.
 
         # ─── MOCK MODE ────────────────────────────────────────────────────────
         # Khi MOCK_RESPONSE_FILE set, bỏ qua solver hoàn toàn, trả về nguyên
@@ -221,13 +218,9 @@ def optimize_schedule(self, payload: dict):
             "dyelot_shortage": result.get("dyelot_shortage", []),
         }
 
-        try:
-            os.makedirs("/app/logs", exist_ok=True)
-            with open(f"/app/logs/solver_output_{job_id}.json", "w") as f:
-                json.dump(response_data, f, indent=2)
-            logger.info(f"[Task {self.request.id}] Dumped output payload to /app/logs/solver_output_{job_id}.json")
-        except Exception as e:
-            logger.error(f"[Task {self.request.id}] Failed to dump output payload: {e}")
+        # The solver_output debug log is no longer written to /app/logs. The Go
+        # backend receives this exact response_data via the webhook and uploads it
+        # to object storage as solver_output, linked on the job record.
 
         success = _post_webhook(response_data, self.request.id)
         return "Callback Successful" if success else "Callback Failed"
