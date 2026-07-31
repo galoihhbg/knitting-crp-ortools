@@ -35,6 +35,28 @@ def _truthy_env(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _dump_debug_payload(kind: str, job_id, data: dict, task_id) -> None:
+    """Dump solver input/output JSON to a local dir for offline inspection.
+
+    OFF by default: production relies on the Go backend uploading the exact
+    payload/response to object storage (see attachDebugLog). Set SOLVER_DEBUG_DUMP=1
+    to also write local files — handy for `docker compose` / bare-metal dev where
+    you don't have the object-storage links. Dir via SOLVER_LOG_DIR (default "logs").
+    `kind` is "solver_input" or "solver_output".
+    """
+    if not _truthy_env("SOLVER_DEBUG_DUMP", False):
+        return
+    log_dir = os.getenv("SOLVER_LOG_DIR", "logs")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, f"{kind}_{job_id}.json")
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        logger.info(f"[Task {task_id}] Dumped {kind} to {path}")
+    except Exception as e:
+        logger.error(f"[Task {task_id}] Failed to dump {kind}: {e}")
+
+
 def _hint_from_assignments(assignments: list) -> dict:
     """Dựng reschedule_hint từ assignments của lượt solve trước.
 
@@ -104,10 +126,11 @@ def optimize_schedule(self, payload: dict):
         job_id = payload.get("job_id")
         logger.info(f"[Task {self.request.id}] Starting job_id={job_id}")
 
-        # The solver_input debug log is no longer written to /app/logs. The Go
-        # backend uploads the exact payload it POSTs (identical to this dict) to
-        # object storage as solver_input and links it on the capacity_planning_jobs
-        # record — see attachDebugLog on the Go side.
+        # Production: the Go backend uploads the exact payload it POSTs (identical
+        # to this dict) to object storage as solver_input, linked on the
+        # capacity_planning_jobs record — see attachDebugLog on the Go side.
+        # Local dev: set SOLVER_DEBUG_DUMP=1 to also write it to SOLVER_LOG_DIR.
+        _dump_debug_payload("solver_input", job_id, payload, self.request.id)
 
         # ─── MOCK MODE ────────────────────────────────────────────────────────
         # Khi MOCK_RESPONSE_FILE set, bỏ qua solver hoàn toàn, trả về nguyên
@@ -218,9 +241,10 @@ def optimize_schedule(self, payload: dict):
             "dyelot_shortage": result.get("dyelot_shortage", []),
         }
 
-        # The solver_output debug log is no longer written to /app/logs. The Go
-        # backend receives this exact response_data via the webhook and uploads it
-        # to object storage as solver_output, linked on the job record.
+        # Production: the Go backend receives this exact response_data via the
+        # webhook and uploads it to object storage as solver_output, linked on the
+        # job record. Local dev: set SOLVER_DEBUG_DUMP=1 to also write it locally.
+        _dump_debug_payload("solver_output", job_id, response_data, self.request.id)
 
         success = _post_webhook(response_data, self.request.id)
         return "Callback Successful" if success else "Callback Failed"

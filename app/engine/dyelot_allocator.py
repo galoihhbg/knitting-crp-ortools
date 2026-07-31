@@ -84,6 +84,7 @@ def allocate_dyelots(
                                  order_after, order_before}]
       dyelot_unassigned:       [{order, vi, reason}]
       dyelot_shortage:         [{vi, demand_kg (gross), net_demand_kg, stock_kg,
+                                 warehouse_kg, committed_kg, n_lots, shortage_kind,
                                  single_lot_deficit_kg, topups:[{dyelot, add_kg}],
                                  new_lot_kg}]
                                 topups[] = ALTERNATIVES — "add add_kg to THIS dyelot
@@ -91,6 +92,13 @@ def allocate_dyelots(
                                 replenishes exactly one lot); single_lot_deficit_kg is
                                 the cheapest of them. new_lot_kg = instead import ONE
                                 fresh dyelot of this size.
+                                stock_kg = warehouse_kg + committed_kg (in-production
+                                creel already PICKED onto a machine — not purchasable);
+                                the capacity that binds is warehouse_kg.
+                                shortage_kind names WHY (NO_STOCK / MATERIAL_SHORT /
+                                CREEL_ROLL_SHORT / FRAGMENTED / REMEDY_UNKNOWN /
+                                UNPROVEN) so the consumer never re-derives it from
+                                net-vs-stock — see _classify_shortage.
 
     Never raises on an infeasible VI — an order that cannot be placed is reported
     in dyelot_unassigned (a procurement signal), not crashed.
@@ -122,11 +130,15 @@ def allocate_dyelots(
         t["task_id"] for t in tasks
         if str(t.get("operation", "")).lower() == "knitting"
     }
-    sched: Dict[str, Tuple[Any, int]] = {}
+    # tid → (machine, start, end|None). `end` drives the creel-release model below;
+    # legacy assignments with no end_time keep the time-blind capacity bound.
+    sched: Dict[str, Tuple[Any, int, Optional[int]]] = {}
     for a in knitting_assignments:
         tid = a.get("task_id")
         if tid in knit_ids:
-            sched[tid] = (a.get("machine_id"), int(a.get("start_time", 0)))
+            end = a.get("end_time")
+            sched[tid] = (a.get("machine_id"), int(a.get("start_time", 0)),
+                          int(end) if end is not None else None)
     task_by_id = {t["task_id"]: t for t in tasks if t["task_id"] in knit_ids}
 
     def _order_of(t: Dict[str, Any]) -> str:
@@ -148,10 +160,16 @@ def allocate_dyelots(
     vi_order_kg: Dict[str, Dict[str, float]] = {}
     vi_machine_units: Dict[str, Dict[Any, List[Tuple[int, str, str]]]] = {}
     vi_mo: Dict[str, Dict[Any, Dict[str, List[float]]]] = {}
+    # vi → machine → [span_start, span_end]: the window the machine holds this VI's
+    # creel (first run start → last run end).  Go releases the leftover to the free
+    # pool at the end of that window, so machines with DISJOINT windows can reuse the
+    # same physical rolls — see _add_roll_capacity(machine_span=...).
+    vi_machine_span: Dict[str, Dict[Any, List[int]]] = {}
+    vi_span_unknown: set = set()      # a unit with no end_time → no release model
     for tid, t in task_by_id.items():
         if tid not in sched:
             continue
-        machine, start = sched[tid]
+        machine, start, end = sched[tid]
         order = _order_of(t)
         for vi, (kg, slots) in _main_consumption(t).items():
             vi_order_kg.setdefault(vi, {}).setdefault(order, 0.0)
@@ -162,6 +180,12 @@ def allocate_dyelots(
             run = vi_mo.setdefault(vi, {}).setdefault(machine, {}).setdefault(order, [0.0, 0])
             run[0] += kg
             run[1] = max(run[1], slots)
+            if end is None:
+                vi_span_unknown.add(vi)
+            else:
+                sp = vi_machine_span.setdefault(vi, {}).setdefault(machine, [start, end])
+                sp[0] = min(sp[0], start)
+                sp[1] = max(sp[1], end)
 
     # In-production (converted/pinned) orders: inject their committed knit units so
     # they participate in the per-VI solve. Otherwise they are invisible (excluded
@@ -287,6 +311,10 @@ def allocate_dyelots(
             shortage.append({"vi": vi, "demand_kg": round(new_lot_kg, 3),
                              "net_demand_kg": round(demand_kg, 3),
                              "stock_kg": 0.0,
+                             "warehouse_kg": 0.0,
+                             "committed_kg": 0.0,
+                             "n_lots": 0,
+                             "shortage_kind": "NO_STOCK",
                              "single_lot_deficit_kg": round(new_lot_kg, 3),
                              "topups": [],
                              "new_lot_kg": round(new_lot_kg, 3)})
@@ -294,11 +322,20 @@ def allocate_dyelots(
                            f"dyelot_stock is empty → shortage.")
             continue
 
+        # Creel-release model (default ON): only usable when EVERY unit of this VI
+        # carries an end_time — a missing end means an unknown release moment, so we
+        # fall back to the time-blind bound rather than guess (legacy payloads and the
+        # synthetic fixtures land here → byte-identical behaviour).
+        span_vi = (vi_machine_span.get(vi)
+                   if (config.get("enable_dyelot_creel_release", True)
+                       and vi not in vi_span_unknown)
+                   else None)
         res = _solve_vi(vi, order_kg, lots, vi_machine_units.get(vi, {}),
                         vi_mo.get(vi, {}), solver_config,
                         pinned_lot_vi=pinned_lot.get(vi),
                         mounted_vi=inprod_mounted.get(vi),
-                        committed_vi=committed_by.get(vi))
+                        committed_vi=committed_by.get(vi),
+                        machine_span=span_vi)
         assignments.extend(res["assignments"])
         flush_points.extend(res["flush_points"])
         unassigned.extend(res["unassigned"])
@@ -315,11 +352,11 @@ def allocate_dyelots(
             # order was stranded; it is the honest "add this much to clear".
             deficit_kg = res.get("deficit_g", 0) / _KG_SCALE
             # net_demand_kg is the actual consumed-into-product demand (no
-            # whole-roll / creel-up inflation). The Go side classifies
-            # material-shortage vs dyelot-fragmentation on NET vs stock — gross
-            # (demand_kg) over-counts and would mislabel a fragmentation case as
-            # a material buy near the boundary (e.g. 3039 net 403 ≤ stock 423 but
-            # gross 440 > 423).
+            # whole-roll / creel-up inflation) — kept because a classifier run on
+            # gross alone would call a fragmentation case a material buy near the
+            # boundary (e.g. 3039 net 403 ≤ stock 423 but gross 440 > 423). The
+            # net-vs-stock comparison is now made HERE (shortage_kind) instead of
+            # downstream, which had no way to see warehouse vs picked creel.
             # Procurement options to clear it (pick ONE downstream — dyelots are
             # never merged):
             #   topups[]    — ALTERNATIVES: "add add_kg to THIS dyelot alone".
@@ -332,13 +369,44 @@ def allocate_dyelots(
                       if d < len(topups_g) and topups_g[d] is not None
                       and topups_g[d] > 0]
             new_lot_kg = res.get("new_lot_g", 0) / _KG_SCALE
+            # stock_kg includes the in-production PICKED creel re-counted into the lot
+            # (see _ensure_lot) — that yarn is on a machine, NOT purchasable stock, and
+            # the capacity that actually binds is the free WAREHOUSE (cap − committed).
+            # Classifying "enough material" on stock_kg alone reads a creel/roll
+            # shortage as dyelot fragmentation, so the split is reported explicitly.
+            committed_kg = sum((committed_by.get(vi) or {}).values())
+            warehouse_kg = max(stock_kg - committed_kg, 0.0)
+            kind = _classify_shortage(len(lots), demand_kg, gross_demand_kg,
+                                      warehouse_kg, deficit_kg,
+                                      topup_possible=res.get("topup_possible", True))
             shortage.append({"vi": vi,
                              "demand_kg": round(gross_demand_kg, 3),
                              "net_demand_kg": round(demand_kg, 3),
                              "stock_kg": round(stock_kg, 3),
+                             "warehouse_kg": round(warehouse_kg, 3),
+                             "committed_kg": round(committed_kg, 3),
+                             "n_lots": len(lots),
+                             "shortage_kind": kind,
                              "single_lot_deficit_kg": round(deficit_kg, 3),
                              "topups": topups,
                              "new_lot_kg": round(new_lot_kg, 3)})
+            logger.warning(
+                f"🎨 VI {vi} shortage [{kind}]: {len(res['unassigned'])} order(s) "
+                f"unassigned; net {demand_kg:.3f} / gross {gross_demand_kg:.3f} kg vs "
+                f"warehouse {warehouse_kg:.3f} kg (+{committed_kg:.3f} kg picked creel) "
+                f"on {len(lots)} lot(s) → top-up {deficit_kg:.3f} kg "
+                f"or new lot {new_lot_kg:.3f} kg."
+            )
+            if deficit_kg <= 0 and new_lot_kg <= 0:
+                logger.warning(
+                    f"🎨 VI {vi}: orders dropped but BOTH remedies price at 0 kg — "
+                    + ("no top-up solve returned a solution (budget, or a pin holds an "
+                       "order on a lot that cannot host it)."
+                       if kind == "REMEDY_UNKNOWN" else
+                       "the main solve did not prove its optimum (raise "
+                       "dyelot_max_deterministic_time).")
+                    + " NOT a procurement signal."
+                )
 
     logger.info(
         f"🎨 Dyelot allocator: {len(assignments)} (order,VI) assigned, "
@@ -351,6 +419,40 @@ def allocate_dyelots(
         "dyelot_unassigned": unassigned,
         "dyelot_shortage": shortage,
     }
+
+
+def _classify_shortage(n_lots, net_kg, gross_kg, warehouse_kg, deficit_kg,
+                       topup_possible=True) -> str:
+    """WHY this VI has unassignable orders — computed here, where the capacity model
+    lives, so the consumer never has to re-derive it from net-vs-stock:
+
+      NO_STOCK         — the VI has no dyelot row at all.
+      MATERIAL_SHORT   — net (consumed-into-product) demand alone exceeds the free
+                         warehouse: a real buy, whatever the lot layout.
+      CREEL_ROLL_SHORT — net fits but GROSS (whole-roll + creel-up MinSlots) does not.
+                         Nothing to "gather": the yarn is short because every parallel
+                         machine must mount its own cones.
+      FRAGMENTED       — gross fits the warehouse in TOTAL but not on ONE lot (≥2 lots
+                         needed).  Only reachable with ≥2 lots — with a single lot there
+                         is nothing to consolidate onto, so this is never emitted there.
+      REMEDY_UNKNOWN   — no top-up solve returned a solution at all (its budget ran out,
+                         or an in-production pin holds an order on a lot that cannot host
+                         it), so the priced remedy is not trustworthy — not a buy signal.
+      UNPROVEN         — none of the above bind, i.e. the main solve stranded orders it
+                         could not prove unplaceable (budget), not a procurement signal.
+    """
+    eps = 1e-9
+    if n_lots == 0:
+        return "NO_STOCK"
+    if net_kg > warehouse_kg + eps:
+        return "MATERIAL_SHORT"
+    if gross_kg > warehouse_kg + eps:
+        return "CREEL_ROLL_SHORT"
+    if n_lots >= 2 and deficit_kg > eps:
+        return "FRAGMENTED"
+    if not topup_possible:
+        return "REMEDY_UNKNOWN"
+    return "UNPROVEN"
 
 
 def _vi_gross_demand_g(orders, demand_g, pk_g, machine_order, per_machine=True) -> int:
@@ -411,7 +513,8 @@ def _cap_slack_g(demand_g, pk_g, machine_order, per_machine=True) -> int:
 def _add_roll_capacity(model, x, orders, n_lots, demand_g, cap_g, pk_g,
                        machine_order, extra=None, per_machine=True,
                        mounted=None, lot_names=None,
-                       committed_g=None, inprod_pool=True) -> None:
+                       committed_g=None, inprod_pool=True,
+                       machine_span=None) -> None:
     """Whole-roll capacity per dyelot.
 
     per_machine=True (default — CORRECT): per (machine, lot) the orders of a lot
@@ -420,6 +523,17 @@ def _add_roll_capacity(model, x, orders, n_lots, demand_g, cap_g, pk_g,
     creel (max slots). Rolls are summed ACROSS machines (each machine mounts its own
     cones from the lot) and bounded by the lot stock. So a VI knit on N machines in
     parallel charges ≈ N × its creel — the physically-real reservation.
+
+    machine_span={machine: (start, end)} (optional) turns on the CREEL-RELEASE model:
+    a machine holds its cones only while it runs the VI, and Go returns the leftover
+    to the free pool when the machine finishes it (chrono_commit: RELEASE_POOL at
+    is_last_for_machine_vi, re-consumed by a later machine as SUCCESSOR_POOL).  So the
+    stock bound is the PEAK CONCURRENT reservation (checked at every span start), not
+    the time-blind sum over all machines, plus net conservation (consumed yarn never
+    comes back).  Without it, a VI knit on N machines that never overlap still charges
+    N × creel and manufactures a shortage on a VI whose net demand is grams.
+    Machines with no span (in-production pooled buckets, legacy payloads with no
+    end_time) are charged at EVERY time point — conservative, unchanged behaviour.
 
     per_machine=False (legacy pooled): one rolls Var per lot, ceil(Σnet/pk[d]),
     NO per-machine rounding and NO creel-up floor (assumes residual pools)."""
@@ -456,6 +570,9 @@ def _add_roll_capacity(model, x, orders, n_lots, demand_g, cap_g, pk_g,
         pool_net = bool(inprod_pool and cmt > 0)
         lot_rolls = []
         pooled_net_terms = []
+        all_net_terms = []        # every machine's net — conservation in release mode
+        timed_rolls = []          # (rolls Var, (start, end)) for span-known machines
+        untimed_rolls = []        # charged at EVERY time point (no span known)
         for m in machines:
             mo = machine_order[m]
             oz = [o for o in orders if o in mo]
@@ -463,6 +580,12 @@ def _add_roll_capacity(model, x, orders, n_lots, demand_g, cap_g, pk_g,
                 continue
             r = model.NewIntVar(0, ub, f"r_{d}_{m}")
             net_m = sum(_g(mo[o][0]) * x[o][d] for o in oz)
+            all_net_terms.append(net_m)
+            span = (machine_span or {}).get(m)
+            if span is not None:
+                timed_rolls.append((r, span))
+            else:
+                untimed_rolls.append(r)
             if pool_net:
                 pooled_net_terms.append(net_m)   # net pools at lot level (below)
             else:
@@ -482,6 +605,8 @@ def _add_roll_capacity(model, x, orders, n_lots, demand_g, cap_g, pk_g,
         if missing:
             r = model.NewIntVar(0, ub, f"rm_{d}")
             miss_net = sum(demand_g[o] * x[o][d] for o in missing)
+            all_net_terms.append(miss_net)
+            untimed_rolls.append(r)      # no machine → no span → always charged
             if pool_net:
                 pooled_net_terms.append(miss_net)
             else:
@@ -493,10 +618,26 @@ def _add_roll_capacity(model, x, orders, n_lots, demand_g, cap_g, pk_g,
                 # Mounted creel (committed) covers net poolingly; fresh rolls cover
                 # only the remainder and come from WAREHOUSE (cap − committed).
                 model.Add(sum(lot_rolls) * pk_g[d] + cmt >= sum(pooled_net_terms))
-                warehouse = cap_g[d] - cmt + extra_d
-                model.Add(sum(lot_rolls) * pk_g[d] <= (warehouse if warehouse > 0 else 0))
+                # NOTE: `extra_d` may be a CP-SAT Var (expandable-bin remedy models),
+                # so the free-warehouse floor must be clamped on the CONSTANT part —
+                # `max(cap-cmt, 0) + extra_d` — never `if warehouse > 0` (evaluating a
+                # BoundedLinearExpression as a bool raises NotImplementedError).
+                bound = max(cap_g[d] - cmt, 0) + extra_d
             else:
-                model.Add(sum(lot_rolls) * pk_g[d] <= cap_g[d] + extra_d)
+                bound = cap_g[d] + extra_d
+            if timed_rolls:
+                # CREEL-RELEASE model: bound the PEAK concurrent reservation. Checking
+                # every span start is exact for interval overlap (a maximal overlap set
+                # always begins at some span's start).
+                base = sum(untimed_rolls)
+                for t in sorted({s for _r, (s, _e) in timed_rolls}):
+                    act = [r for r, (s, e) in timed_rolls if s <= t < max(e, s + 1)]
+                    model.Add((sum(act) + base) * pk_g[d] <= bound)
+                # Consumed yarn never returns to the pool: total net drawn from this lot
+                # must still fit its TOTAL stock (warehouse + already-mounted creel).
+                model.Add(sum(all_net_terms) <= cap_g[d] + extra_d)
+            else:
+                model.Add(sum(lot_rolls) * pk_g[d] <= bound)
 
 
 def _solve_vi(
@@ -509,6 +650,7 @@ def _solve_vi(
     pinned_lot_vi: Optional[Dict[str, str]] = None,
     mounted_vi: Optional[Dict[Any, Dict[str, int]]] = None,
     committed_vi: Optional[Dict[str, float]] = None,
+    machine_span: Optional[Dict[Any, Tuple[int, int]]] = None,
 ) -> Dict[str, Any]:
     """One independent CP-SAT model for a single VI.
 
@@ -603,10 +745,16 @@ def _solve_vi(
     # capacity for in-production lots (creel physically pools across their machines).
     committed_g = ([_g((committed_vi or {}).get(lot_names[d], 0)) for d in range(n_lots)]
                    if per_machine else None)
+    # Semantics shared by the main solve AND the two remedy solves below — a remedy
+    # model built on a LOOSER capacity answers "add 0 kg" to a shortage the main solve
+    # really found (measured 2026-07-31 on AY02-DKG350: cap 55.971 incl. picked creel
+    # instead of the 22 kg warehouse → deficit 0.0 instead of 4.0).
+    cap_kw = dict(per_machine=per_machine, mounted=mounted_vi, lot_names=lot_names,
+                  committed_g=committed_g,
+                  inprod_pool=bool(config.get("enable_dyelot_inprod_pool", True)),
+                  machine_span=machine_span)
     _add_roll_capacity(model, x, orders, n_lots, demand_g, cap_g, pk_g, machine_order,
-                       per_machine=per_machine, mounted=mounted_vi, lot_names=lot_names,
-                       committed_g=committed_g,
-                       inprod_pool=bool(config.get("enable_dyelot_inprod_pool", True)))
+                       **cap_kw)
 
     # used[d]: 1 iff lot d carries any order.  Drives tier-3 (min lots) + tier-4/5.
     # EXACT indicator (both bounds): tier 4 rewards buffer via +used[d]·buffer_g, a
@@ -731,26 +879,50 @@ def _solve_vi(
         #                 None when that lot can't be the single sink.
         #   deficit_g   — the CHEAPEST single-lot top-up (min over topups_g).
         #   new_lot_g   — size of ONE fresh dyelot to import instead.
+        # Both remedy models get `cap_kw` + the pins — the SAME capacity semantics as
+        # the main solve above.  Anything looser silently answers "add 0 kg".
         topups_g = [_topup_one_lot_g(d, orders, n_lots, demand_g, cap_g, pk_g,
-                                     machine_order, config)
+                                     machine_order, config, cap_kw=cap_kw,
+                                     pinned_lot_vi=pinned_lot_vi, lot_names=lot_names)
                     for d in range(n_lots)]
         out["topups_g"] = topups_g
         feasible = [g for g in topups_g if g is not None]
         out["deficit_g"] = min(feasible) if feasible else 0
+        out["topup_possible"] = bool(feasible)
         out["new_lot_g"] = _new_lot_g(
-            orders, n_lots, demand_g, cap_g, pk_g, machine_order, config)
+            orders, n_lots, demand_g, cap_g, pk_g, machine_order, config,
+            cap_kw=cap_kw, pinned_lot_vi=pinned_lot_vi, lot_names=lot_names)
     return out
 
 
+def _pin_orders(model, x, orders, pinned_lot_vi, lot_names) -> None:
+    """Force in-production orders onto their committed lot (same as the main solve).
+    A remedy model without the pins is free to relocate an order already on the
+    machine, so it prices a move that procurement cannot actually buy."""
+    if not pinned_lot_vi or lot_names is None:
+        return
+    idx = {str(lot_names[d]): d for d in range(len(lot_names))}
+    for o in orders:
+        want = pinned_lot_vi.get(o)
+        if want is None:
+            continue
+        d = idx.get(str(want))
+        if d is not None:
+            model.Add(x[o][d] == 1)
+
+
 def _topup_one_lot_g(d_fill, orders, n_lots, demand_g, cap_g, pk_g,
-                     machine_order, config) -> Optional[int]:
+                     machine_order, config, cap_kw=None,
+                     pinned_lot_vi=None, lot_names=None) -> Optional[int]:
     """Minimal extra capacity (grams) added to dyelot `d_fill` ALONE (all other
     lots fixed at their current stock) so that a one-dyelot-per-order assignment of
     ALL orders becomes feasible. This is a STANDALONE option — dyelots are never
     merged, so a real top-up replenishes exactly one lot — not a spread across
     several. Returns None if even an unbounded single-lot top-up can't host the
-    orders (should not happen: lot d_fill can absorb everything)."""
-    per_machine = bool(config.get("enable_dyelot_per_machine_creel", True))
+    orders (a pin forces an order onto a DIFFERENT, non-growing lot)."""
+    kw = dict(cap_kw or {})
+    per_machine = bool(kw.pop("per_machine",
+                              config.get("enable_dyelot_per_machine_creel", True)))
     m = cp_model.CpModel()
     x = {o: [m.NewBoolVar(f"tx_{o}_{d}") for d in range(n_lots)] for o in orders}
     ub = _cap_slack_g(demand_g, pk_g, machine_order, per_machine)
@@ -758,8 +930,9 @@ def _topup_one_lot_g(d_fill, orders, n_lots, demand_g, cap_g, pk_g,
     extra = [fill if d == d_fill else 0 for d in range(n_lots)]  # only d_fill grows
     for o in orders:
         m.Add(sum(x[o]) == 1)  # every order must land on exactly one lot
+    _pin_orders(m, x, orders, pinned_lot_vi, lot_names)
     _add_roll_capacity(m, x, orders, n_lots, demand_g, cap_g, pk_g,
-                       machine_order, extra=extra, per_machine=per_machine)
+                       machine_order, extra=extra, per_machine=per_machine, **kw)
     m.Minimize(fill)
     s = make_solver(config, relative_gap=0.0)   # exact minimal top-up, not within 1%
     st = s.Solve(m)
@@ -769,16 +942,26 @@ def _topup_one_lot_g(d_fill, orders, n_lots, demand_g, cap_g, pk_g,
 
 
 def _new_lot_g(orders, n_lots, demand_g, cap_g, pk_g,
-               machine_order, config) -> int:
+               machine_order, config, cap_kw=None,
+               pinned_lot_vi=None, lot_names=None) -> int:
     """Minimal size (grams) of ONE fresh dyelot which, added alongside the
     existing lots, makes a one-dyelot-per-order assignment of ALL orders feasible.
     Same expandable-bin model but the free capacity lives ONLY on a new
     (n_lots+1)-th lot — the 'import a new dyelot of this size' answer. The new lot
     inherits the smallest existing roll size (whole-roll charge stays consistent)."""
-    per_machine = bool(config.get("enable_dyelot_per_machine_creel", True))
+    kw = dict(cap_kw or {})
+    per_machine = bool(kw.pop("per_machine",
+                              config.get("enable_dyelot_per_machine_creel", True)))
     nl = n_lots + 1
     cap2 = cap_g + [0]
     pk2 = pk_g + [min(pk_g)]
+    # The fresh lot carries no picked creel and no mounted cones — extend the
+    # per-lot vectors so the shared semantics stay index-aligned.
+    if kw.get("committed_g") is not None:
+        kw["committed_g"] = list(kw["committed_g"]) + [0]
+    names2 = (list(lot_names) + ["__NEW_LOT__"]) if lot_names is not None else None
+    if kw.get("lot_names") is not None:
+        kw["lot_names"] = names2
     m = cp_model.CpModel()
     x = {o: [m.NewBoolVar(f"nx_{o}_{d}") for d in range(nl)] for o in orders}
     ub = _cap_slack_g(demand_g, pk2, machine_order, per_machine)  # safe bound (gross ≥ Σnet)
@@ -786,8 +969,9 @@ def _new_lot_g(orders, n_lots, demand_g, cap_g, pk_g,
     extra = [0] * n_lots + [new]          # only the fresh lot is expandable
     for o in orders:
         m.Add(sum(x[o]) == 1)
+    _pin_orders(m, x, orders, pinned_lot_vi, names2)
     _add_roll_capacity(m, x, orders, nl, demand_g, cap2, pk2,
-                       machine_order, extra=extra, per_machine=per_machine)
+                       machine_order, extra=extra, per_machine=per_machine, **kw)
     m.Minimize(new)
     s = make_solver(config, relative_gap=0.0)   # exact minimal fresh-lot size, not within 1%
     st = s.Solve(m)

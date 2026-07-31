@@ -40,8 +40,14 @@ def _knit_task(task_id, order, vi_kg, is_main=None, slots=None):
             "operation": "knitting", "main_yarn_consumption": myc}
 
 
-def _assign(task_id, machine, start):
-    return {"task_id": task_id, "machine_id": machine, "start_time": start}
+def _assign(task_id, machine, start, end=None):
+    """end = optional end_time. Omitted (legacy assignments / most fixtures) → the
+    allocator cannot know when the creel is released, so it keeps the time-blind
+    capacity bound; supplied → the creel-release model applies."""
+    a = {"task_id": task_id, "machine_id": machine, "start_time": start}
+    if end is not None:
+        a["end_time"] = end
+    return a
 
 
 # ---------------------------------------------------------------------------
@@ -849,3 +855,177 @@ def test_in_production_pool_still_respects_capacity():
     # whole-roll slack (10). Cramming all 4 (125) would blow past physical yarn.
     assert on03 <= 60, f"dyelot03 over-promised: {on03}kg placed on 50kg supply"
     assert amap.get("INPROD") == "dyelot03", "in-production order stays pinned"
+
+
+# ---------------------------------------------------------------------------
+# 15. Remedy models must mirror the MAIN solve's capacity semantics.
+#     Bug (CP_1785481968066285380 / AY02-DKG350, 2026-07-31): _topup_one_lot_g and
+#     _new_lot_g were built WITHOUT committed_g / mounted / pins, so they saw the
+#     lot's cap INCLUDING 33.97 kg of already-picked creel (55.971) instead of the
+#     22 kg free warehouse the main solve is bound by → both priced the fix at
+#     0.00 kg while 2 orders were genuinely stranded ("Top-up: add 0.00 kg").
+# ---------------------------------------------------------------------------
+
+def _picked_creel_shortage_fixture():
+    """1 lot: 22 kg warehouse + 34 kg PICKED creel (cap 56). Five NEW orders each on
+    their OWN non-mounted machine, slots=5, pk=1 → 5 rolls each = 25 rolls > 22 kg
+    warehouse → exactly one order must be dropped (4 × 5 = 20 ≤ 22)."""
+    VI = "V"
+    tasks, assigns = [], []
+    for i, name in enumerate(("A", "B", "C", "D", "E")):
+        tid = f"t_{name}"
+        tasks.append(_knit_task(tid, name, {VI: 0.2}, slots={VI: 5}))
+        assigns.append(_assign(tid, f"M{i}", 100))
+    stock = [{"vi": VI, "dyelot": "L", "remaining_kg": 22.0, "packing_size": 1.0}]
+    in_prod = [{"order": "INPROD", "vi": VI, "dyelot": "L", "machine_id": "MOUNT",
+                "start_time": 0, "net_kg": 0.05, "slots": 5, "committed_kg": 34.0}]
+    return VI, tasks, assigns, stock, in_prod
+
+
+def test_remedy_prices_the_free_warehouse_not_the_picked_creel():
+    VI, tasks, assigns, stock, in_prod = _picked_creel_shortage_fixture()
+
+    res = allocate_dyelots(tasks, assigns, stock, CFG, in_production=in_prod)
+
+    assert len(res["dyelot_unassigned"]) == 1
+    sh = next(s for s in res["dyelot_shortage"] if s["vi"] == VI)
+    # The picked creel is reported, but the BINDING capacity is the free warehouse.
+    assert sh["stock_kg"] == 56.0
+    assert sh["committed_kg"] == 34.0
+    assert sh["warehouse_kg"] == 22.0
+    # Honest remedy: 25 rolls needed − 22 kg warehouse = 3 kg (3 rolls). NOT 0.
+    assert sh["single_lot_deficit_kg"] == 3.0
+    assert sh["topups"] == [{"dyelot": "L", "add_kg": 3.0}]
+    # Or host the stranded order's machine creel on ONE fresh lot: 5 rolls = 5 kg.
+    assert sh["new_lot_kg"] == 5.0
+
+
+def test_shortage_kind_single_lot_is_never_fragmented():
+    """A VI with ONE lot cannot be 'not gathered onto a single dyelot' — there is
+    nothing to gather onto. The label must name the real binder (creel/roll gross)."""
+    VI, tasks, assigns, stock, in_prod = _picked_creel_shortage_fixture()
+    res = allocate_dyelots(tasks, assigns, stock, CFG, in_production=in_prod)
+    sh = next(s for s in res["dyelot_shortage"] if s["vi"] == VI)
+    assert sh["n_lots"] == 1
+    # net (1.05 kg) fits the 22 kg warehouse; the GROSS creel-up does not.
+    assert sh["net_demand_kg"] < sh["warehouse_kg"] < sh["demand_kg"]
+    assert sh["shortage_kind"] == "CREEL_ROLL_SHORT"
+
+
+def test_shortage_kind_material_short_and_fragmented():
+    VI = "V"
+    # (a) net demand alone exceeds stock → a real buy, whatever the lot layout.
+    tasks = [_knit_task(f"u{i}", o, {VI: 50.0}) for i, o in enumerate("ABC")]
+    assigns = [_assign(f"u{i}", "M1", i * 100) for i in range(3)]
+    stock = [{"vi": VI, "dyelot": "L1", "remaining_kg": 100.0, "packing_size": 1.0}]
+    sh = next(s for s in allocate_dyelots(tasks, assigns, stock, CFG)["dyelot_shortage"]
+              if s["vi"] == VI)
+    assert sh["shortage_kind"] == "MATERIAL_SHORT"
+    assert sh["warehouse_kg"] == 100.0 and sh["committed_kg"] == 0.0
+
+    # (b) 6+4 = 10 kg total covers the 10 kg demand, but {5,5} needs 2 lots and one
+    #     order fits neither alone → genuine fragmentation (≥2 lots).
+    tasks = [_knit_task("u1", "A", {VI: 5.0}), _knit_task("u2", "B", {VI: 5.0})]
+    assigns = [_assign("u1", "M1", 0), _assign("u2", "M1", 100)]
+    stock = [{"vi": VI, "dyelot": "L6", "remaining_kg": 6.0, "packing_size": 1.0},
+             {"vi": VI, "dyelot": "L4", "remaining_kg": 4.0, "packing_size": 1.0}]
+    sh = next(s for s in allocate_dyelots(tasks, assigns, stock, CFG)["dyelot_shortage"]
+              if s["vi"] == VI)
+    assert sh["shortage_kind"] == "FRAGMENTED" and sh["n_lots"] == 2
+
+
+def test_no_stock_shortage_kind():
+    tasks = [_knit_task("u1", "A", {"VNOSTOCK": 10.0})]
+    res = allocate_dyelots(tasks, [_assign("u1", "M1", 0)],
+                           [{"vi": "OTHER", "dyelot": "L1", "remaining_kg": 100.0,
+                             "packing_size": 1.0}], CFG)
+    sh = next(s for s in res["dyelot_shortage"] if s["vi"] == "VNOSTOCK")
+    assert sh["shortage_kind"] == "NO_STOCK" and sh["n_lots"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 16. Creel-release model — a machine holds its cones only while it runs the VI;
+#     Go returns the leftover to the free pool at end-of-machine-VI (RELEASE_POOL)
+#     and a later machine re-consumes it (SUCCESSOR_POOL).  So machines whose knit
+#     windows are DISJOINT reuse the same rolls: the bound is the peak concurrent
+#     reservation, not the sum over every machine.
+# ---------------------------------------------------------------------------
+
+def _two_machine_creel(end1, end2, start2):
+    """One order on 2 machines, slots=4 at pk=10 → 40 kg of cones per machine,
+    lot = 50 kg. Concurrent → 80 kg needed (shortage); disjoint → 40 kg (fits)."""
+    VI = "V"
+    tasks = [_knit_task("u1", "A", {VI: 5.0}, slots={VI: 4}),
+             _knit_task("u2", "A", {VI: 5.0}, slots={VI: 4})]
+    assigns = [_assign("u1", "M1", 0, end1), _assign("u2", "M2", start2, end2)]
+    stock = [{"vi": VI, "dyelot": "L1", "remaining_kg": 50.0, "packing_size": 10.0}]
+    return VI, tasks, assigns, stock
+
+
+def test_creel_release_disjoint_machines_reuse_rolls():
+    VI, tasks, assigns, stock = _two_machine_creel(end1=100, end2=200, start2=100)
+    res = allocate_dyelots(tasks, assigns, stock, CFG)
+    # M1 releases its cones at t=100, M2 mounts them at t=100 → peak 40 ≤ 50.
+    assert res["dyelot_unassigned"] == []
+    assert [a["dyelot"] for a in res["order_dyelot_assignment"]] == ["L1"]
+    assert res["dyelot_shortage"] == []
+
+
+def test_creel_release_overlapping_machines_still_short():
+    VI, tasks, assigns, stock = _two_machine_creel(end1=100, end2=150, start2=50)
+    res = allocate_dyelots(tasks, assigns, stock, CFG)
+    # Windows overlap on [50,100) → both creels mounted at once = 80 kg > 50.
+    assert res["dyelot_unassigned"] == [{"order": "A", "vi": VI,
+                                        "reason": "capacity_shortage"}]
+
+
+def test_creel_release_flag_off_is_time_blind():
+    VI, tasks, assigns, stock = _two_machine_creel(end1=100, end2=200, start2=100)
+    cfg = {**CFG, "enable_dyelot_creel_release": False}
+    res = allocate_dyelots(tasks, assigns, stock, cfg)
+    # Time-blind: 2 × 40 = 80 kg > 50 even though the windows never overlap.
+    assert res["dyelot_unassigned"] == [{"order": "A", "vi": VI,
+                                        "reason": "capacity_shortage"}]
+
+
+def test_creel_release_needs_end_time_on_every_unit():
+    """A single unit with no end_time → the release moment is unknown for that VI, so
+    the conservative time-blind bound is kept (legacy payloads unchanged)."""
+    VI, tasks, assigns, stock = _two_machine_creel(end1=None, end2=200, start2=100)
+    res = allocate_dyelots(tasks, assigns, stock, CFG)
+    assert res["dyelot_unassigned"] == [{"order": "A", "vi": VI,
+                                        "reason": "capacity_shortage"}]
+
+
+def test_creel_release_never_over_promises_net():
+    """SAFETY: releasing cones recycles the UNUSED residual only — consumed yarn never
+    comes back. Two disjoint machines each CONSUMING 40 kg net cannot both be served
+    by a 50 kg lot, even though the peak reservation (40) would fit."""
+    VI = "V"
+    tasks = [_knit_task("u1", "A", {VI: 40.0}, slots={VI: 4}),
+             _knit_task("u2", "B", {VI: 40.0}, slots={VI: 4})]
+    assigns = [_assign("u1", "M1", 0, 100), _assign("u2", "M2", 100, 200)]
+    stock = [{"vi": VI, "dyelot": "L1", "remaining_kg": 50.0, "packing_size": 10.0}]
+    res = allocate_dyelots(tasks, assigns, stock, CFG)
+    assert len(res["dyelot_unassigned"]) == 1     # 80 kg of net on a 50 kg lot
+
+
+def test_classify_shortage_all_kinds():
+    """Direct coverage of the label cascade — REMEDY_UNKNOWN cannot be staged
+    end-to-end (a top-up solve only fails to answer on a budget/pin corner), so the
+    classifier is pinned down here."""
+    from app.engine.dyelot_allocator import _classify_shortage as C
+
+    assert C(0, 10.0, 10.0, 0.0, 10.0) == "NO_STOCK"
+    # net alone over the warehouse → a real buy.
+    assert C(1, 150.0, 150.0, 100.0, 50.0) == "MATERIAL_SHORT"
+    # net fits, gross (whole-roll + creel-up) does not → cones, not lot layout.
+    assert C(1, 3.9, 55.0, 22.0, 4.0) == "CREEL_ROLL_SHORT"
+    # a single lot is NEVER fragmented, whatever the deficit.
+    assert C(1, 5.0, 10.0, 10.0, 1.0) == "UNPROVEN"
+    # ≥2 lots, everything fits in total, but not on one lot.
+    assert C(2, 10.0, 10.0, 10.0, 1.0) == "FRAGMENTED"
+    # deficit 0 with 2 lots → the main solve just didn't prove its optimum.
+    assert C(2, 10.0, 10.0, 10.0, 0.0) == "UNPROVEN"
+    # no top-up solve answered → the priced remedy is not trustworthy.
+    assert C(2, 10.0, 10.0, 10.0, 0.0, topup_possible=False) == "REMEDY_UNKNOWN"

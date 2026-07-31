@@ -12,18 +12,30 @@ _log_dir = os.path.join(_base_dir, "logs")
 os.makedirs(_log_dir, exist_ok=True)
 _log_file = os.path.join(_log_dir, f"scheduling_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
-logger = logging.getLogger(__name__)
-logger.handlers.clear()
-logger.setLevel(logging.INFO)
+# Attach the per-run FileHandler to the `app.engine` PACKAGE logger, not just this
+# module. Phase diagnostics (the "Phase 1 … INFEASIBLE / bottleneck / workforce"
+# lines that explain WHY a solve fails) are emitted by sibling loggers such as
+# app.engine.phases.phase1_knitting and app.engine.shared. Those propagate up to
+# app.engine — not to app.engine.model — so anchoring the handler here lets the
+# scheduling_*.log capture the full engine trace instead of only model.py's lines.
+#
+# Only a FileHandler is attached, and propagate is left True on purpose: console
+# output keeps flowing through whatever root handler the runtime installs
+# (celery/uvicorn), so there is no double-printing, and pytest's `caplog` — which
+# captures via propagation to the root logger — keeps seeing engine records.
+_engine_logger = logging.getLogger("app.engine")
+_engine_logger.setLevel(logging.INFO)
+# Drop any FileHandler left by a previous import of this module (defensive against
+# module reloads in tests); leave non-file handlers (e.g. pytest's) untouched.
+for _h in list(_engine_logger.handlers):
+    if isinstance(_h, logging.FileHandler):
+        _engine_logger.removeHandler(_h)
 
 _file_handler = logging.FileHandler(_log_file)
-_file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-logger.addHandler(_file_handler)
+_file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
+_engine_logger.addHandler(_file_handler)
 
-_console_handler = logging.StreamHandler()
-_console_handler.setFormatter(logging.Formatter("%(levelname)s - %(message)s"))
-logger.addHandler(_console_handler)
-
+logger = logging.getLogger(__name__)
 logger.info(f"🔵 Logs will be saved to: {_log_file}")
 
 
