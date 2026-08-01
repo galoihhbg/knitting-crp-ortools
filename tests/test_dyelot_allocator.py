@@ -1056,3 +1056,81 @@ def test_classify_shortage_all_kinds():
     assert C(2, 10.0, 10.0, 10.0, 0.0) == "UNPROVEN"
     # no top-up solve answered → the priced remedy is not trustworthy.
     assert C(2, 10.0, 10.0, 10.0, 0.0, topup_possible=False) == "REMEDY_UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# in_production with NO committed lot — demand that used to vanish
+# ---------------------------------------------------------------------------
+
+def test_in_production_without_lot_still_charges_demand():
+    """An in-production order converted while its yarn was out of stock has no
+    reservation, so Go can read no committed lot and sends dyelot="".
+
+    It still has knitting left to run, and this payload is the ONLY route its
+    material need has into the model (its PIN_ task carries no
+    main_yarn_consumption). The old `not dyelot` filter dropped the row outright,
+    so that demand disappeared and the reported shortage came out short by exactly
+    those kg — the "thiếu 11 thay vì 13" bug. Its net must be charged; it just
+    isn't pinned to any lot.
+    """
+    tasks = [_knit_task("t_new", "NEW", {"3039": 10}, slots={"3039": 1})]
+    assigns = [_assign("t_new", "SK1", 100)]
+    dyelot_stock = [{"vi": "3039", "dyelot": "lotA", "remaining_kg": 20, "packing_size": 10}]
+    vi_packing = {"3039": 10}
+    unreserved = [{"order": "INPROD_NOLOT", "vi": "3039", "dyelot": "",
+                   "machine_id": "SK1", "start_time": 0, "net_kg": 20, "slots": 1,
+                   "committed_kg": 0}]
+
+    without = allocate_dyelots(tasks, assigns, dyelot_stock, CFG, vi_packing=vi_packing)
+    with_ = allocate_dyelots(tasks, assigns, dyelot_stock, CFG,
+                             vi_packing=vi_packing, in_production=unreserved)
+
+    def net_of(res):
+        rows = [s for s in res["dyelot_shortage"] if s["vi"] == "3039"]
+        return rows[0]["net_demand_kg"] if rows else 0.0
+
+    # 10 kg of new demand fits the 20 kg lot on its own — no shortage.
+    assert not without["dyelot_shortage"], without["dyelot_shortage"]
+    # Adding the unreserved order's 20 kg takes total demand to 30 kg over 20 kg
+    # of stock: the shortage must appear and must count its kg.
+    assert net_of(with_) == 30.0, with_["dyelot_shortage"]
+    deficit = with_["dyelot_shortage"][0]["single_lot_deficit_kg"]
+    assert deficit >= 10.0, f"deficit {deficit} must cover the 10 kg gap"
+
+
+def test_in_production_without_lot_is_not_pinned():
+    """No committed lot → nothing to pin: the solver stays free to place the order
+    on whichever lot it likes (here the only one), while a pinned sibling is fixed."""
+    tasks = [_knit_task("t_new", "NEW", {"3039": 4}, slots={"3039": 1})]
+    assigns = [_assign("t_new", "SK1", 100)]
+    dyelot_stock = [
+        {"vi": "3039", "dyelot": "lotPIN", "remaining_kg": 60, "packing_size": 10},
+        {"vi": "3039", "dyelot": "lotFREE", "remaining_kg": 60, "packing_size": 10},
+    ]
+    in_prod = [
+        {"order": "PINNED", "vi": "3039", "dyelot": "lotPIN", "machine_id": "SK1",
+         "start_time": 0, "net_kg": 10, "slots": 1, "committed_kg": 10},
+        {"order": "NOLOT", "vi": "3039", "dyelot": "", "machine_id": "SK2",
+         "start_time": 0, "net_kg": 10, "slots": 1, "committed_kg": 0},
+    ]
+    out = allocate_dyelots(tasks, assigns, dyelot_stock, CFG,
+                           vi_packing={"3039": 10}, in_production=in_prod)
+    amap = {a["order"]: a["dyelot"] for a in out["order_dyelot_assignment"]}
+    assert amap["PINNED"] == "lotPIN"          # pin honoured
+    assert amap.get("NOLOT") in {"lotPIN", "lotFREE"}  # placed, but free to choose
+    assert not out["dyelot_unassigned"], out["dyelot_unassigned"]
+
+
+def test_in_production_without_lot_and_without_demand_is_ignored():
+    """Nothing to pin and nothing left to knit → the row carries no information."""
+    tasks = [_knit_task("t_new", "NEW", {"3039": 4}, slots={"3039": 1})]
+    assigns = [_assign("t_new", "SK1", 100)]
+    stock = [{"vi": "3039", "dyelot": "lotA", "remaining_kg": 50, "packing_size": 10}]
+    noise = [{"order": "GHOST", "vi": "3039", "dyelot": "", "machine_id": "SK1",
+              "start_time": 0, "net_kg": 0, "slots": 1, "committed_kg": 0}]
+
+    a = allocate_dyelots(tasks, assigns, stock, CFG, vi_packing={"3039": 10})
+    b = allocate_dyelots(tasks, assigns, stock, CFG, vi_packing={"3039": 10},
+                         in_production=noise)
+    assert a["order_dyelot_assignment"] == b["order_dyelot_assignment"]
+    assert "GHOST" not in {x["order"] for x in b["order_dyelot_assignment"]}

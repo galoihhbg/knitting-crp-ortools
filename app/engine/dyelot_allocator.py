@@ -204,18 +204,32 @@ def allocate_dyelots(
     inprod_mounted: Dict[str, Dict[Any, Dict[str, int]]] = {}
     _committed_seen = set()   # (vi, order, machine, dyelot) — committed_kg repeats per machine row
     _inprod_pool_net: Dict[Tuple[str, str], float] = {}  # (vi, order) → pooled remaining net
+    # (vi, order) → creel width to charge on the pooled bucket. 0 for a PINNED order
+    # (its cones are already mounted and paid for via committed_kg); the order's real
+    # slots for an UNRESERVED one, which still has to mount cones from somewhere.
+    _inprod_pool_slots: Dict[Tuple[str, str], int] = {}
     for s in (in_production or []):
         vi = str(s.get("vi", ""))
         order = str(s.get("order", ""))
+        # An EMPTY dyelot is meaningful, not junk: Go sends it for an in-production
+        # order that was converted while the VI was out of stock, so it never got a
+        # reservation to read a committed lot from. It has no lot to pin but it DOES
+        # still have knitting to run, so its remaining net must be charged here —
+        # dropping the row (the old `not dyelot` filter) deleted that demand from the
+        # model outright and under-reported the procurement shortage by exactly those
+        # orders' kg. Such an order stays unpinned: the solver assigns it like any
+        # free order.
         dyelot = s.get("dyelot")
+        dyelot = str(dyelot) if dyelot else ""
         machine = s.get("machine_id")
-        if not vi or not order or not dyelot or machine is None:
+        if not vi or not order or machine is None:
             continue
-        dyelot = str(dyelot)
         start = int(s.get("start_time", 0) or 0)
         kg = float(s.get("net_kg", 0) or 0)          # per-machine (already split by Go)
         slots = int(s.get("slots", 0) or 0)
         committed_kg = float(s.get("committed_kg", 0) or 0)  # per-machine picked creel
+        if not dyelot and kg <= 0:
+            continue          # nothing to pin, nothing to knit
         tid = f"INPROD_{order}_{machine}_{start}"
         vi_order_kg.setdefault(vi, {}).setdefault(order, 0.0)
         vi_order_kg[vi][order] += kg
@@ -227,6 +241,14 @@ def allocate_dyelots(
         # creel-up for an order spread across many machines would balloon its gross
         # far past the lot and make the forced pin infeasible (→ whole VI dropped).
         _inprod_pool_net[(vi, order)] = _inprod_pool_net.get((vi, order), 0.0) + kg
+        if not dyelot:
+            # Unreserved: no cones mounted anywhere, so keep a creel-up floor of one
+            # creel width. Charged ONCE on the pooled bucket rather than per machine —
+            # same reasoning as the pooling above, and it keeps the floor from
+            # exploding to (machines × creel) for an order that only needs grams.
+            if slots > _inprod_pool_slots.get((vi, order), 0):
+                _inprod_pool_slots[(vi, order)] = slots
+            continue
         pinned_lot.setdefault(vi, {})[order] = dyelot
         # Cap: re-count picked creel ONCE per (vi, order, machine, dyelot); summed
         # across machines = the order's total leftover creel on this lot.
@@ -242,11 +264,14 @@ def allocate_dyelots(
                 md[dyelot] = slots
 
     # One pooled capacity bucket per in-production (vi, order): whole-roll on the
-    # POOLED remaining net, slots 0 (no creel-up floor — the cones are already
-    # mounted and paid for via committed_kg). A unique per-order machine key keeps
-    # it out of any real machine's flush sequence.
+    # POOLED remaining net, slots 0 for a pinned order (no creel-up floor — the cones
+    # are already mounted and paid for via committed_kg) and its real creel width for
+    # an unreserved one. A unique per-order machine key keeps it out of any real
+    # machine's flush sequence.
     for (vi, order), net in _inprod_pool_net.items():
-        vi_mo.setdefault(vi, {}).setdefault(f"__INPROD_POOL_{order}", {})[order] = [net, 0]
+        vi_mo.setdefault(vi, {}).setdefault(f"__INPROD_POOL_{order}", {})[order] = [
+            net, _inprod_pool_slots.get((vi, order), 0)
+        ]
 
     # vi → sorted list of lots (copies — we mutate remaining_kg below).
     lots_by_vi: Dict[str, List[Dict[str, Any]]] = {}
