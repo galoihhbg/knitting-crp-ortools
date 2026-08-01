@@ -835,12 +835,21 @@ def _solve_vi(
     out: Dict[str, Any] = {"assignments": [], "flush_points": [],
                            "unassigned": [], "gross_demand_g": gross_demand_g}
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        # Should not happen (unassigned makes it always feasible) — defensive.
-        logger.warning(f"🎨 VI {vi}: solver status {solver.StatusName(status)} "
-                       f"— reporting all orders unassigned.")
+        # Infeasible ONLY because in-production pins remove the unassigned escape
+        # (x[o][pin]=1 ⇒ assigned[o]=1): the pinned lot cannot host its own pinned
+        # demand + any co-lot under the current (reduced) stock, so no feasible
+        # packing exists. Report every order unassigned, but STILL price the top-up —
+        # the remedy solves add capacity until the pins fit, so they return a real
+        # "add X kg to <pinned lot>" deficit. Bailing here (the old behaviour) left
+        # deficit 0 / new_lot 0, which downstream reads as "dropped but nothing to
+        # buy" — a misleading procurement signal.
+        logger.warning(f"🎨 VI {vi}: main solve {solver.StatusName(status)} "
+                       f"(in-production pins exceed lot capacity) — pricing top-up remedy.")
         for o in orders:
             out["unassigned"].append({"order": o, "vi": vi,
                                       "reason": f"solver_{solver.StatusName(status)}"})
+        _price_shortage_remedies(orders, n_lots, demand_g, cap_g, pk_g, machine_order,
+                                 config, cap_kw, pinned_lot_vi, lot_names, out)
         return out
 
     any_unassigned = False
@@ -872,26 +881,8 @@ def _solve_vi(
     # over-concentrated. Go surfaces it as the procurement top-up instead of the
     # inflated cohort estimate. Only run the extra solve when needed.
     if any_unassigned:
-        # Procurement options to clear the shortage (all honest minima under the
-        # SAME reuse-aware capacity as the main solve). Dyelots are never merged,
-        # so each option replenishes exactly ONE lot:
-        #   topups_g[d] — extra kg to add to dyelot d ALONE (a standalone choice);
-        #                 None when that lot can't be the single sink.
-        #   deficit_g   — the CHEAPEST single-lot top-up (min over topups_g).
-        #   new_lot_g   — size of ONE fresh dyelot to import instead.
-        # Both remedy models get `cap_kw` + the pins — the SAME capacity semantics as
-        # the main solve above.  Anything looser silently answers "add 0 kg".
-        topups_g = [_topup_one_lot_g(d, orders, n_lots, demand_g, cap_g, pk_g,
-                                     machine_order, config, cap_kw=cap_kw,
-                                     pinned_lot_vi=pinned_lot_vi, lot_names=lot_names)
-                    for d in range(n_lots)]
-        out["topups_g"] = topups_g
-        feasible = [g for g in topups_g if g is not None]
-        out["deficit_g"] = min(feasible) if feasible else 0
-        out["topup_possible"] = bool(feasible)
-        out["new_lot_g"] = _new_lot_g(
-            orders, n_lots, demand_g, cap_g, pk_g, machine_order, config,
-            cap_kw=cap_kw, pinned_lot_vi=pinned_lot_vi, lot_names=lot_names)
+        _price_shortage_remedies(orders, n_lots, demand_g, cap_g, pk_g, machine_order,
+                                 config, cap_kw, pinned_lot_vi, lot_names, out)
     return out
 
 
@@ -978,3 +969,31 @@ def _new_lot_g(orders, n_lots, demand_g, cap_g, pk_g,
     if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return 0
     return int(s.Value(new))
+
+
+def _price_shortage_remedies(orders, n_lots, demand_g, cap_g, pk_g, machine_order,
+                             config, cap_kw, pinned_lot_vi, lot_names, out) -> None:
+    """Attach the honest procurement remedies onto `out`, under the SAME reuse-aware
+    capacity + in-production pins as the main solve (a looser model silently answers
+    "add 0 kg"). Shared by BOTH shortage paths so each surfaces a real number:
+      - the main solve was FEASIBLE but stranded an order for capacity, and
+      - the main solve was INFEASIBLE because the in-production pins alone overflow
+        their lot (the pins remove the unassigned escape, so no packing exists) —
+        the path that used to bail with deficit 0 / new_lot 0.
+    Dyelots are never merged, so each option replenishes exactly ONE lot:
+      topups_g[d] — extra kg to add to dyelot d ALONE (None when it can't be the
+                    single sink, e.g. a pin forces an order onto a different lot);
+      deficit_g   — the CHEAPEST single-lot top-up (min over topups_g);
+      new_lot_g   — size of ONE fresh dyelot to import instead.
+    """
+    topups_g = [_topup_one_lot_g(d, orders, n_lots, demand_g, cap_g, pk_g,
+                                 machine_order, config, cap_kw=cap_kw,
+                                 pinned_lot_vi=pinned_lot_vi, lot_names=lot_names)
+                for d in range(n_lots)]
+    out["topups_g"] = topups_g
+    feasible = [g for g in topups_g if g is not None]
+    out["deficit_g"] = min(feasible) if feasible else 0
+    out["topup_possible"] = bool(feasible)
+    out["new_lot_g"] = _new_lot_g(
+        orders, n_lots, demand_g, cap_g, pk_g, machine_order, config,
+        cap_kw=cap_kw, pinned_lot_vi=pinned_lot_vi, lot_names=lot_names)

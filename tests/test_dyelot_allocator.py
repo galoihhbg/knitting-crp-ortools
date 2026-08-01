@@ -746,6 +746,33 @@ def test_in_production_many_machines_does_not_inflate_gross():
     assert amap.get("NEW") == "dyelot03"       # co-lotted
 
 
+def test_in_production_pin_over_capacity_prices_topup():
+    """When the pinned lot cannot host its in-production order's own demand under
+    reduced stock, the main solve is INFEASIBLE — the pin removes the unassigned
+    escape, so no packing exists. The allocator must STILL price the top-up: a real
+    'add X kg to the pinned lot' deficit, not the misleading single_lot_deficit_kg 0
+    / new_lot_kg 0 (which reads as 'dropped but nothing to buy'). Regression for the
+    solver_INFEASIBLE-returns-zero-remedy bug."""
+    # Pinned lot dyelotP holds only 20 kg; the in-production order needs 50 kg net on
+    # it (no picked creel yet) → forced pin overflows → INFEASIBLE.
+    dyelot_stock = [{"vi": "3039", "dyelot": "dyelotP", "remaining_kg": 20, "packing_size": 10}]
+    in_prod = [{"order": "INPROD", "vi": "3039", "dyelot": "dyelotP",
+                "machine_id": "SK1", "start_time": 0, "net_kg": 50, "slots": 1,
+                "committed_kg": 0}]
+    tasks = [_knit_task("t_new", "NEW", {"3039": 4}, slots={"3039": 1})]
+    assigns = [_assign("t_new", "SK1", 100)]
+    out = allocate_dyelots(tasks, assigns, dyelot_stock, CFG,
+                           vi_packing={"3039": 10}, in_production=in_prod)
+
+    # VI dropped as infeasible (the forced pin cannot fit)…
+    assert any(u["vi"] == "3039" and u["reason"] == "solver_INFEASIBLE"
+               for u in out["dyelot_unassigned"])
+    # …but a real remedy is now priced (the fix), not 0.
+    sh = next(s for s in out["dyelot_shortage"] if s["vi"] == "3039")
+    assert sh["single_lot_deficit_kg"] > 0
+    assert sh["shortage_kind"] not in ("REMEDY_UNKNOWN", "UNPROVEN")
+
+
 def test_in_production_shared_machines_creel_reuse_enables_colot():
     """Reported case (CP_1784687188624193131): in-prod + new order run on the SAME
     19 machines, both slots=2. Without creel reuse the new order's per-machine
