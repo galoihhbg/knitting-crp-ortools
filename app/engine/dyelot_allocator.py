@@ -124,6 +124,14 @@ def allocate_dyelots(
     dyelot_det = config.get("dyelot_max_deterministic_time")
     solver_config = ({**config, "max_deterministic_time": dyelot_det}
                      if dyelot_det is not None else config)
+    # When Go's commit walker gates cross-order seed inheritance
+    # (restrictSeedInheritToOwnerEnabled), a NEW co-lotting order mounts its OWN
+    # cones rather than reusing an in-production order's mounted creel — so its
+    # creel-up floor must NOT drop for those cones. Go sends this False to keep the
+    # two in lockstep; default True preserves the legacy reuse behaviour for any
+    # other caller / older payload. The in-production order's OWN accounting
+    # (committed_by capacity credit, its slots=0 pooled bucket) is unaffected.
+    reuse_mounted_cones = bool(config.get("dyelot_new_order_reuses_mounted_cones", True))
 
     # task_id → (machine, start) from the scheduler's knitting assignments.
     knit_ids = {
@@ -201,6 +209,8 @@ def allocate_dyelots(
     # (committed_kg>0). A co-lotting new order reuses these cones, so its creel-up
     # floor on such (machine, lot) drops to max(0, its_slots − mounted). Machines
     # NOT yet picked keep the full floor (cones not there → new order must mount).
+    # Left EMPTY when reuse_mounted_cones is off (Go's owner gate blocks the reuse),
+    # so no floor is dropped and every co-lotting order mounts its own cones.
     inprod_mounted: Dict[str, Dict[Any, Dict[str, int]]] = {}
     _committed_seen = set()   # (vi, order, machine, dyelot) — committed_kg repeats per machine row
     _inprod_pool_net: Dict[Tuple[str, str], float] = {}  # (vi, order) → pooled remaining net
@@ -257,8 +267,11 @@ def allocate_dyelots(
             _committed_seen.add(key)
             committed_by.setdefault(vi, {}).setdefault(dyelot, 0.0)
             committed_by[vi][dyelot] += committed_kg
-        # Mounted cones — only where physically picked (committed_kg>0).
-        if committed_kg > 0 and slots > 0:
+        # Mounted cones — only where physically picked (committed_kg>0). Skipped
+        # when reuse is off (Go's owner gate): the new order cannot reuse these
+        # cones, so its creel-up floor stays and it mounts fresh — leaving
+        # inprod_mounted empty makes the floor-drop below a no-op.
+        if reuse_mounted_cones and committed_kg > 0 and slots > 0:
             md = inprod_mounted.setdefault(vi, {}).setdefault(machine, {})
             if slots > md.get(dyelot, 0):
                 md[dyelot] = slots
@@ -342,7 +355,8 @@ def allocate_dyelots(
                              "shortage_kind": "NO_STOCK",
                              "single_lot_deficit_kg": round(new_lot_kg, 3),
                              "topups": [],
-                             "new_lot_kg": round(new_lot_kg, 3)})
+                             "new_lot_kg": round(new_lot_kg, 3),
+                             "new_lot_possible": True})   # a fresh lot IS the answer here
             logger.warning(f"🎨 VI {vi}: {len(order_kg)} order(s) consume it but "
                            f"dyelot_stock is empty → shortage.")
             continue
@@ -414,7 +428,11 @@ def allocate_dyelots(
                              "shortage_kind": kind,
                              "single_lot_deficit_kg": round(deficit_kg, 3),
                              "topups": topups,
-                             "new_lot_kg": round(new_lot_kg, 3)})
+                             "new_lot_kg": round(new_lot_kg, 3),
+                             # False ⇒ new_lot_kg 0 means "no fresh-lot option exists"
+                             # (a pin holds an order on an overflowing lot), NOT
+                             # "importing 0 kg clears it".
+                             "new_lot_possible": bool(res.get("new_lot_possible", True))})
             logger.warning(
                 f"🎨 VI {vi} shortage [{kind}]: {len(res['unassigned'])} order(s) "
                 f"unassigned; net {demand_kg:.3f} / gross {gross_demand_kg:.3f} kg vs "
@@ -676,6 +694,7 @@ def _solve_vi(
     mounted_vi: Optional[Dict[Any, Dict[str, int]]] = None,
     committed_vi: Optional[Dict[str, float]] = None,
     machine_span: Optional[Dict[Any, Tuple[int, int]]] = None,
+    forced_assigned: Optional[set] = None,
 ) -> Dict[str, Any]:
     """One independent CP-SAT model for a single VI.
 
@@ -698,20 +717,45 @@ def _solve_vi(
     Flush: per machine, walk the VI's units in schedule order; between adjacent
       units of DIFFERENT orders a flush is needed iff they pick different dyelots.
       cut = both_assigned − same_lot  (linear; same_lot=1 only when both assigned).
+    STRICT small-first (enable_dyelot_small_order_priority, default ON) sits ABOVE the
+    whole objective: when the solve below strands anything, the served set is recomputed
+    by walking the orders smallest→largest (_lex_small_first_forced) and the model is
+    re-solved with that set pinned.  The business rule is "a small order is completed
+    whenever it CAN be, big orders take what is left", which the count tier alone does
+    not give: maximising the COUNT still sacrifices one small order to serve two larger
+    ones.  The two agree whenever orders mount comparable creels (measured on 134 orders
+    of 0.5…67 kg: both serve the same 15 smallest), and diverge when a small order has a
+    disproportionate creel footprint.
+
     Objective (lexicographic via data-bounded weights, Maximize):
-      (1) feasibility       — maximize assigned orders
-      (2) min flush         — fewest cohort cuts (Σ cut)
-      (3) min lots opened   — Σ used[d]; consolidates a VI onto as few lots as
+      (1) feasibility       — maximize assigned orders.  COUNT-based: every order weighs
+                              the same regardless of kg, so when a lot cannot host all of
+                              them the solver drops the FEWEST orders — i.e. the big one
+                              goes before several small ones.  Bounded above by the strict
+                              small-first pass, which may deliberately serve FEWER.
+      (2) small-first       — +Σ assigned[o]·small_w[o], small_w = size RANK (smallest
+                              order gets the largest weight).  Tier 1 only fixes HOW MANY
+                              orders are served; among the equal-count solutions the rest
+                              of the objective was blind to order size, so which order got
+                              stranded was decided by the order CODE (measured: renaming
+                              the 40 kg order flipped the victim from it to a 0.5 kg order
+                              in 3 of 5 namings).  This makes "small orders get stock
+                              first" explicit instead of accidental.  Rank, not grams, so
+                              the weight cascade below cannot overflow on a 5-tonne VI.
+                              Flag enable_dyelot_small_order_first (default ON); OFF
+                              restores the old byte-identical objective.
+      (3) min flush         — fewest cohort cuts (Σ cut)
+      (4) min lots opened   — Σ used[d]; consolidates a VI onto as few lots as
                               possible WITHOUT preferring small lots, so multi-order
                               demand lands on the lot that holds the most instead of
                               stranding on a nearly-full small lot while a big lot
                               sits idle (the production over-concentration bug).
-      (4) prefer-buffer     — +Σ used[d]·buffer_g[d]; among equal-lot-count, equal-
+      (5) prefer-buffer     — +Σ used[d]·buffer_g[d]; among equal-lot-count, equal-
                               flush solutions, prefer a lot that carries Buffer-bin
                               yarn. Staged buffer consumed here issues no fresh main-
                               warehouse pull, so drain it before raw — but BELOW min-
                               lots, so buffer never justifies opening an extra lot.
-      (5) drain-small       — Σ used[d]·remaining_g[d] as a pure TIE-BREAK below the
+      (6) drain-small       — Σ used[d]·remaining_g[d] as a pure TIE-BREAK below the
                               buffer tier: among equal-lot-count, equal-flush, equal-
                               buffer solutions, consume the nearly-empty lot first.
                               Demoted from tier 3 (where it caused over-concentration)
@@ -761,6 +805,14 @@ def _solve_vi(
             d = lot_index.get(str(want))
             if d is not None:
                 model.Add(x[o][d] == 1)
+
+    # STRICT small-first re-solve: the must-serve set computed by the lexicographic
+    # walk below is imposed as HARD constraints, so the objective can no longer trade a
+    # small order away for a larger count. Every other tier still optimises inside it.
+    if forced_assigned:
+        for o in orders:
+            if o in forced_assigned:
+                model.Add(una[o] == 0)
 
     # Capacity — reuse-aware per-(machine, lot) roll model (C). mounted lets a
     # co-lotting order reuse an in-production order's already-mounted cones
@@ -819,7 +871,8 @@ def _solve_vi(
 
     # ── Lexicographic objective via data-bounded weights ─────────────────────
     # Tiers (high→low), folded into one Maximize:
-    #   (1) +assigned  (2) −flush  (3) −lots opened  (4) +prefer-buffer  (5) −drain-small
+    #   (1) +assigned  (2) +small-first  (3) −flush  (4) −lots opened
+    #   (5) +prefer-buffer  (6) −drain-small
     # Each tier's weight must dominate the MAX possible value of every lower tier
     # summed, so the optimum is exactly lexicographic.
     assigned_sum = sum(assigned[o] for o in orders)
@@ -828,9 +881,21 @@ def _solve_vi(
     buf_sum = sum(used[d] * buffer_g[d] for d in range(n_lots))     # prefer-buffer
     frag_sum = sum(used[d] * remaining_g[d] for d in range(n_lots))  # drain-small
 
+    # small-first: keep the SMALL orders when the lot cannot host everyone. Weight is
+    # the size RANK (smallest order → largest weight, ties by order id so it stays
+    # deterministic), NOT grams: a grams weight would push k_assign past int64 on a
+    # multi-tonne VI (max_small ≈ Σnet_g), while the rank sum is ≤ n²/2.
+    if config.get("enable_dyelot_small_order_first", True):
+        by_size = sorted(orders, key=lambda o: (demand_g[o], o))
+        small_w = {o: len(orders) - i for i, o in enumerate(by_size)}
+    else:
+        small_w = {o: 0 for o in orders}                    # OFF → tier vanishes
+    small_sum = sum(assigned[o] * small_w[o] for o in orders)
+
     n_pairs = len(flush_terms)                              # max value of flush_sum
     max_frag = sum(remaining_g)                             # max value of frag_sum
     max_buf = sum(buffer_g)                                 # max value of buf_sum
+    max_small = sum(small_w.values())                       # max value of small_sum
     k_frag = 1
     # Draining one buffer-gram must beat any drain-small gain (buffer is staged;
     # consuming it avoids a fresh main-warehouse pull — worth more than emptying a
@@ -840,11 +905,18 @@ def _solve_vi(
     k_lots = k_buf * max_buf + k_frag * max_frag + 1
     # One fewer flush must beat the worst (lots + buffer + drain-small) combined.
     k_flush = k_lots * n_lots + k_buf * max_buf + k_frag * max_frag + 1
+    # Serving a SMALLER order must beat everything below it (flush/lots/buffer/drain) —
+    # a rank step is worth more than any waste it causes. Still strictly BELOW tier 1,
+    # so small-first never trades away the number of orders served.
+    k_small = k_flush * n_pairs + k_lots * n_lots + k_buf * max_buf + k_frag * max_frag + 1
     # Assigning one more order must beat the worst lower-tier sum — so feasibility is
     # never traded for a lower tier (also why a VI with no flush pairs still assigns).
-    k_assign = k_flush * n_pairs + k_lots * n_lots + k_buf * max_buf + k_frag * max_frag + 1
+    # max_small = 0 when small-first is OFF → the old k_assign, byte-identical.
+    k_assign = (k_small * max_small + k_flush * n_pairs + k_lots * n_lots
+                + k_buf * max_buf + k_frag * max_frag + 1)
     model.Maximize(
         k_assign * assigned_sum
+        + k_small * small_sum
         - k_flush * flush_sum
         - k_lots * lots_sum
         + k_buf * buf_sum
@@ -876,6 +948,33 @@ def _solve_vi(
         _price_shortage_remedies(orders, n_lots, demand_g, cap_g, pk_g, machine_order,
                                  config, cap_kw, pinned_lot_vi, lot_names, out)
         return out
+
+    # STRICT small-first: the objective above maximises the COUNT of served orders, so
+    # it still sacrifices one small order to serve two larger ones. The business rule is
+    # that a small order must be completed whenever it CAN be — big orders take what is
+    # left — so when anything was dropped, recompute the served set by walking the
+    # orders smallest→largest and re-solve with that set pinned. Only runs on a VI that
+    # actually has an unplaceable order, and only once (the recursion passes
+    # forced_assigned, which short-circuits this block).
+    if (forced_assigned is None
+            and config.get("enable_dyelot_small_order_priority", True)
+            and any(solver.Value(una[o]) for o in orders)):
+        must = _lex_small_first_forced(orders, n_lots, demand_g, cap_g, pk_g,
+                                       machine_order, config, cap_kw,
+                                       pinned_lot_vi, lot_names)
+        served = {o for o in orders if not solver.Value(una[o])}
+        if must != served:
+            dropped_small = sorted(must - served, key=lambda o: (demand_g[o], o))
+            logger.info(
+                f"🎨 VI {vi}: strict small-first re-solve — count-max stranded "
+                f"{len(dropped_small)} order(s) that CAN be served "
+                f"({', '.join(dropped_small[:5])}{'…' if len(dropped_small) > 5 else ''}); "
+                f"serving {len(must)} order(s) instead of {len(served)}."
+            )
+            return _solve_vi(vi, order_kg, lots, machine_units, machine_order, config,
+                             pinned_lot_vi=pinned_lot_vi, mounted_vi=mounted_vi,
+                             committed_vi=committed_vi, machine_span=machine_span,
+                             forced_assigned=must)
 
     any_unassigned = False
     for o in orders:
@@ -909,6 +1008,45 @@ def _solve_vi(
         _price_shortage_remedies(orders, n_lots, demand_g, cap_g, pk_g, machine_order,
                                  config, cap_kw, pinned_lot_vi, lot_names, out)
     return out
+
+
+def _lex_small_first_forced(orders, n_lots, demand_g, cap_g, pk_g, machine_order,
+                            config, cap_kw, pinned_lot_vi, lot_names):
+    """The set of orders to serve under STRICT small-first priority: "a small order is
+    always completed if it can be, whatever it costs the bigger ones".
+
+    Walks the orders smallest→largest (ties by id, so it is deterministic) and keeps
+    each one whenever the accumulated must-serve set is still feasible. That is true
+    lexicographic priority — order k is only sacrificed if serving it is impossible
+    given every smaller order, never because it would cost two larger ones.
+
+    Why a walk and not another objective tier: the tier-2 weight is a rank SUM, so it
+    still trades the single smallest order for two lower-ranked ones (weights n vs
+    (n−1)+(n−2)); making the tiers truly lexicographic needs exponential weights
+    (2^rank), which overflows past ~60 orders. n small feasibility solves do not.
+
+    Cost: one tiny feasibility solve per order, and only on a VI that actually has an
+    unplaceable order — a VI where everything fits never reaches this path."""
+    kw = dict(cap_kw or {})
+    per_machine = bool(kw.pop("per_machine",
+                              config.get("enable_dyelot_per_machine_creel", True)))
+    must: List[str] = []
+    for o in sorted(orders, key=lambda oo: (demand_g[oo], oo)):
+        candidate = must + [o]
+        m = cp_model.CpModel()
+        x = {oo: [m.NewBoolVar(f"lx_{oo}_{d}") for d in range(n_lots)] for oo in orders}
+        una = {oo: m.NewBoolVar(f"lu_{oo}") for oo in orders}
+        for oo in orders:
+            m.Add(sum(x[oo]) + una[oo] == 1)
+        _pin_orders(m, x, orders, pinned_lot_vi, lot_names)
+        _add_roll_capacity(m, x, orders, n_lots, demand_g, cap_g, pk_g,
+                           machine_order, per_machine=per_machine, **kw)
+        for oo in candidate:
+            m.Add(una[oo] == 0)
+        s = make_solver(config, relative_gap=0.0)
+        if s.Solve(m) in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            must = candidate
+    return set(must)
 
 
 def _pin_orders(model, x, orders, pinned_lot_vi, lot_names) -> None:
@@ -992,7 +1130,12 @@ def _new_lot_g(orders, n_lots, demand_g, cap_g, pk_g,
     s = make_solver(config, relative_gap=0.0)   # exact minimal fresh-lot size, not within 1%
     st = s.Solve(m)
     if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return 0
+        # A fresh lot CANNOT clear this shortage at any size — an in-production pin
+        # holds an order on an existing lot that overflows, and a new lot cannot take
+        # it (dyelots are never mixed within an order). Returning 0 here would read
+        # downstream as "import 0 kg", i.e. nothing to buy; None says "no such
+        # option" so the caller can report it as unavailable instead of free.
+        return None
     return int(s.Value(new))
 
 
@@ -1009,7 +1152,9 @@ def _price_shortage_remedies(orders, n_lots, demand_g, cap_g, pk_g, machine_orde
       topups_g[d] — extra kg to add to dyelot d ALONE (None when it can't be the
                     single sink, e.g. a pin forces an order onto a different lot);
       deficit_g   — the CHEAPEST single-lot top-up (min over topups_g);
-      new_lot_g   — size of ONE fresh dyelot to import instead.
+      new_lot_g   — size of ONE fresh dyelot to import instead (None when a fresh lot
+                    cannot clear it at any size, i.e. a pin holds an order on an
+                    existing overflowing lot; 0 would read as "import 0 kg").
     """
     topups_g = [_topup_one_lot_g(d, orders, n_lots, demand_g, cap_g, pk_g,
                                  machine_order, config, cap_kw=cap_kw,
@@ -1019,6 +1164,8 @@ def _price_shortage_remedies(orders, n_lots, demand_g, cap_g, pk_g, machine_orde
     feasible = [g for g in topups_g if g is not None]
     out["deficit_g"] = min(feasible) if feasible else 0
     out["topup_possible"] = bool(feasible)
-    out["new_lot_g"] = _new_lot_g(
+    new_lot_g = _new_lot_g(
         orders, n_lots, demand_g, cap_g, pk_g, machine_order, config,
         cap_kw=cap_kw, pinned_lot_vi=pinned_lot_vi, lot_names=lot_names)
+    out["new_lot_possible"] = new_lot_g is not None
+    out["new_lot_g"] = new_lot_g or 0

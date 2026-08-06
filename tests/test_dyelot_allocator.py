@@ -800,6 +800,37 @@ def test_in_production_shared_machines_creel_reuse_enables_colot():
     assert amap.get("NEW") == "dyelot03", f"new order should co-lot, got {amap.get('NEW')}"
 
 
+def test_in_production_reuse_off_keeps_floor_no_colot():
+    """Owner-gate mirror of the reuse-enables-colot case: with
+    dyelot_new_order_reuses_mounted_cones=False (Go's commit walker gates
+    cross-order seed inheritance — the new order mounts its OWN cones), the new
+    order can NOT reuse the in-production order's mounted creel, so its
+    19×2×10=380 kg creel-up overflows dyelot03 (120 kg) and it drifts to dyelot02
+    instead of co-lotting. Identical payload to
+    test_in_production_shared_machines_creel_reuse_enables_colot; only the flag
+    differs. The in-production order still pins to its own committed lot."""
+    machines = [f"M{i}" for i in range(19)]
+    in_prod = [{"order": "INPROD", "vi": "3039", "dyelot": "dyelot03",
+                "machine_id": m, "start_time": 0, "net_kg": 69.0/19, "slots": 2,
+                "committed_kg": 319.0/19} for m in machines]
+    tasks, assigns = [], []
+    for i, m in enumerate(machines):
+        tid = f"t_new_{i}"
+        tasks.append(_knit_task(tid, "NEW", {"3039": 65.0/19}, slots={"3039": 2}))
+        assigns.append(_assign(tid, m, 1000))
+    dyelot_stock = [
+        {"vi": "3039", "dyelot": "dyelot03", "remaining_kg": 120, "packing_size": 10},
+        {"vi": "3039", "dyelot": "dyelot02", "remaining_kg": 1000, "packing_size": 10},
+    ]
+    out = allocate_dyelots(tasks, assigns, dyelot_stock,
+                           {**CFG, "dyelot_new_order_reuses_mounted_cones": False},
+                           vi_packing={"3039": 10}, in_production=in_prod)
+    amap = {a["order"]: a["dyelot"] for a in out["order_dyelot_assignment"]}
+    assert amap.get("INPROD") == "dyelot03"
+    assert amap.get("NEW") == "dyelot02", \
+        f"reuse off → floor kept → new order must NOT co-lot onto dyelot03, got {amap.get('NEW')}"
+
+
 def test_in_production_not_picked_keeps_floor():
     """If the in-production creel is NOT picked (committed_kg=0 → cones not mounted),
     the floor must NOT drop — the new order still needs its own cones. Here dyelot03
@@ -1134,3 +1165,134 @@ def test_in_production_without_lot_and_without_demand_is_ignored():
                          in_production=noise)
     assert a["order_dyelot_assignment"] == b["order_dyelot_assignment"]
     assert "GHOST" not in {x["order"] for x in b["order_dyelot_assignment"]}
+
+
+# ---------------------------------------------------------------------------
+# 17. small-first (tier 2) — "đơn siêu nhỏ được ưu tiên stock trước".
+#     Tier 1 only fixes HOW MANY orders are served; among equal-count solutions the
+#     objective used to be blind to order size, so the victim was decided by the order
+#     CODE (measured: renaming the 40 kg order flipped the victim from it to a 0.5 kg
+#     order in 3 of 5 namings). This tier makes small-first explicit.
+# ---------------------------------------------------------------------------
+
+def _big_vs_tiny(big_name, tiny_names, cfg=CFG):
+    """Lot 50 kg, rolls of 10. BIG=40 kg on its own machine (charge 40), each TINY=0.5 kg
+    on its own machine (charge 10 = one full creel). Keeping everyone needs 60 > 50, and
+    EVERY single-order drop leaves exactly 2 orders assigned → tier 1 ties, so only
+    small-first decides who is stranded."""
+    VI = "V"
+    tasks = [_knit_task("t_big", big_name, {VI: 40.0}, slots={VI: 1})]
+    assigns = [_assign("t_big", "M0", 0, 100)]
+    for i, nm in enumerate(tiny_names, start=1):
+        tasks.append(_knit_task(f"t_s{i}", nm, {VI: 0.5}, slots={VI: 1}))
+        assigns.append(_assign(f"t_s{i}", f"M{i}", 0, 100))
+    stock = [{"vi": VI, "dyelot": "L1", "remaining_kg": 50.0, "packing_size": 10.0}]
+    res = allocate_dyelots(tasks, assigns, stock, cfg)
+    return res, sorted(u["order"] for u in res["dyelot_unassigned"])
+
+
+@pytest.mark.parametrize("big,tinies", [
+    ("BIG_40kg", ["TINY_1", "TINY_2"]),
+    ("AAA_BIG_40kg", ["TINY_1", "TINY_2"]),   # big sorts FIRST by id
+    ("ZZZ_BIG_40kg", ["TINY_1", "TINY_2"]),   # big sorts LAST by id
+    ("MID_BIG_40kg", ["AAA_TINY", "ZZZ_TINY"]),
+    ("BIG_40kg", ["A_TINY", "B_TINY"]),
+])
+def test_small_orders_get_stock_before_a_big_one(big, tinies):
+    res, lost = _big_vs_tiny(big, tinies)
+    # The big order is the one stranded — in EVERY naming, not just the lucky ones.
+    assert lost == [big], f"expected {big} stranded, got {lost}"
+    assert sorted(a["order"] for a in res["order_dyelot_assignment"]) == sorted(tinies)
+
+
+def test_small_first_off_keeps_old_objective():
+    """OFF → the tier vanishes (max_small = 0 ⇒ the old k_assign), so feasibility is
+    unchanged: still exactly 2 of 3 orders served. WHICH one is stranded is objective-
+    neutral there (that is the bug this tier fixes), so it is deliberately not asserted."""
+    cfg = {**CFG, "enable_dyelot_small_order_first": False}
+    res, lost = _big_vs_tiny("BIG_40kg", ["TINY_1", "TINY_2"], cfg=cfg)
+    assert len(lost) == 1
+    assert len(res["order_dyelot_assignment"]) == 2
+
+
+def _tiny_hogs_creel(cfg=CFG):
+    """The case where "most orders served" and "small orders first" disagree: a 0.5 kg
+    order mounts a 3-cone creel (30 kg at pk 10) and alone fills the lot, while three
+    5 kg orders would fit in one roll each. Count-max serves the three; strict
+    small-first serves the 0.5 kg one."""
+    VI = "V"
+    tasks = [_knit_task("t_tiny", "TINY_wide_creel", {VI: 0.5}, slots={VI: 3})]
+    assigns = [_assign("t_tiny", "M0", 0, 100)]
+    for i, nm in enumerate(("MID_A", "MID_B", "MID_C"), start=1):
+        tasks.append(_knit_task(f"t_m{i}", nm, {VI: 5.0}, slots={VI: 1}))
+        assigns.append(_assign(f"t_m{i}", f"M{i}", 0, 100))
+    stock = [{"vi": VI, "dyelot": "L1", "remaining_kg": 30.0, "packing_size": 10.0}]
+    return VI, allocate_dyelots(tasks, assigns, stock, cfg)
+
+
+def test_smallest_order_is_served_even_at_the_cost_of_more_orders():
+    """STRICT small-first (business rule): a small order is completed whenever it CAN
+    be, and the bigger ones take what is left — even when serving it means serving FEWER
+    orders overall. Count-max alone would strand the 0.5 kg order to keep three 5 kg
+    ones; a rank-SUM tier would too (weights 4 vs 3+2)."""
+    VI, res = _tiny_hogs_creel()
+    served = sorted(a["order"] for a in res["order_dyelot_assignment"])
+    assert served == ["TINY_wide_creel"], f"smallest order must be served, got {served}"
+    assert sorted(u["order"] for u in res["dyelot_unassigned"]) == ["MID_A", "MID_B", "MID_C"]
+
+
+def test_small_order_priority_off_maximises_count():
+    """OFF → the old count-max behaviour: three 5 kg orders beat the 0.5 kg one. Kept as
+    an escape hatch (and to pin down exactly what the strict rule changes)."""
+    cfg = {**CFG, "enable_dyelot_small_order_priority": False}
+    VI, res = _tiny_hogs_creel(cfg=cfg)
+    assert [u["order"] for u in res["dyelot_unassigned"]] == ["TINY_wide_creel"]
+    assert len(res["order_dyelot_assignment"]) == 3
+
+
+def test_strict_small_first_serves_every_order_it_can():
+    """The walk is greedy by size but never gives up a servable small order: 4 orders of
+    1/2/3/40 kg (slots 1, pk 1) on a 10 kg lot → the three small ones all fit (6 kg) and
+    only the 40 kg one is dropped. No small order is sacrificed for the big one."""
+    VI = "V"
+    tasks, assigns = [], []
+    for i, (nm, kg) in enumerate((("S1", 1.0), ("S2", 2.0), ("S3", 3.0), ("BIG", 40.0))):
+        tasks.append(_knit_task(f"t{i}", nm, {VI: kg}, slots={VI: 1}))
+        assigns.append(_assign(f"t{i}", f"M{i}", 0, 100))
+    stock = [{"vi": VI, "dyelot": "L1", "remaining_kg": 10.0, "packing_size": 1.0}]
+    res = allocate_dyelots(tasks, assigns, stock, CFG)
+    assert sorted(a["order"] for a in res["order_dyelot_assignment"]) == ["S1", "S2", "S3"]
+    assert [u["order"] for u in res["dyelot_unassigned"]] == ["BIG"]
+
+
+def test_new_lot_impossible_is_flagged_not_reported_as_zero():
+    """A fresh lot cannot rescue an order PINNED to an overflowing lot (dyelots are
+    never mixed within an order), so _new_lot_g has no answer. Reporting new_lot_kg 0
+    then reads as "import 0 kg" = nothing to buy; new_lot_possible says otherwise.
+    Seen on CP_1785981985233855798: deficit 293.2 kg alongside new_lot_kg 0."""
+    tasks = [_knit_task("t_new", "NEW", {"V": 4.0}, slots={"V": 1})]
+    assigns = [_assign("t_new", "SK1", 100)]
+    # 5 kg lot pinned to an in-production order needing 40 kg → the pin alone overflows.
+    stock = [{"vi": "V", "dyelot": "L1", "remaining_kg": 5.0, "packing_size": 1.0}]
+    in_prod = [{"order": "INPROD", "vi": "V", "dyelot": "L1", "machine_id": "SK1",
+                "start_time": 0, "net_kg": 40.0, "slots": 1, "committed_kg": 0.0}]
+
+    res = allocate_dyelots(tasks, assigns, stock, CFG, in_production=in_prod)
+
+    sh = next(s for s in res["dyelot_shortage"] if s["vi"] == "V")
+    assert sh["single_lot_deficit_kg"] > 0, "topping up the pinned lot IS possible"
+    assert sh["new_lot_possible"] is False
+    assert sh["new_lot_kg"] == 0.0        # 0 now means "no such option", not "free"
+
+
+def test_new_lot_possible_when_a_fresh_lot_clears_it():
+    """Control: with no pin in the way a fresh lot is a real option, so the flag stays
+    True and new_lot_kg carries its size."""
+    VI = "V"
+    tasks = [_knit_task("u1", "A", {VI: 5.0}), _knit_task("u2", "B", {VI: 5.0})]
+    assigns = [_assign("u1", "M1", 0), _assign("u2", "M1", 100)]
+    stock = [{"vi": VI, "dyelot": "L6", "remaining_kg": 6.0, "packing_size": 1.0},
+             {"vi": VI, "dyelot": "L4", "remaining_kg": 4.0, "packing_size": 1.0}]
+    sh = next(s for s in allocate_dyelots(tasks, assigns, stock, CFG)["dyelot_shortage"]
+              if s["vi"] == VI)
+    assert sh["new_lot_possible"] is True and sh["new_lot_kg"] == 5.0
