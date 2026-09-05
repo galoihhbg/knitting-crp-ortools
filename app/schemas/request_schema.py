@@ -341,6 +341,16 @@ class SolverConfig(BaseModel):
     # only moves earlier ⇒ downstream release bounds relax ⇒ ironing/packing stay valid
     # and end-to-end lateness is non-increasing.  Skipped on re-schedule (washing kept).
     enable_washing_left_shift: bool = True
+    # Dyelot PIECE-SPLIT (GĐ2 of the relaxation "1 item = 1 dyelot" → "1 áo = 1
+    # dyelot").  True → the dyelot allocator may split one item's integer GARMENT
+    # count across several lots (6 áo lot A + 4 áo lot B); same-lot stays
+    # PREFERRED (each extra lot an item touches is priced in the flush tier).
+    # order_dyelot_assignment then carries one row per (order, vi, dyelot) with
+    # `kg` + `pieces`.  False (default) → the legacy one-hot model, byte-identical:
+    # one dyelot per (order, vi), FRAGMENTED shortages, single-lot remedies.
+    # MUST be declared here: SolverConfig drops unknown keys (extra="ignore"),
+    # so an undeclared flag sent by Go would silently never reach the allocator.
+    dyelot_allow_mixing: bool = False
 
 
 class PreviousAssignment(BaseModel):
