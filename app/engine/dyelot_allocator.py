@@ -928,6 +928,22 @@ class _AllocVars:
             for d2 in range(self.n_lots):
                 _hint(self._garment[(o, d2)], q if d2 == d else 0)
 
+    def pieces_on(self, o, d):
+        """Pieces of order o placed on lot d, or None when the order cannot split
+        (one-hot mode, or a whole-order fallback that shares one bool)."""
+        if not self.mixing:
+            return None
+        terms = [self._piece[(o, key, d)] for key in self._entities.get(o, [])
+                 if self._piece.get((o, key, d)) is not None]
+        if not terms:
+            return None
+        return sum(terms)
+
+    def pieces_total(self, o) -> int:
+        """How many pieces of order o are splittable — the bound on pieces_on."""
+        return sum(self._meta[(o, key)][0] for key in self._entities.get(o, [])
+                   if self._piece.get((o, key, 0)) is not None)
+
     def mix_terms(self):
         """Flush-tier extras: creel swaps inside a run + extra lots per item."""
         return list(self._mix_vars)
@@ -1372,11 +1388,47 @@ def _solve_vi(
         small_w = {o: 0 for o in orders}                    # OFF → tier vanishes
     small_sum = sum(assigned[o] * small_w[o] for o in orders)
 
+    # Tier 7 (lowest): keep as many pieces as possible on each order's PRIMARY
+    # lot — i.e. leave as FEW garments as possible on the minority ones.
+    #
+    # Nothing above this tier has an opinion about the SIZE of a split. The mix
+    # terms count how many extra lots an item touches, not how much of it went
+    # there, so 280/20 and 200/100 are the same price to every tier above, and
+    # which one comes back is whatever the search happened to find: measured on
+    # real plans it landed on ~2:1 every time, when 14:1 was available. The floor
+    # pays for that in garments it has to keep apart.
+    #
+    # Safe at the bottom because it is orthogonal to what is already there: the
+    # buffer and drain-small tiers are functions of used[d] — WHICH lots are
+    # opened — and are untouched by how the pieces divide between them. So this
+    # only ever breaks ties between solutions those tiers already rate equal.
+    #
+    # Mixing mode only: a one-hot order has no minority lot by construction, and
+    # the legacy objective stays byte-identical.
+    primary_terms = []
+    max_primary = 0
+    if mixing:
+        for o in orders:
+            tot = alloc.pieces_total(o)
+            if tot <= 0:
+                continue
+            exprs = [alloc.pieces_on(o, d) for d in range(n_lots)]
+            if any(e is None for e in exprs):
+                continue
+            pg = model.NewIntVar(0, tot, f"pg_{vi}_{o}")
+            model.AddMaxEquality(pg, exprs)
+            primary_terms.append(pg)
+            max_primary += tot
+    primary_sum = sum(primary_terms) if primary_terms else 0
+
     n_pairs = len(flush_terms) + alloc.max_mix()            # max value of flush_sum
     max_small = sum(small_w.values())                       # max value of small_sum
 
-    def _cascade(max_frag, max_buf):
-        k_frag = 1
+    def _cascade(max_frag, max_buf, max_prim=0):
+        # k_prim is the new bottom of the cascade; every weight above it grows by
+        # the most this tier can contribute, so the lexicographic order holds.
+        k_prim = 1
+        k_frag = k_prim * max_prim + 1
         # Draining one buffer unit must beat any drain-small gain (buffer is staged;
         # consuming it avoids a fresh main-warehouse pull — worth more than emptying
         # a small raw lot). Below min-lots, so it never opens an extra lot for buffer.
@@ -1395,11 +1447,11 @@ def _solve_vi(
         # assigns). max_small = 0 when small-first is OFF → the old k_assign.
         k_assign = (k_small * max_small + k_flush * n_pairs + k_lots * n_lots
                     + k_buf * max_buf + k_frag * max_frag + 1)
-        return k_frag, k_buf, k_lots, k_flush, k_small, k_assign
+        return k_frag, k_buf, k_lots, k_flush, k_small, k_assign, k_prim
 
     max_frag = sum(frag_w)                                  # max value of frag_sum
     max_buf = sum(buf_w)                                    # max value of buf_sum
-    k_frag, k_buf, k_lots, k_flush, k_small, k_assign = _cascade(max_frag, max_buf)
+    k_frag, k_buf, k_lots, k_flush, k_small, k_assign, k_prim = _cascade(max_frag, max_buf, max_primary)
     if mixing and k_assign * (len(orders) + 1) >= (1 << 62):
         # Defensive int64 guard for a huge piece-split VI: drop the two pure
         # tie-break tiers rather than overflow CP-SAT's objective domain.
@@ -1407,7 +1459,7 @@ def _solve_vi(
                        f"buffer/drain-small tie-break tiers for this solve.")
         buf_sum = 0
         frag_sum = 0
-        k_frag, k_buf, k_lots, k_flush, k_small, k_assign = _cascade(0, 0)
+        k_frag, k_buf, k_lots, k_flush, k_small, k_assign, k_prim = _cascade(0, 0, max_primary)
     model.Maximize(
         k_assign * assigned_sum
         + k_small * small_sum
@@ -1415,6 +1467,7 @@ def _solve_vi(
         - k_lots * lots_sum
         + k_buf * buf_sum
         - k_frag * frag_sum
+        + k_prim * primary_sum
     )
 
     # gap=0: tier-1 is feasibility (max assigned orders); the default 1% gap on a
