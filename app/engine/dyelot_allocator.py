@@ -31,6 +31,7 @@ returned to Go.
 Entry point: allocate_dyelots(tasks, knitting_assignments, dyelot_stock, config).
 """
 import logging
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from ortools.sat.python import cp_model
@@ -176,6 +177,15 @@ def allocate_dyelots(
     # (dyelot_allow_mixing) splits at this granularity — one garment never mixes
     # lots. 0/unknown qty → that order/run falls back to one-hot (no split).
     vi_order_qty: Dict[str, Dict[str, int]] = {}
+    # GĐ3 garment-level lot purity: vi → order → piece-kind (design_item_id) →
+    # [kg, piece_qty]. A garment assembles ONE piece of each kind × mult (front
+    # body + back body + 2 sleeves…), each kind knits as its own PO on its own
+    # machines — so all kinds of an order must split garments across lots
+    # IDENTICALLY or linking cannot pair them into single-lot garments.
+    # vi_order_garment: the explicit garment count when Go sends one
+    # (task.garment_qty); otherwise the gcd of the kind totals resolves it.
+    vi_order_groups: Dict[str, Dict[str, Dict[str, List[float]]]] = {}
+    vi_order_garment: Dict[str, Dict[str, int]] = {}
     # vi → machine → [span_start, span_end]: the window the machine holds this VI's
     # creel (first run start → last run end).  Go releases the leftover to the free
     # pool at the end of that window, so machines with DISJOINT windows can reuse the
@@ -190,6 +200,8 @@ def allocate_dyelots(
         # Integer garment count of this task — negative/fractional junk clamps to 0
         # ("unknown"), which downgrades the run to one-hot rather than mis-splitting.
         tqty = max(int(round(float(t.get("qty") or 0))), 0)
+        group = str(t.get("design_item_id") or "")
+        gq = max(int(round(float(t.get("garment_qty") or 0))), 0)
         for vi, (kg, slots) in _main_consumption(t).items():
             vi_order_kg.setdefault(vi, {}).setdefault(order, 0.0)
             vi_order_kg[vi][order] += kg
@@ -202,6 +214,19 @@ def allocate_dyelots(
             run[0] += kg
             run[1] = max(run[1], slots)
             run[2] += tqty
+            # Per-run piece-kind breakdown (GĐ3) — appended so run[0..2] indexes
+            # stay valid for every existing reader.
+            if len(run) == 3:
+                run.append({})
+            rg = run[3].setdefault(group, [0.0, 0])
+            rg[0] += kg
+            rg[1] += tqty
+            og = vi_order_groups.setdefault(vi, {}).setdefault(order, {}).setdefault(group, [0.0, 0])
+            og[0] += kg
+            og[1] += tqty
+            if gq > 0:
+                cur = vi_order_garment.setdefault(vi, {})
+                cur[order] = max(cur.get(order, 0), gq)
             if end is None:
                 vi_span_unknown.add(vi)
             else:
@@ -392,7 +417,9 @@ def allocate_dyelots(
                         mounted_vi=inprod_mounted.get(vi),
                         committed_vi=committed_by.get(vi),
                         machine_span=span_vi,
-                        order_qty=vi_order_qty.get(vi, {}))
+                        order_qty=vi_order_qty.get(vi, {}),
+                        order_groups=vi_order_groups.get(vi, {}),
+                        garment_qty=vi_order_garment.get(vi, {}))
         assignments.extend(res["assignments"])
         flush_points.extend(res["flush_points"])
         unassigned.extend(res["unassigned"])
@@ -576,6 +603,35 @@ def _cap_slack_g(demand_g, pk_g, machine_order, per_machine=True) -> int:
     return sum(demand_g.values()) + (runs + tslots) * max(pk_g)
 
 
+def _garment_plan(groups: Dict[str, List[float]],
+                  explicit_q: int) -> Optional[Tuple[int, Dict[str, int]]]:
+    """GĐ3: resolve an order's garment structure from its piece-kind totals.
+
+    groups: design_item_id → [kg, piece_qty] (order-level totals). Returns
+    (Q, {kind: pieces_per_garment}) — Q whole garments with every kind carrying
+    mult×Q pieces — or None when the structure cannot be resolved (a kind with
+    no piece count, or kind totals with no common garment count). Prefers Go's
+    explicit garment_qty when it divides every kind total; falls back to the
+    gcd of the totals — exact whenever at least one kind is 1-per-garment
+    (true for any garment with a body panel). A hypothetical all-kinds-share-a-
+    factor garment would over-allow splitting inside that factor; Go closes
+    that residual hole by sending garment_qty.
+    """
+    if not groups:
+        return None
+    qtys = [int(v[1]) for v in groups.values()]
+    if any(q <= 0 for q in qtys):
+        return None
+    q = 0
+    for x in qtys:
+        q = math.gcd(q, x)
+    if explicit_q > 0 and all(x % explicit_q == 0 for x in qtys):
+        q = explicit_q
+    if q <= 0:
+        return None
+    return q, {g: int(v[1]) // q for g, v in groups.items()}
+
+
 class _AllocVars:
     """Per-VI assignment variables, one of two modes (GĐ2 dyelot relaxation).
 
@@ -594,10 +650,20 @@ class _AllocVars:
     second lot on a run swaps the creel, so each touched lot pays the full cone
     floor. order_use[o][d] (OR over the order's runs) feeds flush adjacency,
     used[d] and the mix-preference terms.
+
+    GĐ3 (garment-level purity across piece-kinds): a run's chunks are
+    (machine, design_item_id) so a multi-panel garment's kinds (front / back /
+    sleeves — separate POs on separate machines) can be TIED: n[o][d] whole
+    garments per lot with every kind carrying mult_kind × n[o][d] pieces there.
+    An unresolvable multi-kind order (missing piece counts) falls back to ONE
+    lot for the whole order — never to a free per-kind split that linking could
+    not assemble. Single-kind orders keep the exact GĐ2 behaviour, and `pieces`
+    in the result means GARMENTS whenever the tie is active.
     """
 
     def __init__(self, model, prefix, orders, n_lots, demand_g, machine_order,
-                 order_qty, mixing, per_machine, with_una):
+                 order_qty, mixing, per_machine, with_una,
+                 order_groups=None, garment_qty=None):
         self.model = model
         self.orders = orders
         self.n_lots = n_lots
@@ -616,6 +682,11 @@ class _AllocVars:
         self._entities = {}               # o -> [key, ...]
         self._order_use = {}              # (o, d) -> BoolVar
         self._mix_vars = []               # IntVars = max(0, extra lots) per order/run
+        # GĐ3 garment tying (entities are now (machine, piece-kind) chunks):
+        self._ents_by_m = {}              # (o, machine) -> [entity keys]
+        self._mtouch = {}                 # (o, machine, d) -> BoolVar creel touch
+        self._garment = {}                # (o, d) -> IntVar garments on lot d
+        self._garment_q = {}              # o -> Q (whole-garment count)
 
         if not self.mixing:
             self.x = {o: [model.NewBoolVar(f"{prefix}x_{o}_{d}") for d in range(n_lots)]
@@ -633,51 +704,135 @@ class _AllocVars:
         if with_una:
             self.una = {o: model.NewBoolVar(f"{prefix}una_{o}") for o in orders}
         for o in orders:
-            keys = []
+            served = (1 - self.una[o]) if with_una else 1
+            # Demand chunks: (machine|None, piece-kind, kg, qty). A run splits into
+            # its piece-kind groups (design_item_id) when the payload carries them —
+            # GĐ3 ties the kinds together below so every kind splits garments across
+            # lots IDENTICALLY (an assembled garment = one lot). A legacy run with
+            # no kind info is a single "" chunk — GĐ2 behaviour unchanged.
+            chunks = []
             if per_machine:
                 for m in machines:
                     if o in machine_order[m]:
                         run = machine_order[m][o]
-                        keys.append((m, float(run[0]),
-                                     int(run[2]) if len(run) > 2 else 0))
-            if not keys:
-                # Machine-less (missing) order, or the legacy pooled model:
-                # one order-level entity carrying the whole demand.
-                keys.append((None, self.demand_g[o] / _KG_SCALE,
-                             int((order_qty or {}).get(o, 0) or 0)))
+                        groups = run[3] if len(run) > 3 and run[3] else None
+                        if groups:
+                            for g in sorted(groups):
+                                gkg, gq = groups[g]
+                                chunks.append((m, g, float(gkg), int(gq)))
+                        else:
+                            chunks.append((m, "", float(run[0]),
+                                           int(run[2]) if len(run) > 2 else 0))
+            if not chunks:
+                # Machine-less (missing) order, or the legacy pooled model: one
+                # chunk per piece-kind when known, else one order-level chunk.
+                og = (order_groups or {}).get(o) or {}
+                if og:
+                    for g in sorted(og):
+                        gkg, gq = og[g]
+                        chunks.append((None, g, float(gkg), int(gq)))
+                else:
+                    chunks.append((None, "", self.demand_g[o] / _KG_SCALE,
+                                   int((order_qty or {}).get(o, 0) or 0)))
+
+            kinds = {c[1] for c in chunks}
+            plan = None
+            if len(kinds) >= 2:
+                plan = _garment_plan((order_groups or {}).get(o) or {},
+                                     int((garment_qty or {}).get(o, 0) or 0))
+            all_piece = all(cq >= 1 and _g(ckg) > 0 for _cm, _cg, ckg, cq in chunks)
+            # A multi-kind order whose garment structure cannot be resolved (a
+            # chunk with no piece count, or kind totals sharing no garment count):
+            # free-splitting it could strand un-assemblable panels at linking, so
+            # the WHOLE order stays on one lot. Visible shortage over silently
+            # mismatched panels.
+            whole_order = len(kinds) >= 2 and (plan is None or not all_piece)
+
             self._entities[o] = []
-            for key, kg_f, qty in keys:
+            ob = None
+            if whole_order:
+                ob = [model.NewBoolVar(f"{prefix}w_{o}_{d}")
+                      for d in range(self.n_lots)]
+                model.Add(sum(ob) == served)
+            for (m, g, kg_f, qty) in chunks:
+                key = (m, g)
                 self._entities[o].append(key)
+                self._ents_by_m.setdefault((o, m), []).append(key)
                 ent_g = _g(kg_f)
-                is_piece = qty >= 1 and ent_g > 0
+                is_piece = (not whole_order) and qty >= 1 and ent_g > 0
                 kgpp = -(-ent_g // qty) if is_piece else 0    # ceil grams / garment
                 self._meta[(o, key)] = (qty, kgpp, kg_f, is_piece)
-                served = (1 - self.una[o]) if with_una else 1
-                if is_piece:
-                    pz = [model.NewIntVar(0, qty, f"{prefix}p_{o}_{key}_{d}")
+                if whole_order:
+                    for d in range(self.n_lots):
+                        self._bool[(o, key, d)] = ob[d]
+                        self._use[(o, key, d)] = ob[d]
+                elif is_piece:
+                    pz = [model.NewIntVar(0, qty, f"{prefix}p_{o}_{m}_{g}_{d}")
                           for d in range(self.n_lots)]
                     for d in range(self.n_lots):
                         self._piece[(o, key, d)] = pz[d]
                     model.Add(sum(pz) == qty * served)
                     for d in range(self.n_lots):
-                        u = model.NewBoolVar(f"{prefix}u_{o}_{key}_{d}")
+                        u = model.NewBoolVar(f"{prefix}u_{o}_{m}_{g}_{d}")
                         model.Add(pz[d] <= qty * u)
                         model.Add(pz[d] >= u)
                         self._use[(o, key, d)] = u
-                    # Every extra lot a run touches is one physical creel swap →
-                    # priced in the flush tier. max(0, Σuse − served) via a
-                    # minimised IntVar (the objective pushes it onto the bound).
-                    sw = model.NewIntVar(0, self.n_lots, f"{prefix}sw_{o}_{key}")
-                    model.Add(sw >= sum(self._use[(o, key, d)]
-                                        for d in range(self.n_lots)) - served)
-                    self._mix_vars.append(sw)
                 else:
-                    yz = [model.NewBoolVar(f"{prefix}y_{o}_{key}_{d}")
+                    yz = [model.NewBoolVar(f"{prefix}y_{o}_{m}_{g}_{d}")
                           for d in range(self.n_lots)]
                     for d in range(self.n_lots):
                         self._bool[(o, key, d)] = yz[d]
                         self._use[(o, key, d)] = yz[d]
                     model.Add(sum(yz) == served)
+
+            # Machine-level creel touch + swap pricing: the piece-kind chunks of
+            # one (order, machine) run SHARE the mounted cones (same yarn), so the
+            # creel floor gate and the swap count live per MACHINE, not per chunk.
+            for m in sorted({k[0] for k in self._entities[o]}, key=str):
+                mkeys = self._ents_by_m[(o, m)]
+                for d in range(self.n_lots):
+                    us = [self._use[(o, k, d)] for k in mkeys]
+                    if len(us) == 1:
+                        mt = us[0]
+                    else:
+                        mt = model.NewBoolVar(f"{prefix}mt_{o}_{m}_{d}")
+                        for u in us:
+                            model.Add(mt >= u)
+                        model.Add(mt <= sum(us))
+                    self._mtouch[(o, m, d)] = mt
+                # Every extra lot a run touches is one physical creel swap →
+                # priced in the flush tier. max(0, Σtouch − served) via a
+                # minimised IntVar (the objective pushes it onto the bound).
+                if any(self._meta[(o, k)][3] for k in mkeys):
+                    sw = model.NewIntVar(0, self.n_lots, f"{prefix}sw_{o}_{m}")
+                    model.Add(sw >= sum(self._mtouch[(o, m, d)]
+                                        for d in range(self.n_lots)) - served)
+                    self._mix_vars.append(sw)
+
+            # GĐ3 garment tying: n[o][d] whole garments on lot d; every piece-kind
+            # must carry exactly mult_kind × n[o][d] pieces there — so front/back/
+            # sleeve POs split identically and linking pairs single-lot garments.
+            if plan is not None and all_piece and not whole_order:
+                Q, mult = plan
+                nz = [model.NewIntVar(0, Q, f"{prefix}n_{o}_{d}")
+                      for d in range(self.n_lots)]
+                self._garment_q[o] = Q
+                for d in range(self.n_lots):
+                    self._garment[(o, d)] = nz[d]
+                model.Add(sum(nz) == Q * served)
+                for g in sorted(kinds):
+                    mg = mult.get(g)
+                    if mg is None:
+                        continue
+                    ents_g = [k for k in self._entities[o] if k[1] == g]
+                    for d in range(self.n_lots):
+                        model.Add(sum(self._piece[(o, k, d)] for k in ents_g)
+                                  == mg * nz[d])
+
+            if whole_order:
+                for d in range(self.n_lots):
+                    self._order_use[(o, d)] = ob[d]
+                continue          # single lot by construction → no mix var needed
             for d in range(self.n_lots):
                 uo = model.NewBoolVar(f"{prefix}ou_{o}_{d}")
                 touches = [self._use[(o, key, d)] for key in self._entities[o]]
@@ -688,7 +843,6 @@ class _AllocVars:
             # Same-lot preference across the whole ITEM: each extra lot the order
             # touches (beyond its first) costs one flush-tier unit, so mixing is
             # allowed but never free.
-            served = (1 - self.una[o]) if with_una else 1
             mo_ = model.NewIntVar(0, self.n_lots, f"{prefix}mix_{o}")
             model.Add(mo_ >= sum(self._order_use[(o, d)]
                                  for d in range(self.n_lots)) - served)
@@ -701,28 +855,31 @@ class _AllocVars:
         return self._order_use[(o, d)]
 
     def net_g(self, o, m, d):
-        """Grams of order o's run on machine m charged to lot d."""
+        """Grams of order o's run on machine m charged to lot d (Σ over the run's
+        piece-kind chunks)."""
         if not self.mixing:
             return _g(self._machine_order[m][o][0]) * self.x[o][d]
-        qty, kgpp, kg_f, is_piece = self._meta[(o, m)]
-        if is_piece:
-            return kgpp * self._piece[(o, m, d)]
-        return _g(kg_f) * self._bool[(o, m, d)]
+        total = 0
+        for key in self._ents_by_m.get((o, m), []):
+            qty, kgpp, kg_f, is_piece = self._meta[(o, key)]
+            if is_piece:
+                total += kgpp * self._piece[(o, key, d)]
+            else:
+                total += _g(kg_f) * self._bool[(o, key, d)]
+        return total
 
     def pooled_net_g(self, o, d):
         """Grams of a machine-less (or legacy-pooled) order charged to lot d."""
         if not self.mixing:
             return self.demand_g[o] * self.x[o][d]
-        qty, kgpp, kg_f, is_piece = self._meta[(o, None)]
-        if is_piece:
-            return kgpp * self._piece[(o, None, d)]
-        return _g(kg_f) * self._bool[(o, None, d)]
+        return self.net_g(o, None, d)
 
     def run_touch(self, o, m, d):
-        """0/1: does order o's run on machine m mount lot d (creel-floor gate)."""
+        """0/1: does order o's run on machine m mount lot d (creel-floor gate).
+        Machine-level: the run's piece-kind chunks share the mounted cones."""
         if not self.mixing:
             return self.x[o][d]
-        return self._use[(o, m, d)]
+        return self._mtouch[(o, m, d)]
 
     def pin(self, o, d):
         """Force order o entirely onto lot d (in-production pin)."""
@@ -742,21 +899,34 @@ class _AllocVars:
                     self.model.Add(v == 0)
 
     def add_hint(self, model, o, d):
-        """Warm-start hint: order o fully on lot d (from the one-hot probe)."""
+        """Warm-start hint: order o fully on lot d (from the one-hot probe).
+        Deduped by variable — a whole-order fallback shares ONE bool across its
+        chunks, and CP-SAT rejects a variable hinted twice."""
         if not self.mixing:
             return
+        hinted = set()
+
+        def _hint(v, val):
+            if v.Index() not in hinted:
+                hinted.add(v.Index())
+                model.AddHint(v, val)
+
         if self.with_una and o in self.una:
-            model.AddHint(self.una[o], 0)
+            _hint(self.una[o], 0)
         for key in self._entities.get(o, []):
             qty, kgpp, kg_f, is_piece = self._meta[(o, key)]
             for d2 in range(self.n_lots):
                 v = self._piece.get((o, key, d2))
                 if v is not None:
-                    model.AddHint(v, qty if d2 == d else 0)
+                    _hint(v, qty if d2 == d else 0)
                 else:
-                    model.AddHint(self._bool[(o, key, d2)], 1 if d2 == d else 0)
+                    _hint(self._bool[(o, key, d2)], 1 if d2 == d else 0)
                 if (o, key, d2) in self._use and self._piece.get((o, key, d2)) is not None:
-                    model.AddHint(self._use[(o, key, d2)], 1 if d2 == d else 0)
+                    _hint(self._use[(o, key, d2)], 1 if d2 == d else 0)
+        q = self._garment_q.get(o)
+        if q is not None:
+            for d2 in range(self.n_lots):
+                _hint(self._garment[(o, d2)], q if d2 == d else 0)
 
     def mix_terms(self):
         """Flush-tier extras: creel swaps inside a run + extra lots per item."""
@@ -772,6 +942,7 @@ class _AllocVars:
                 if solver.Value(self.x[o][d]):
                     return [(d, 0, order_net_kg)]
             return []
+        garment_q = self._garment_q.get(o)
         rows = []
         for d in range(self.n_lots):
             pieces = 0
@@ -784,6 +955,10 @@ class _AllocVars:
                     kg += v * (kg_f / qty)
                 elif solver.Value(self._bool[(o, key, d)]):
                     kg += kg_f
+            if garment_q is not None:
+                # Garment-tied order: report WHOLE GARMENTS on the lot (what FE /
+                # QC / linking count), not the raw piece sum across kinds.
+                pieces = solver.Value(self._garment[(o, d)])
             if pieces > 0 or kg > 1e-9:
                 rows.append((d, pieces, kg))
         rows.sort(key=lambda r: (-r[2], r[0]))
@@ -935,6 +1110,8 @@ def _solve_vi(
     machine_span: Optional[Dict[Any, Tuple[int, int]]] = None,
     forced_assigned: Optional[set] = None,
     order_qty: Optional[Dict[str, int]] = None,
+    order_groups: Optional[Dict[str, Dict[str, List[float]]]] = None,
+    garment_qty: Optional[Dict[str, int]] = None,
     probe: bool = False,
 ) -> Dict[str, Any]:
     """One independent CP-SAT model for a single VI.
@@ -1043,7 +1220,8 @@ def _solve_vi(
         pr = _solve_vi(vi, order_kg, lots, machine_units, machine_order, probe_cfg,
                        pinned_lot_vi=pinned_lot_vi, mounted_vi=mounted_vi,
                        committed_vi=committed_vi, machine_span=machine_span,
-                       order_qty=order_qty, probe=True)
+                       order_qty=order_qty, order_groups=order_groups,
+                       garment_qty=garment_qty, probe=True)
         if not pr["unassigned"]:
             return pr
         hint_lot = {str(a["order"]): str(a["dyelot"]) for a in pr["assignments"]}
@@ -1053,7 +1231,8 @@ def _solve_vi(
     model = cp_model.CpModel()
 
     alloc = _AllocVars(model, f"{vi}_", orders, n_lots, demand_g, machine_order,
-                       order_qty, mixing, per_machine, with_una=True)
+                       order_qty, mixing, per_machine, with_una=True,
+                       order_groups=order_groups, garment_qty=garment_qty)
     una = alloc.una
     assigned = {o: model.NewBoolVar(f"asg_{vi}_{o}") for o in orders}
     for o in orders:
@@ -1263,7 +1442,8 @@ def _solve_vi(
         if not probe:
             _price_shortage_remedies(orders, n_lots, demand_g, cap_g, pk_g, machine_order,
                                      config, cap_kw, pinned_lot_vi, lot_names, out,
-                                     order_qty=order_qty)
+                                     order_qty=order_qty, order_groups=order_groups,
+                                     garment_qty=garment_qty)
         return out
 
     # STRICT small-first: the objective above maximises the COUNT of served orders, so
@@ -1280,7 +1460,9 @@ def _solve_vi(
         must = _lex_small_first_forced(orders, n_lots, demand_g, cap_g, pk_g,
                                        machine_order, config, cap_kw,
                                        pinned_lot_vi, lot_names,
-                                       order_qty=order_qty)
+                                       order_qty=order_qty,
+                                       order_groups=order_groups,
+                                       garment_qty=garment_qty)
         served = {o for o in orders if not solver.Value(una[o])}
         if must != served:
             dropped_small = sorted(must - served, key=lambda o: (demand_g[o], o))
@@ -1293,7 +1475,8 @@ def _solve_vi(
             return _solve_vi(vi, order_kg, lots, machine_units, machine_order, config,
                              pinned_lot_vi=pinned_lot_vi, mounted_vi=mounted_vi,
                              committed_vi=committed_vi, machine_span=machine_span,
-                             forced_assigned=must, order_qty=order_qty)
+                             forced_assigned=must, order_qty=order_qty,
+                             order_groups=order_groups, garment_qty=garment_qty)
 
     any_unassigned = False
     for o in orders:
@@ -1336,13 +1519,14 @@ def _solve_vi(
     if any_unassigned and not probe:
         _price_shortage_remedies(orders, n_lots, demand_g, cap_g, pk_g, machine_order,
                                  config, cap_kw, pinned_lot_vi, lot_names, out,
-                                 order_qty=order_qty)
+                                 order_qty=order_qty, order_groups=order_groups,
+                                 garment_qty=garment_qty)
     return out
 
 
 def _lex_small_first_forced(orders, n_lots, demand_g, cap_g, pk_g, machine_order,
                             config, cap_kw, pinned_lot_vi, lot_names,
-                            order_qty=None):
+                            order_qty=None, order_groups=None, garment_qty=None):
     """The set of orders to serve under STRICT small-first priority: "a small order is
     always completed if it can be, whatever it costs the bigger ones".
 
@@ -1367,7 +1551,8 @@ def _lex_small_first_forced(orders, n_lots, demand_g, cap_g, pk_g, machine_order
         candidate = must + [o]
         m = cp_model.CpModel()
         alloc = _AllocVars(m, "l_", orders, n_lots, demand_g, machine_order,
-                           order_qty, mixing, per_machine, with_una=True)
+                           order_qty, mixing, per_machine, with_una=True,
+                           order_groups=order_groups, garment_qty=garment_qty)
         _pin_orders(alloc, orders, pinned_lot_vi, lot_names)
         _add_roll_capacity(m, alloc, orders, n_lots, demand_g, cap_g, pk_g,
                            machine_order, per_machine=per_machine, **kw)
@@ -1398,7 +1583,8 @@ def _pin_orders(alloc, orders, pinned_lot_vi, lot_names) -> None:
 def _topup_one_lot_g(d_fill, orders, n_lots, demand_g, cap_g, pk_g,
                      machine_order, config, cap_kw=None,
                      pinned_lot_vi=None, lot_names=None,
-                     order_qty=None) -> Optional[int]:
+                     order_qty=None, order_groups=None,
+                     garment_qty=None) -> Optional[int]:
     """Minimal extra capacity (grams) added to dyelot `d_fill` ALONE (all other
     lots fixed at their current stock) so that an assignment of ALL orders becomes
     feasible — one-dyelot-per-order in legacy mode, piece-split in mixing mode
@@ -1414,7 +1600,8 @@ def _topup_one_lot_g(d_fill, orders, n_lots, demand_g, cap_g, pk_g,
     m = cp_model.CpModel()
     # with_una=False: every order must be fully served (Σ_d = 1, or Σ_d p = qty).
     alloc = _AllocVars(m, "t_", orders, n_lots, demand_g, machine_order,
-                       order_qty, mixing, per_machine, with_una=False)
+                       order_qty, mixing, per_machine, with_una=False,
+                       order_groups=order_groups, garment_qty=garment_qty)
     ub = _cap_slack_g(demand_g, pk_g, machine_order, per_machine)
     fill = m.NewIntVar(0, ub, "fill")
     extra = [fill if d == d_fill else 0 for d in range(n_lots)]  # only d_fill grows
@@ -1432,7 +1619,7 @@ def _topup_one_lot_g(d_fill, orders, n_lots, demand_g, cap_g, pk_g,
 def _new_lot_g(orders, n_lots, demand_g, cap_g, pk_g,
                machine_order, config, cap_kw=None,
                pinned_lot_vi=None, lot_names=None,
-               order_qty=None) -> int:
+               order_qty=None, order_groups=None, garment_qty=None) -> int:
     """Minimal size (grams) of ONE fresh dyelot which, added alongside the
     existing lots, makes a one-dyelot-per-order assignment of ALL orders feasible.
     Same expandable-bin model but the free capacity lives ONLY on a new
@@ -1454,7 +1641,8 @@ def _new_lot_g(orders, n_lots, demand_g, cap_g, pk_g,
     mixing = bool(config.get("dyelot_allow_mixing", False))
     m = cp_model.CpModel()
     alloc = _AllocVars(m, "n_", orders, nl, demand_g, machine_order,
-                       order_qty, mixing, per_machine, with_una=False)
+                       order_qty, mixing, per_machine, with_una=False,
+                       order_groups=order_groups, garment_qty=garment_qty)
     ub = _cap_slack_g(demand_g, pk2, machine_order, per_machine)  # safe bound (gross ≥ Σnet)
     new = m.NewIntVar(0, ub, "new_lot")
     extra = [0] * n_lots + [new]          # only the fresh lot is expandable
@@ -1476,7 +1664,8 @@ def _new_lot_g(orders, n_lots, demand_g, cap_g, pk_g,
 
 def _price_shortage_remedies(orders, n_lots, demand_g, cap_g, pk_g, machine_order,
                              config, cap_kw, pinned_lot_vi, lot_names, out,
-                             order_qty=None) -> None:
+                             order_qty=None, order_groups=None,
+                             garment_qty=None) -> None:
     """Attach the honest procurement remedies onto `out`, under the SAME reuse-aware
     capacity + in-production pins as the main solve (a looser model silently answers
     "add 0 kg"). Shared by BOTH shortage paths so each surfaces a real number:
@@ -1495,7 +1684,8 @@ def _price_shortage_remedies(orders, n_lots, demand_g, cap_g, pk_g, machine_orde
     topups_g = [_topup_one_lot_g(d, orders, n_lots, demand_g, cap_g, pk_g,
                                  machine_order, config, cap_kw=cap_kw,
                                  pinned_lot_vi=pinned_lot_vi, lot_names=lot_names,
-                                 order_qty=order_qty)
+                                 order_qty=order_qty, order_groups=order_groups,
+                                 garment_qty=garment_qty)
                 for d in range(n_lots)]
     out["topups_g"] = topups_g
     feasible = [g for g in topups_g if g is not None]
@@ -1504,6 +1694,6 @@ def _price_shortage_remedies(orders, n_lots, demand_g, cap_g, pk_g, machine_orde
     new_lot_g = _new_lot_g(
         orders, n_lots, demand_g, cap_g, pk_g, machine_order, config,
         cap_kw=cap_kw, pinned_lot_vi=pinned_lot_vi, lot_names=lot_names,
-        order_qty=order_qty)
+        order_qty=order_qty, order_groups=order_groups, garment_qty=garment_qty)
     out["new_lot_possible"] = new_lot_g is not None
     out["new_lot_g"] = new_lot_g or 0
