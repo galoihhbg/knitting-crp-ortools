@@ -346,7 +346,8 @@ class SolverConfig(BaseModel):
     # count across several lots (6 áo lot A + 4 áo lot B); same-lot stays
     # PREFERRED (each extra lot an item touches is priced in the flush tier).
     # order_dyelot_assignment then carries one row per (order, vi, dyelot) with
-    # `kg` + `pieces`.  False (default) → the legacy one-hot model, byte-identical:
+    # `kg` + `pieces` + `runs` (the share per (machine, piece-kind) run, with its
+    # task ids — GĐ4 per-machine hand-off).  False (default) → the legacy one-hot model, byte-identical:
     # one dyelot per (order, vi), FRAGMENTED shortages, single-lot remedies.
     # MUST be declared here: SolverConfig drops unknown keys (extra="ignore"),
     # so an undeclared flag sent by Go would silently never reach the allocator.

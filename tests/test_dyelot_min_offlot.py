@@ -48,7 +48,9 @@ def _off_lot_pieces(res, order):
 
 # ---------------------------------------------------------------------------
 # 1. 20 áo, and neither lot can take them all: the overflow must be the SMALLEST
-#    the lots allow (1 áo), not a comfortable half-and-half.
+#    the lots allow, not a comfortable half-and-half. Cones mount in sets of the
+#    creel width (2 feeders here), so 19 cones of a lot are 18 usable cones and
+#    the smallest possible overflow is 2 áo, not 1.
 # ---------------------------------------------------------------------------
 
 def test_overflow_is_as_small_as_the_lots_allow():
@@ -61,8 +63,8 @@ def test_overflow_is_as_small_as_the_lots_allow():
     assert len(rows) == 2, f"expected a 2-lot split, got {rows}"
     assert sum(r["pieces"] for r in rows) == 20
     # The lots are interchangeable, so either may be primary — what is pinned is
-    # that only ONE garment is left behind.
-    assert _off_lot_pieces(res, "O1") == 1, rows
+    # that only one SET's worth of garments is left behind (2 feeders → 2 áo).
+    assert _off_lot_pieces(res, "O1") == 2, rows
 
 
 # ---------------------------------------------------------------------------

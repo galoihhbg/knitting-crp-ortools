@@ -80,7 +80,11 @@ def allocate_dyelots(
     """Allocate one dyelot per (order, VI), flush-optimized, per VI independently.
 
     Returns a dict to merge into the solver result:
-      order_dyelot_assignment: [{order, vi, dyelot}]
+      order_dyelot_assignment: [{order, vi, dyelot}]  — piece-split mode adds
+                               kg, pieces and `runs`: [{machine, kind, kg,
+                               pieces, tasks}], the same lot share per
+                               (machine, piece-kind) run so Go budgets its
+                               commit walk per machine (GĐ4)
       dyelot_flush_points:     [{machine, vi, after_task, before_task,
                                  order_after, order_before}]
       dyelot_unassigned:       [{order, vi, reason}]
@@ -186,6 +190,13 @@ def allocate_dyelots(
     # (task.garment_qty); otherwise the gcd of the kind totals resolves it.
     vi_order_groups: Dict[str, Dict[str, Dict[str, List[float]]]] = {}
     vi_order_garment: Dict[str, Dict[str, int]] = {}
+    # GĐ4 per-machine hand-off: vi → machine → order → piece-kind → [task_id].
+    # The model already decides lots per (order, machine, kind) chunk; this is
+    # the address book that lets the result name the tasks each chunk covers,
+    # so Go can budget the walk per MACHINE instead of re-spreading the
+    # order-level total chronologically across machines (which put the lot
+    # boundary inside a run the solver had kept whole).
+    vi_run_tasks: Dict[str, Dict[Any, Dict[str, Dict[str, List[str]]]]] = {}
     # vi → machine → [span_start, span_end]: the window the machine holds this VI's
     # creel (first run start → last run end).  Go releases the leftover to the free
     # pool at the end of that window, so machines with DISJOINT windows can reuse the
@@ -221,6 +232,8 @@ def allocate_dyelots(
             rg = run[3].setdefault(group, [0.0, 0])
             rg[0] += kg
             rg[1] += tqty
+            vi_run_tasks.setdefault(vi, {}).setdefault(machine, {}) \
+                .setdefault(order, {}).setdefault(group, []).append(tid)
             og = vi_order_groups.setdefault(vi, {}).setdefault(order, {}).setdefault(group, [0.0, 0])
             og[0] += kg
             og[1] += tqty
@@ -419,7 +432,8 @@ def allocate_dyelots(
                         machine_span=span_vi,
                         order_qty=vi_order_qty.get(vi, {}),
                         order_groups=vi_order_groups.get(vi, {}),
-                        garment_qty=vi_order_garment.get(vi, {}))
+                        garment_qty=vi_order_garment.get(vi, {}),
+                        run_tasks=vi_run_tasks.get(vi, {}))
         assignments.extend(res["assignments"])
         flush_points.extend(res["flush_points"])
         unassigned.extend(res["unassigned"])
@@ -576,7 +590,12 @@ def _vi_gross_demand_g(orders, demand_g, pk_g, machine_order, per_machine=True) 
         with_machine.update(oz)
         net_m = sum(_g(mo[o][0]) for o in oz)
         max_slots = max((int(mo[o][1]) for o in oz), default=0)
-        g += max((net_m + pk - 1) // pk, max_slots) * pk
+        if max_slots > 1:
+            # Cones mount in sets of the creel width (see _add_roll_capacity).
+            per_set = max_slots * pk
+            g += ((net_m + per_set - 1) // per_set) * per_set
+        else:
+            g += max((net_m + pk - 1) // pk, max_slots) * pk
     missing = [o for o in orders if o not in with_machine]
     if missing:
         net_miss = sum(demand_g[o] for o in missing)
@@ -678,7 +697,8 @@ class _AllocVars:
         self._piece = {}                  # (o, key, d) -> IntVar pieces
         self._bool = {}                   # (o, key, d) -> BoolVar fallback run
         self._use = {}                    # (o, key, d) -> BoolVar touch
-        self._meta = {}                   # (o, key) -> (qty, kgpp_g, kg_float, is_piece)
+        self._meta = {}                   # (o, key) -> (qty, kg_float, is_piece)
+        self._gram = {}                   # (o, key, d) -> IntVar grams charged to lot d
         self._entities = {}               # o -> [key, ...]
         self._order_use = {}              # (o, d) -> BoolVar
         self._mix_vars = []               # IntVars = max(0, extra lots) per order/run
@@ -760,8 +780,7 @@ class _AllocVars:
                 self._ents_by_m.setdefault((o, m), []).append(key)
                 ent_g = _g(kg_f)
                 is_piece = (not whole_order) and qty >= 1 and ent_g > 0
-                kgpp = -(-ent_g // qty) if is_piece else 0    # ceil grams / garment
-                self._meta[(o, key)] = (qty, kgpp, kg_f, is_piece)
+                self._meta[(o, key)] = (qty, kg_f, is_piece)
                 if whole_order:
                     for d in range(self.n_lots):
                         self._bool[(o, key, d)] = ob[d]
@@ -777,6 +796,24 @@ class _AllocVars:
                         model.Add(pz[d] <= qty * u)
                         model.Add(pz[d] >= u)
                         self._use[(o, key, d)] = u
+                    # Grams charged to each lot, rounded up ONCE PER LOT rather
+                    # than once per garment. Charging p · ceil(ent_g / qty) made
+                    # every garment carry a whole extra gram — 141 g where the
+                    # floor consumes 140.01 — so 27 kg of a lot "bought" 191
+                    # garments instead of 192 and the plan handed the last garment
+                    # of a run to the next lot for yarn that was standing on the
+                    # machine (SK16 task _9, CP_1788854762359001264). 0.99 g per
+                    # garment is 0.7% of the demand: on a big item it is kilograms
+                    # of yarn the model believes it needs and does not.
+                    #
+                    # The two bounds pin gv to exactly ceil(ent_g · p / qty), so it
+                    # is a rewrite of the same quantity at a finer resolution, not
+                    # a new degree of freedom the search could exploit.
+                    for d in range(self.n_lots):
+                        gv = model.NewIntVar(0, ent_g, f"{prefix}g_{o}_{m}_{g}_{d}")
+                        model.Add(qty * gv >= ent_g * pz[d])
+                        model.Add(qty * gv <= ent_g * pz[d] + qty - 1)
+                        self._gram[(o, key, d)] = gv
                 else:
                     yz = [model.NewBoolVar(f"{prefix}y_{o}_{m}_{g}_{d}")
                           for d in range(self.n_lots)]
@@ -803,7 +840,7 @@ class _AllocVars:
                 # Every extra lot a run touches is one physical creel swap →
                 # priced in the flush tier. max(0, Σtouch − served) via a
                 # minimised IntVar (the objective pushes it onto the bound).
-                if any(self._meta[(o, k)][3] for k in mkeys):
+                if any(self._meta[(o, k)][2] for k in mkeys):
                     sw = model.NewIntVar(0, self.n_lots, f"{prefix}sw_{o}_{m}")
                     model.Add(sw >= sum(self._mtouch[(o, m, d)]
                                         for d in range(self.n_lots)) - served)
@@ -861,9 +898,9 @@ class _AllocVars:
             return _g(self._machine_order[m][o][0]) * self.x[o][d]
         total = 0
         for key in self._ents_by_m.get((o, m), []):
-            qty, kgpp, kg_f, is_piece = self._meta[(o, key)]
+            qty, kg_f, is_piece = self._meta[(o, key)]
             if is_piece:
-                total += kgpp * self._piece[(o, key, d)]
+                total += self._gram[(o, key, d)]
             else:
                 total += _g(kg_f) * self._bool[(o, key, d)]
         return total
@@ -914,7 +951,7 @@ class _AllocVars:
         if self.with_una and o in self.una:
             _hint(self.una[o], 0)
         for key in self._entities.get(o, []):
-            qty, kgpp, kg_f, is_piece = self._meta[(o, key)]
+            qty, kg_f, is_piece = self._meta[(o, key)]
             for d2 in range(self.n_lots):
                 v = self._piece.get((o, key, d2))
                 if v is not None:
@@ -964,7 +1001,7 @@ class _AllocVars:
             pieces = 0
             kg = 0.0
             for key in self._entities[o]:
-                qty, kgpp, kg_f, is_piece = self._meta[(o, key)]
+                qty, kg_f, is_piece = self._meta[(o, key)]
                 if is_piece:
                     v = solver.Value(self._piece[(o, key, d)])
                     pieces += v
@@ -980,6 +1017,44 @@ class _AllocVars:
         rows.sort(key=lambda r: (-r[2], r[0]))
         return rows
 
+    def result_runs(self, o, d, solver):
+        """Solved allocation of order o on lot d, per (machine, piece-kind) chunk →
+        [(machine, kind, pieces, kg)] for the chunks that touch the lot. Only
+        machine-bound chunks are reported (a pooled / machine-less chunk has no
+        run to hand to Go); empty in one-hot mode."""
+        if not self.mixing:
+            return []
+        runs = []
+        for key in self._entities.get(o, []):
+            m, g = key
+            if m is None:
+                continue
+            qty, kg_f, is_piece = self._meta[(o, key)]
+            if is_piece:
+                v = solver.Value(self._piece[(o, key, d)])
+                if v <= 0:
+                    continue
+                runs.append((m, g, int(v), v * (kg_f / qty)))
+            elif solver.Value(self._bool[(o, key, d)]):
+                runs.append((m, g, 0, kg_f))
+        runs.sort(key=lambda r: (str(r[0]), str(r[1])))
+        return runs
+
+
+
+def _kg_up(kg: float) -> float:
+    """A lot's kilograms, rounded UP to the gram.
+
+    Go budgets its walk from this figure while the tasks it must cover demand
+    pieces x kg/garment, so the report may exceed the demand by a gram but must
+    never fall below it. Rounding to NEAREST published 4.2 kg for 30 garments
+    whose tasks demand 4.2003; the walker spent the budget, read the last 0.3 g
+    as a shortage, and its reconciliation had the floor carry three near-empty
+    cones of the OTHER lot across the shop to weave it (SK16 task _9,
+    CP_1788851414200481354). The epsilon keeps float noise (4.2000000000001)
+    from buying a whole extra gram.
+    """
+    return math.ceil(kg * 1000 - 1e-6) / 1000
 
 def _add_roll_capacity(model, alloc, orders, n_lots, demand_g, cap_g, pk_g,
                        machine_order, extra=None, per_machine=True,
@@ -1074,6 +1149,20 @@ def _add_roll_capacity(model, alloc, orders, n_lots, demand_g, cap_g, pk_g,
                     # Creel floor, gated per (order, machine, lot): a piece-split
                     # run that touches this lot mounts its full cone width for it.
                     model.Add(r * pk_g[d] >= s * pk_g[d] * alloc.run_touch(o, m, d))
+            # Cones go up in SETS of the creel width. A machine with `slots` feeders
+            # pulls `slots` ends at once and its cones run out together, so a lot is
+            # only knittable on it while a whole set of that lot can be mounted: the
+            # cones it pulls from lot d over its run are a multiple of `slots`, not
+            # ceil(net/pk). Without this, 25 cones on a 3-feeder machine "fit" 177
+            # garments and Go was told to knit the last 7 off one lone cone (SK16,
+            # CP_1788841868832388003). Skipped when an in-production creel is
+            # already mounted (mnt > 0: the new order threads onto cones that are
+            # there) or when net pools at lot level; legacy payloads with no
+            # slots keep plain whole-roll rounding.
+            width = max((int(mo[o][1]) for o in oz), default=0)
+            if width > 1 and mnt == 0 and not pool_net:
+                sets = model.NewIntVar(0, ub // width + 1, f"sets_{d}_{m}")
+                model.Add(r == sets * width)
             lot_rolls.append(r)
         if missing:
             r = model.NewIntVar(0, ub, f"rm_{d}")
@@ -1129,6 +1218,7 @@ def _solve_vi(
     order_groups: Optional[Dict[str, Dict[str, List[float]]]] = None,
     garment_qty: Optional[Dict[str, int]] = None,
     probe: bool = False,
+    run_tasks: Optional[Dict[Any, Dict[str, Dict[str, List[str]]]]] = None,
 ) -> Dict[str, Any]:
     """One independent CP-SAT model for a single VI.
 
@@ -1529,7 +1619,8 @@ def _solve_vi(
                              pinned_lot_vi=pinned_lot_vi, mounted_vi=mounted_vi,
                              committed_vi=committed_vi, machine_span=machine_span,
                              forced_assigned=must, order_qty=order_qty,
-                             order_groups=order_groups, garment_qty=garment_qty)
+                             order_groups=order_groups, garment_qty=garment_qty,
+                             run_tasks=run_tasks)
 
     any_unassigned = False
     for o in orders:
@@ -1550,10 +1641,22 @@ def _solve_vi(
             # pieces = whole garments knit from this lot (0 = unknown qty — the
             # run fell back to one-hot and kg is the only granularity).
             for d, pieces, kg in rows:
-                out["assignments"].append(
-                    {"order": o, "vi": vi, "dyelot": lots[d].get("dyelot"),
-                     "kg": round(kg, 3), "pieces": int(pieces)}
-                )
+                row = {"order": o, "vi": vi, "dyelot": lots[d].get("dyelot"),
+                       "kg": _kg_up(kg), "pieces": int(pieces)}
+                # Per-machine hand-off (GĐ4): the same lot share broken down by
+                # the (machine, piece-kind) run that carries it, with the task
+                # ids of that run. Go budgets its walk per run from this, so a
+                # machine the model kept whole on one lot stays whole on commit.
+                # `pieces` here are raw pieces of the run (not garments).
+                runs = []
+                for m, g, rp, rkg in alloc.result_runs(o, d, solver):
+                    tids = ((run_tasks or {}).get(m, {}).get(o, {}) or {}).get(g, [])
+                    runs.append({"machine": str(m), "kind": g,
+                                 "kg": _kg_up(rkg), "pieces": rp,
+                                 "tasks": sorted(tids)})
+                if runs:
+                    row["runs"] = runs
+                out["assignments"].append(row)
     for cut, machine, ta, tb, oa, ob in flush_terms:
         if solver.Value(cut):
             out["flush_points"].append({
