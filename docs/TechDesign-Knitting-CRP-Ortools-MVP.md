@@ -353,6 +353,77 @@ if ghost_count > MAX_GHOST_TASKS_BEFORE_WARN:
 
 ---
 
+### P4.1 — Dynamic Material Constraints via Cumulative Sweep
+
+**Feature:** BOM-level fractional yarn-roll consumption (Creel capacity limits).
+
+**Problem:** Multiple knitting tasks share a finite pool of physical yarn rolls (creel slots). Without explicit constraints the solver may assign more concurrent tasks than the creel can support, leading to production stoppages.
+
+**Decision: Sweep Algorithm via `model.AddCumulative()` — one constraint per material.**
+
+The Go backend aggregates creel availability per material and per task before sending the payload. Python applies `AddCumulative` (Profile Sweep, O(n log n)) for each declared material. No O(N²) BoolVar transition matrix is created between task pairs.
+
+#### New Schema Fields
+
+```python
+# SolverPayload (top-level)
+material_capacities: Dict[str, int] = {}   # material_code → total creel slots
+
+# SolverTask
+material_demands: Dict[str, int] = {}      # material_code → rolls consumed while running
+```
+
+#### Builder Implementation (`builder.py` — `build_material_constraints`)
+
+```python
+# Step 1: Initialize per-material lists
+mat_intervals: Dict[str, List] = {mat: [] for mat in self.material_capacities}
+mat_demands:   Dict[str, List[int]] = {mat: [] for mat in self.material_capacities}
+
+# Step 2: Flatten task demands
+for t in self.tasks:
+    for mat_code, demand in (t.get("material_demands") or {}).items():
+        interval = self.model.NewIntervalVar(
+            tv["start"], duration, tv["end"], f"mat_{mat_code}_{t_id}"
+        )  # Strictly bound to task's own [start, end] — released on task finish
+        mat_intervals[mat_code].append(interval)
+        mat_demands[mat_code].append(int(demand))
+
+# Step 3: Apply per-material AddCumulative
+for mat_code, capacity in self.material_capacities.items():
+    self.model.AddCumulative(mat_intervals[mat_code], mat_demands[mat_code], int(capacity))
+```
+
+#### Strict Guardrails
+
+| Rule | Enforcement |
+|------|-------------|
+| No O(N²) BoolVars | Only `AddCumulative` — no `is_next` / `seq_A_B` variables |
+| Integer demands | `int(demand)` enforced at assignment |
+| Release on end | Interval anchored to `tv["end"]` — solver releases automatically |
+| Backward compat | Empty `material_capacities` → method returns immediately (no-op) |
+
+#### Builder Chain Position
+
+```
+build_resource_allocations()
+  └─ build_workforce_constraints()   ← existing global machine cap
+build_material_constraints()         ← NEW: per-material creel cap
+apply_routing_constraints()
+apply_dependency_constraints()
+...
+```
+
+**Trade-offs:**
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| `AddCumulative` per material (chosen) | Linear sweep, no explosion, auto-release | One propagator per material |
+| O(N²) BoolVar pairs | Explicit | Exponential model size, forbidden by spec |
+| Go-side preprocessing | Python model stays simple | Requires Go to compute max concurrent — less accurate |
+
+---
+
 ### P1.5 — Pipeline Offsets vs. Strict Dependencies (Q3)
 
 **Current state:** Both `final_depends_on` (strict: `L.start >= K.end`) and `wait_offsets` (pipeline: `L.start >= K.start + offset`) are implemented. No makespan comparison exists.

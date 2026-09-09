@@ -9,6 +9,8 @@ services:
       - "${PORT:-8083}:${PORT:-8083}"
     env_file:
       - .env
+    volumes:
+      - ./logs:/app/logs
     environment:
       - REDIS_URL=redis://redis:6379/0
     networks:
@@ -23,10 +25,14 @@ services:
     command: celery -A app.core.celery_app worker --loglevel=info --concurrency=2
     env_file:
       - .env
+    volumes:
+      - ./logs:/app/logs
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - WEBHOOK_URL=http://api:8082/capacity-planning/complete
+      - WEBHOOK_URL=http://api-vn:8082/capacity-planning/complete
       - PORT=8083
+      # Chạy 2 lượt solve cho /solve để trả lịch ổn định (lượt 2) về UI. false = tắt.
+      - ENABLE_DOUBLE_SOLVE=${ENABLE_DOUBLE_SOLVE:-true}
     networks:
       - app-network
 

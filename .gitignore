@@ -1,4 +1,4 @@
-venv/
+.venv/
 .env
 AI_GUIDELINES.md
 .agents
@@ -11,3 +11,6 @@ part2-prd-mvp.md
 part3-tech-design-mvp.md
 part4-notes-for-agent.md
 logs
+specs
+det_study
+agent_docs

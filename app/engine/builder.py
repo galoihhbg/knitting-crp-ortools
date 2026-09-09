@@ -1,8 +1,9 @@
 import re
 import logging
-from typing import Dict, Any, List, Set
+from typing import Dict, Any, List, Optional, Set
 
 from ortools.sat.python import cp_model
+from .shared import apply_order_flow_objective
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class TaskModelBuilder:
         resources: List[Dict[str, Any]],
         tasks: List[Dict[str, Any]],
         machine_states: Dict[str, Dict[str, str]],
+        material_capacities: Optional[Dict[str, int]] = None,
     ) -> None:
         self.model = cp_model.CpModel()
         self.config = config
@@ -53,23 +55,137 @@ class TaskModelBuilder:
         # Accumulated terms for the minimization objective
         self.objective_terms: List[Any] = []
 
-        # Use config horizon, but guarantee it is large enough for all task durations
-        total_duration = sum(int(t.get("duration", 0)) for t in self.tasks)
+        import math as _math
         config_horizon = int(self.config.get("horizon_minutes", 40320))
-        self.horizon: int = max(config_horizon, total_duration + 5000)
+        total_duration = sum(int(t.get("duration", 0)) for t in self.tasks)
 
-        # Dynamic weight calibration — keeps LATENESS : AFFINITY : ACTIVATION ≈ 1000 : 10 : 2
-        # regardless of horizon size. Larger horizons need a bigger absolute coefficient so that
-        # a 1-minute delay doesn't appear negligible relative to the huge time scale.
-        self.lateness_scale: int = max(1, self.horizon // 1000)
+        # Auto-expand so every task fits, but cap at an int64-safe limit.
+        # Worst-case objective term per task: horizon² × MAX_WEIGHT (10⁵).
+        # For n tasks to stay within int64 (9.2 × 10¹⁸):
+        #   horizon < sqrt(INT64_MAX / (n × MAX_WEIGHT × 2))   ← ×2 safety margin
+        _n = max(len(self.tasks), 1)
+        _INT64_MAX = 9_223_372_036_854_775_807
+        _safe_horizon = int(_math.isqrt(_INT64_MAX // (_n * 100_000 * 2)))
+        _safe_horizon = max(_safe_horizon, config_horizon)  # never below what user asked
+
+        self.horizon: int = min(max(config_horizon, total_duration + 5000), _safe_horizon)
+
+        if total_duration > config_horizon:
+            logger.warning(
+                f"⚠️ Tổng duration tasks ({total_duration}min) vượt horizon config ({config_horizon}min) "
+                f"— horizon tự mở rộng lên {self.horizon}min. "
+                "Tăng horizon_minutes nếu muốn kiểm soát rõ hơn."
+            )
+        if self.horizon < total_duration + 5000:
+            logger.warning(
+                f"⚠️ Horizon bị giới hạn ở {self.horizon}min (int64-safe cap) dù total_duration={total_duration}min. "
+                "Một số task có thể không lên lịch được — giảm số đơn hoặc giảm priority weight."
+            )
+
+        # Cap lateness_scale to prevent objective overflow on large payloads.
+        # At safe_horizon with n tasks, scale = horizon//1000 keeps sum within int64.
+        self.lateness_scale: int = min(max(1, self.horizon // 1000), 50)
+
+        # Tasks that were skipped because no compatible resource exists.
+        # Populated by build_time_variables() and build_resource_allocations().
+        # Engine.solve() checks this after the builder chain to return a structured
+        # infeasible result instead of silently proceeding with a partial model.
+        self.no_resource_tasks: List[Dict[str, Any]] = []
+
+        # Per-material creel capacities: material_code → max concurrent rolls/slots.
+        # Populated from SolverPayload.material_capacities; empty dict = feature disabled.
+        self.material_capacities: Dict[str, int] = material_capacities or {}
 
         # Build the sub-task → batch-task translation map once during construction
         self.task_translation_map: Dict[str, str] = {}
         self._build_translation_map()
 
+        # Merge overlapping dummy shift tasks to prevent AddNoOverlap infeasible crashes
+        self._sanitize_dummy_tasks()
+
+        # Smart batching state: populated by apply_smart_batching_constraints()
+        # _wash_x[task_id] = list of BoolVars x[i][k] for batch slot assignment
+        # _wash_batch_starts = list of IntVars for batch slot start times
+        self._wash_x: Dict[str, List] = {}
+        self._wash_batch_starts: List = []
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _sanitize_dummy_tasks(self) -> None:
+        """
+        Groups and merges any overlapping dummy tasks (is_pinned=True, qty=0) that are
+        assigned to the same machine.
+        
+        Why: When worker count spikes exceed the available W_LINKING_XX virtual slots,
+        the Go backend maps multiple shift blockers to the same virtual machine.
+        If these blockers overlap in time, OR-Tools will fail immediately on AddNoOverlap.
+        Since dummy tasks just represent 'blocked time' rather than real jobs,
+        overlapping them just means a continuous blocked interval.
+        """
+        # Separate dummies and real tasks
+        dummies = [t for t in self.tasks if t.get("is_pinned") and t.get("qty", 0) == 0]
+        real_tasks = [t for t in self.tasks if not (t.get("is_pinned") and t.get("qty", 0) == 0)]
+        
+        if not dummies:
+            return
+
+        # Group by effective machine ID
+        from collections import defaultdict
+        grouped_dummies = defaultdict(list)
+        for t in dummies:
+            _rids = t.get("compatible_resource_ids") or []
+            m_id = t.get("pinned_machine_id") or (_rids[0] if _rids else None)
+            if not m_id:
+                real_tasks.append(t) # Should be caught by normal no_resource block later
+                continue
+            grouped_dummies[m_id].append(t)
+            
+        merged_dummies = []
+        for m_id, tasks_for_machine in sorted(grouped_dummies.items()):
+            # Filter and sort intervals
+            intervals = []
+            for t in tasks_for_machine:
+                s = t.get("pinned_start_time")
+                e = t.get("pinned_end_time")
+                if s is not None and e is not None:
+                    intervals.append((int(s), int(e), t))
+                else:
+                    real_tasks.append(t) # Malformed dummy, leave it for normal workflow
+            
+            if not intervals:
+                continue
+                
+            intervals.sort(key=lambda x: x[0])
+            
+            # Sweep line merge
+            merged = []
+            current_start, current_end, base_t = intervals[0]
+            
+            for s, e, t in intervals[1:]:
+                if s <= current_end:  # Overlap or contiguous
+                    current_end = max(current_end, e)
+                else:
+                    merged.append((current_start, current_end, base_t))
+                    current_start, current_end, base_t = s, e, t
+            merged.append((current_start, current_end, base_t))
+            
+            # Create consolidated dummy tasks
+            for idx, (s, e, base_t) in enumerate(merged):
+                new_dummy = dict(base_t) # Copy to preserve group_id, operation, etc
+                new_dummy["task_id"] = f"DUMMY_MERGED_{m_id}_{s}_{e}_{idx}"
+                new_dummy["original_order_id"] = new_dummy["task_id"]
+                new_dummy["pinned_start_time"] = s
+                new_dummy["pinned_end_time"] = e
+                new_dummy["duration"] = e - s
+                merged_dummies.append(new_dummy)
+                
+            if len(intervals) > len(merged):
+                logger.info(f"🧹 Merged {len(intervals)} overlapping dummy tasks into {len(merged)} for machine {m_id}")
+                
+        # Rebuild full task list
+        self.tasks = real_tasks + merged_dummies
 
     def _build_translation_map(self) -> None:
         """
@@ -194,9 +310,9 @@ class TaskModelBuilder:
             operation = t.get("operation", "").lower()
             if t.get("operation") != "capacity_block" and not compatible_ids:
                 logger.warning(f"⚠️ Task {t_id} has NO compatible resources — skipping.")
+                self.no_resource_tasks.append(t)
                 continue
 
-            duration = int(t["duration"])
             priority = int(t.get("priority", 5))
             due_at = int(t.get("due_at_min", self.horizon))
             start_after = int(t.get("start_after_min", 0))
@@ -218,16 +334,38 @@ class TaskModelBuilder:
             else:
                 start_var = self.model.NewIntVar(0, self.horizon, f"start_{t_id}")
                 end_var = self.model.NewIntVar(0, self.horizon, f"end_{t_id}")
-                # Chỉ ép duration cho biến tự do
                 if operation != "capacity_block":
+                    # Ép duration rõ ràng: end == start + duration
+                    duration_val = max(0, int(t.get("duration", 0)))
+                    if duration_val == 0:
+                        logger.warning(f"⚠️ Task '{t_id}' có duration=0 — có thể là lỗi data.")
+                    self.model.Add(end_var == start_var + duration_val)
                     if start_after > 0 and not is_pinned:
                         self.model.Add(start_var >= start_after)
 
-            # Weighted lateness
-            weight = 10 ** (6 - priority)
-            lateness = self.model.NewIntVar(0, self.horizon, f"lat_{t_id}")
-            self.model.Add(lateness >= end_var - due_at)
-            self.objective_terms.append(lateness * weight * 1000 * self.lateness_scale)
+            # Weighted lateness (Only for real tasks, avoid horizon violations on pure dummy blockers)
+            is_dummy = is_pinned and (t.get("qty", 0) == 0 or operation == "capacity_block")
+            if not is_dummy:
+                weight = 10 ** (6 - priority)
+                # Tighten lateness variable domain: max meaningful lateness = horizon - due_at
+                # Reduces OR-Tools worst-case objective sum check (prevents MODEL_INVALID on
+                # large payloads where n × horizon × weight would approach int64 limit).
+                max_lateness = max(0, self.horizon - due_at)
+                lateness = self.model.NewIntVar(0, max_lateness, f"lat_{t_id}")
+                self.model.Add(lateness >= end_var - due_at)
+                # Coefficient: weight × 100 (not × 1000 × lateness_scale).
+                # Ratios maintained: priority-1:priority-5 = 10000:1 ✓
+                #                    lateness:affinity      ≥ 2:1 (priority-5 vs 500pts) ✓
+                # Max term: 10^5 × 100 × horizon = 5×10^11 per task → 6.25×10^15 for 12500 tasks
+                # (vs 6.25×10^17 with old ×1000×scale — 100× safer margin from int64 limit)
+                self.objective_terms.append(lateness * weight * 100)
+
+            # Early-start preference: tie-breaker so the solver avoids lazy idle schedules.
+            # Coefficient = max(1, weight // 100) — 10000× less than lateness per minute,
+            # so the solver always prefers being on time over starting earlier.
+            if not is_pinned and operation != "capacity_block":
+                start_coeff = max(1, weight // 100)
+                self.objective_terms.append(start_var * start_coeff)
 
             self.task_vars[t_id] = {
                 "start": start_var,
@@ -247,9 +385,6 @@ class TaskModelBuilder:
         return self
     
     def build_workforce_constraints(self):
-        knitting_intervals = []
-        demands = []
-        
         # Lấy giới hạn tuyệt đối của xưởng từ data truyền sang (Ví dụ: 100 máy)
         # Nếu không có, mặc định là 100
         print(f"\n🔢 MAX_FACTORY_MACHINES from config: {self.config.get('max_factory_machines', 'Not set, defaulting to 100')}")
@@ -266,42 +401,204 @@ class TaskModelBuilder:
                 "AddCumulative propagation may slow. Consider splitting shift windows."
             )
 
+        # Choose workforce constraint strategy.
+        # Boolean exclusion (slot-based NoOverlap) is lighter on RAM when there are many
+        # capacity_block ghost tasks, because it avoids adding them all to one large
+        # AddCumulative propagator.  It trades RAM for slightly more BoolVars.
+        # Triggered automatically when ghost_count > 200, or by explicit config flag.
+        _use_bool = bool(self.config.get("use_boolean_exclusion", False)) or _ghost_count > 200
+
+        if _use_bool:
+            logger.info(
+                f"⚙️  Workforce mode: BOOLEAN EXCLUSION (ghost_count={_ghost_count}, "
+                f"max_machines={MAX_FACTORY_MACHINES})"
+            )
+            self._build_workforce_boolean(MAX_FACTORY_MACHINES)
+        else:
+            self._build_workforce_cumulative(MAX_FACTORY_MACHINES)
+
+    def _build_workforce_cumulative(self, MAX_FACTORY_MACHINES: int) -> None:
+        """
+        AddCumulative approach — uses OptionalIntervalVar for free knitting tasks
+        so that demand is only counted when the task is actually assigned to a machine.
+
+        BUG FIX: Previously used hard NewIntervalVar for knitting tasks. This caused
+        ALL knitting tasks to always contribute demand=1 to the cumulative constraint,
+        even at t=0 when no machine was selected yet, resulting in all tasks appearing
+        to start simultaneously and violating the capacity limit.
+        """
+        knitting_intervals = []
+        demands = []
+
         for t_id, tv in self.task_vars.items():
-            # Tìm thông tin task gốc
             task_info = next((t for t in self.tasks if t["task_id"] == t_id), {})
             operation = task_info.get("operation", "").lower()
-            duration = int(task_info.get("duration", 0))
-            
-            # 1. NẾU LÀ TASK DỆT THỰC TẾ
+
+            # Use actual duration: for pinned tasks, end-start may differ from "duration" field
+            pinned_start = task_info.get("pinned_start_time")
+            pinned_end = task_info.get("pinned_end_time")
+            is_fully_pinned = (
+                task_info.get("is_pinned") and pinned_start is not None and pinned_end is not None
+            )
+            duration = int(pinned_end) - int(pinned_start) if is_fully_pinned else int(task_info.get("duration", 0))
+
+            # 1. TASK DỆT THỰC TẾ — dùng OptionalInterval để demand chỉ tính khi task đã được assign
             if operation == "knitting":
-                # Tạo một IntervalVar ghép từ start_var, duration, và end_var
-                interval = self.model.NewIntervalVar(
-                    tv["start"], 
-                    duration, 
-                    tv["end"],      
-                    f"global_interval_{t_id}"
-                )
+                literals = tv.get("literals", [])
+                if literals:
+                    # any_assigned = True khi task được gán vào bất kỳ máy nào
+                    any_assigned = self.model.NewBoolVar(f"cumul_active_{t_id}")
+                    self.model.AddMaxEquality(any_assigned, literals)
+                    interval = self.model.NewOptionalIntervalVar(
+                        tv["start"], duration, tv["end"], any_assigned,
+                        f"global_interval_{t_id}"
+                    )
+                else:
+                    # Pinned knitting task — luôn active, dùng hard interval
+                    interval = self.model.NewIntervalVar(
+                        tv["start"], duration, tv["end"],
+                        f"global_interval_{t_id}"
+                    )
                 knitting_intervals.append(interval)
-                demands.append(1) # Mỗi mẻ dệt chiếm 1 năng lực (1 máy)
-                
-            # 2. NẾU LÀ GHOST TASK KHÓA NĂNG LỰC
+                demands.append(1)
+
+            # 2. GHOST TASK KHÓA NĂNG LỰC — luôn active (pinned), dùng hard interval
             elif operation == "capacity_block":
-                # Dummy Task đã bị ghim, tv["start"] và tv["end"] đang là hằng số
                 interval = self.model.NewIntervalVar(
-                    tv["start"], 
-                    duration, 
-                    tv["end"], 
+                    tv["start"], duration, tv["end"],
                     f"global_interval_{t_id}"
                 )
                 knitting_intervals.append(interval)
-                
-                # Lấy số lượng máy cần chặn từ trường demand
                 blocked_demand = int(task_info.get("demand", 0))
                 demands.append(blocked_demand)
 
-        # 3. Add Cumulative Ràng buộc tổng năng lực
+        # Lấp đầy khoảng TRỐNG giữa các ca làm (inter-shift gaps).
+        # Trong khoảng trống không có capacity_block nào, solver có thể xếp tất cả
+        # MAX_FACTORY_MACHINES task đồng thời (không có ràng buộc nào chặn).
+        # Fix: với mỗi khoảng trống [gap_start, gap_end), thêm một interval cứng với
+        # demand=MAX_FACTORY_MACHINES để chiếm hết slot → không task knitting nào
+        # được lên lịch trong ca nghỉ.
+        horizon = int(self.config.get("horizon_minutes", 57600))
+        # Thu thập các khoảng thời gian của capacity_block (đã được pinned)
+        block_windows: List[tuple] = []
+        for t in self.tasks:
+            if t.get("operation", "").lower() == "capacity_block":
+                ps = t.get("pinned_start_time")
+                pe = t.get("pinned_end_time")
+                if ps is not None and pe is not None and int(pe) > int(ps):
+                    block_windows.append((int(ps), int(pe)))
+        # Sắp xếp và hợp nhất các block window (merge overlapping)
+        block_windows.sort()
+        merged: List[tuple] = []
+        for s, e in block_windows:
+            if merged and s <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+        # Lấp khoảng TRỐNG giữa các ca làm bằng demand của ca có ràng buộc chặt nhất.
+        # Chỉ áp dụng khi Go đã gửi ít nhất một capacity_block (có cấu trúc ca làm).
+        # Nếu không có block nào → môi trường test/dev, bỏ qua.
+        #
+        # Dùng max_block_demand thay vì MAX_FACTORY_MACHINES để các task có thể
+        # tiếp tục chạy qua ranh giới ca (autonomous machines), nhưng số lượng
+        # đồng thời vẫn bị giới hạn như trong ca (không tăng đột biến trong gap).
+        gap_count = 0
+        if merged:
+            max_block_demand = max(
+                int(t.get("demand", 0))
+                for t in self.tasks
+                if t.get("operation", "").lower() == "capacity_block"
+            )
+            prev_end = 0
+            for s, e in merged:
+                if s > prev_end:
+                    gap_iv = self.model.NewIntervalVar(
+                        self.model.NewConstant(prev_end),
+                        s - prev_end,
+                        self.model.NewConstant(s),
+                        f"gap_block_{prev_end}_{s}"
+                    )
+                    knitting_intervals.append(gap_iv)
+                    demands.append(max_block_demand)
+                    gap_count += 1
+                prev_end = max(prev_end, e)
+            # Sau block cuối cùng đến hết horizon
+            if prev_end < horizon:
+                gap_iv = self.model.NewIntervalVar(
+                    self.model.NewConstant(prev_end),
+                    horizon - prev_end,
+                    self.model.NewConstant(horizon),
+                    f"gap_block_{prev_end}_{horizon}"
+                )
+                knitting_intervals.append(gap_iv)
+                demands.append(max_block_demand)
+                gap_count += 1
+
         if knitting_intervals:
+            _total_block_demand = sum(d for t, d in zip(knitting_intervals, demands) if d > 1)
+            logger.info(
+                f"📊 AddCumulative: {len(knitting_intervals)} intervals total "
+                f"(capacity_block demand sum={_total_block_demand}, "
+                f"gap_blocks_added={gap_count}), "
+                f"capacity={MAX_FACTORY_MACHINES}"
+            )
             self.model.AddCumulative(knitting_intervals, demands, MAX_FACTORY_MACHINES)
+
+    def _build_workforce_boolean(self, MAX_FACTORY_MACHINES: int) -> None:
+        """
+        Slot-based NoOverlap alternative to AddCumulative.
+
+        Each knitting task is assigned to exactly one of MAX_FACTORY_MACHINES virtual
+        machine slots via a BoolVar.  capacity_block tasks occupy their first `demand`
+        slots as fixed intervals, preventing knitting tasks on those slots from running
+        concurrently with the block.
+
+        RAM trade-off vs. AddCumulative:
+          - Saves: no large cumulative propagator with many ghost-task intervals
+          - Costs: MAX_FACTORY_MACHINES BoolVars per knitting task
+          - Break-even: typically around 200 ghost tasks (hence the auto-trigger)
+        """
+        n_slots = max(1, int(MAX_FACTORY_MACHINES))
+        slot_intervals: List[List] = [[] for _ in range(n_slots)]
+
+        for t_id, tv in self.task_vars.items():
+            task_info = next((t for t in self.tasks if t["task_id"] == t_id), {})
+            operation = task_info.get("operation", "").lower()
+
+            # Use actual duration: for pinned tasks, end-start may differ from "duration" field
+            pinned_start = task_info.get("pinned_start_time")
+            pinned_end = task_info.get("pinned_end_time")
+            is_fully_pinned = (
+                task_info.get("is_pinned") and pinned_start is not None and pinned_end is not None
+            )
+            duration = int(pinned_end) - int(pinned_start) if is_fully_pinned else int(task_info.get("duration", 0))
+
+            if operation == "capacity_block":
+                # Occupy first `demand` slots — same semantics as AddCumulative demand.
+                blocked = min(int(task_info.get("demand", 0)), n_slots)
+                for s in range(blocked):
+                    iv = self.model.NewIntervalVar(
+                        tv["start"], duration, tv["end"],
+                        f"block_{t_id}_vslot_{s}"
+                    )
+                    slot_intervals[s].append(iv)
+
+            elif operation == "knitting":
+                slot_bools = [
+                    self.model.NewBoolVar(f"{t_id}_vslot_{s}")
+                    for s in range(n_slots)
+                ]
+                self.model.AddExactlyOne(slot_bools)
+                for s, sb in enumerate(slot_bools):
+                    opt_iv = self.model.NewOptionalIntervalVar(
+                        tv["start"], duration, tv["end"], sb,
+                        f"k_{t_id}_vslot_{s}"
+                    )
+                    slot_intervals[s].append(opt_iv)
+
+        for s in range(n_slots):
+            if slot_intervals[s]:
+                self.model.AddNoOverlap(slot_intervals[s])
 
     def build_resource_allocations(self) -> "TaskModelBuilder":
         resource_usage_literals: Dict[str, List[cp_model.IntVar]] = {
@@ -323,11 +620,36 @@ class TaskModelBuilder:
             start_var = tv["start"]
             end_var = tv["end"]
             
-            # Nếu ghim, chỉ cần ghi đè danh sách r_ids thành 1 máy duy nhất trước khi vào vòng lặp
+            # Nếu ghim, tính toán effective_id thay vì dùng trực tiếp
             if t.get("is_pinned"):
-                tv["r_ids"] = [t["pinned_machine_id"]]
+                effective_id = t.get("pinned_machine_id") or (
+                    t.get("compatible_resource_ids", [None])[0]
+                )
+                if not effective_id:
+                    logger.warning(f"⚠️ Pinned {t_id}: no machine ID — skipping")
+                    self.no_resource_tasks.append(t)
+                    continue
+
+                tv["r_ids"] = [effective_id]
+                
+                # Auto-register: Guard if pinned machine is omitted from resources list
+                if effective_id not in self.resource_map:
+                    logger.warning(f"⚠️ Auto-registering omitted resource {effective_id} for pinned {t_id}")
+                    self.resource_map[effective_id] = {
+                        "id": effective_id,
+                        "type": "serial",
+                        "capacity": 1,
+                        "unavailability": [],
+                        "available_at_min": 0,
+                    }
+                    self.resource_map[effective_id].setdefault("intervals", [])
+                    # Track literals list for Objective activation constraints later
+                    if "resource_usage_literals" in locals(): 
+                        pass # Fixed cleanly by tracking within resource_map if needed, 
+                             # but we don't activate phantom resources, we just avoid crashing
 
             literals = []
+            actual_r_ids = []
 
             for r_id in tv["r_ids"]:
                 if r_id not in self.resource_map:
@@ -336,6 +658,7 @@ class TaskModelBuilder:
                 # Tạo biến is_selected CHUẨN (Chỉ tạo 1 lần)
                 is_selected = self.model.NewBoolVar(f"{t_id}_on_{r_id}")
                 literals.append(is_selected)
+                actual_r_ids.append(r_id)
 
                 # NẾU TASK BỊ GHIM -> ÉP BIẾN NÀY = 1
                 if t.get("is_pinned"):
@@ -347,8 +670,12 @@ class TaskModelBuilder:
                 # available_at > pinned_start would make the model INFEASIBLE.
                 if available_at > 0 and not t.get("is_pinned"):
                     self.model.Add(start_var >= available_at).OnlyEnforceIf(is_selected)
-                
-                resource_usage_literals[r_id].append(is_selected)
+
+                if "resource_usage_literals" in locals() and r_id in resource_usage_literals:
+                    resource_usage_literals[r_id].append(is_selected)
+                # Dành cho resource mới tạo từ auto-register (safe access)
+                elif "resource_usage_literals" in locals():
+                    resource_usage_literals.setdefault(r_id, []).append(is_selected)
 
                 # OptionalIntervalVar dùng cho AddNoOverlap
                 # Cần tính lại duration thực tế nếu đã ghim để tránh lỗi Infeasible
@@ -368,8 +695,17 @@ class TaskModelBuilder:
                 if penalty > 0:
                     self.objective_terms.append(is_selected * penalty * 10 * self.lateness_scale)
 
+            if not literals:
+                logger.warning(
+                    f"⚠️ Task {t_id}: none of {tv['r_ids']} found in resource_map — "
+                    "no assignment possible. Marking as unschedulable."
+                )
+                self.no_resource_tasks.append(t)
+                continue
+
             self.model.AddExactlyOne(literals)
             tv["literals"] = literals
+            tv["r_ids"] = actual_r_ids
 
         # Activation weights scale with lateness_scale to preserve LATENESS : ACTIVATION ≈ 1000 : 2.
         # Labor activation is a pure tie-breaker — keep it zero.
@@ -386,66 +722,186 @@ class TaskModelBuilder:
                 self.objective_terms.append(is_resource_activated * _w_activate)
 
         # ------------------------------------------------------------------
-        # NEW: CONTIGUOUS ON SAME MACHINE, PARALLEL ACROSS MACHINES
+        # PO CO-LOCATION: nhóm task cùng PO trên cùng máy (bounding box mềm)
         # ------------------------------------------------------------------
-        # 1. Gom nhóm task Knitting theo PO
+        # Chỉ xử lý task KHÔNG bị pin (is_pinned=False).
+        # Task đang chạy (is_pinned=True) có thể có pinned_start_time < 0 (âm),
+        # khi đó ràng buộc po_start ≤ start_pinned với po_start ∈ [0, horizon]
+        # tạo ra domain rỗng → INFEASIBLE ngay lập tức.
+        # Không thêm po_end - po_start == total_dur (zero-gap): ràng buộc này
+        # cũng INFEASIBLE khi shift break nằm giữa các task của PO.
+        # Co-location được khuyến khích qua affinity scoring trong objective.
         po_knitting_groups = {}
         for t in self.tasks:
-            if t.get("operation", "").lower() == "knitting":
+            if t.get("operation", "").lower() == "knitting" and not t.get("is_pinned", False):
                 po_id = t.get("original_order_id")
                 if po_id:
                     po_knitting_groups.setdefault(po_id, []).append(t)
 
-        # 2. Tạo "Bounding Box" cục bộ trên từng máy
-        for po_id, tasks_in_po in po_knitting_groups.items():
+        for po_id, tasks_in_po in sorted(po_knitting_groups.items()):
             if len(tasks_in_po) <= 1:
                 continue
 
             for r_id in self.resource_map.keys():
                 task_lits = []
-                task_durations = []
                 task_starts = []
                 task_ends = []
-                
-                # Lọc các biến (variables) của PO này trên máy r_id
+
                 for t in tasks_in_po:
                     tid = t["task_id"]
+                    if tid not in self.task_vars:
+                        continue
                     tv = self.task_vars[tid]
                     lit = next((l for l in tv["literals"] if l.Name().endswith(f"_on_{r_id}")), None)
                     if lit is not None:
                         task_lits.append(lit)
-                        task_durations.append(int(t["duration"]))
                         task_starts.append(tv["start"])
                         task_ends.append(tv["end"])
 
                 if len(task_lits) > 1:
-                    # Tạo biến bao trùm cục bộ
                     po_start = self.model.NewIntVar(0, self.horizon, f"po_{po_id}_{r_id}_start")
                     po_end = self.model.NewIntVar(0, self.horizon, f"po_{po_id}_{r_id}_end")
                     po_active = self.model.NewBoolVar(f"po_{po_id}_{r_id}_active")
-                    
-                    # Nếu máy này nhận ít nhất 1 task của PO -> po_active = 1
                     self.model.AddMaxEquality(po_active, task_lits)
-                    
-                    # Ép Start/End của các task được chọn không vượt ra ngoài Bounding Box
+
                     for lit, st, en in zip(task_lits, task_starts, task_ends):
                         self.model.Add(st >= po_start).OnlyEnforceIf(lit)
                         self.model.Add(en <= po_end).OnlyEnforceIf(lit)
-                    
-                    # Ràng buộc thép: Khoảng cách Box = Tổng thời gian chạy thực tế của các task trên máy này
-                    total_dur_expr = sum(lit * dur for lit, dur in zip(task_lits, task_durations))
-                    self.model.Add(po_end - po_start == total_dur_expr).OnlyEnforceIf(po_active)
+        
+        obj_terms = apply_order_flow_objective(self.model, self.task_vars, self.tasks, self.horizon)
+        self.objective_terms.extend(obj_terms)
         
         self.build_workforce_constraints()
         return self
 
+    def build_material_constraints(self) -> "TaskModelBuilder":
+        """
+        Apply per-material Creel capacity constraints via AddCumulative (Profile Sweep).
+
+        For each material declared in self.material_capacities this method:
+          1. Collects fixed IntervalVars bound strictly to each task's [start, end].
+          2. Collects the integer demand for that material from task.material_demands.
+          3. Calls model.AddCumulative(intervals, demands, capacity) — O(n log n) sweep,
+             no combinatorial BoolVar explosion, no tracking between task pairs.
+
+        Material is released automatically when the task ends because the interval
+        is anchored to tv["end"]. Called after build_resource_allocations() so
+        task_vars are fully populated.
+
+        Guardrails (per implementation spec):
+          - NO O(N²) transition BoolVars between tasks.
+          - ALL demands and capacities are int — no float.
+          - Intervals are strictly [task.start, task.end] — material released on finish.
+        """
+        if not self.material_capacities:
+            logger.info("📦 build_material_constraints: material_capacities is empty — skipped")
+            return self
+
+        logger.info(
+            f"\n📦 MATERIAL CONSTRAINTS: {len(self.material_capacities)} material(s) declared\n"
+            + "\n".join(
+                f"   capacity['{mat}'] = {cap}"
+                for mat, cap in self.material_capacities.items()
+            )
+        )
+
+        # Step 1: Initialize per-material interval/demand lists
+        mat_intervals: Dict[str, List] = {mat: [] for mat in self.material_capacities}
+        mat_demands: Dict[str, List[int]] = {mat: [] for mat in self.material_capacities}
+
+        # Step 2: Flatten task demands into per-material lists
+        tasks_with_demands = 0
+        for t in self.tasks:
+            t_id = t["task_id"]
+            if t_id not in self.task_vars:
+                continue  # No compatible resource — excluded from the model
+
+            task_mat_demands: Dict[str, int] = t.get("material_demands") or {}
+            if not task_mat_demands:
+                continue
+
+            tasks_with_demands += 1
+            tv = self.task_vars[t_id]
+
+            # Compute actual duration — pinned tasks use their exact pinned window
+            pinned_start = t.get("pinned_start_time")
+            pinned_end = t.get("pinned_end_time")
+            is_fully_pinned = (
+                t.get("is_pinned") and pinned_start is not None and pinned_end is not None
+            )
+            duration: int = (
+                int(pinned_end) - int(pinned_start)
+                if is_fully_pinned
+                else int(t.get("duration", 0))
+            )
+
+            if duration <= 0:
+                logger.warning(
+                    f"   ⚠️ Task {t_id}: non-positive duration ({duration}) — "
+                    "skipping material interval"
+                )
+                continue
+
+            for mat_code, demand in task_mat_demands.items():
+                if mat_code not in mat_intervals:
+                    logger.warning(
+                        f"   ⚠️ Task {t_id}: material '{mat_code}' not in material_capacities "
+                        f"(declared: {list(self.material_capacities)}) — skipping"
+                    )
+                    continue
+
+                demand_int = int(demand)
+                if demand_int <= 0:
+                    continue
+
+                # Strictly bound to this task's start/end — material released when task finishes
+                interval = self.model.NewIntervalVar(
+                    tv["start"], duration, tv["end"],
+                    f"mat_{mat_code}_{t_id}",
+                )
+                mat_intervals[mat_code].append(interval)
+                mat_demands[mat_code].append(demand_int)
+                logger.info(
+                    f"   📌 {t_id} → '{mat_code}': demand={demand_int}, duration={duration}"
+                )
+
+        logger.info(
+            f"   📊 Tasks with material_demands: {tasks_with_demands}/{len(self.tasks)} total tasks"
+        )
+
+        # Step 3: Apply AddCumulative per material
+        for mat_code, capacity in sorted(self.material_capacities.items()):
+            intervals = mat_intervals.get(mat_code, [])
+            demands = mat_demands.get(mat_code, [])
+
+            if not intervals:
+                logger.warning(
+                    f"   ⚠️ '{mat_code}': capacity declared ({capacity}) but NO task has "
+                    "material_demands for this material — AddCumulative skipped. "
+                    "Check that task.material_demands keys match material_capacities keys."
+                )
+                continue
+
+            capacity_int = int(capacity)
+            self.model.AddCumulative(intervals, demands, capacity_int)
+            logger.info(
+                f"   ✅ '{mat_code}': AddCumulative applied "
+                f"({len(intervals)} tasks, capacity={capacity_int})"
+            )
+
+        return self
+
     def apply_routing_constraints(self) -> "TaskModelBuilder":
         """
-        Enforce that no two tasks overlap on the same resource, and that tasks
-        cannot be placed inside declared unavailability windows.
+        Enforce scheduling constraints per resource:
+        - Serial (capacity=1): AddNoOverlap — no two tasks at the same time
+        - Batch  (capacity>1): AddCumulative — concurrent tasks allowed up to capacity
+          Used for washing machines so batched tasks can run simultaneously.
         """
-        for r_id, resource in self.resource_map.items():
+        for r_id, resource in sorted(self.resource_map.items()):
             intervals = resource.get("intervals", [])
+            cap = int(resource.get("capacity", 1))
+
             for window in resource.get("unavailability", []):
                 w_start, w_end = int(window["start"]), int(window["end"])
                 if w_end > w_start:
@@ -453,7 +909,18 @@ class TaskModelBuilder:
                         w_start, w_end - w_start, f"unavail_{r_id}"
                     )
                     intervals.append(unavail)
-            if intervals:
+
+            if not intervals:
+                continue
+
+            if cap > 1:
+                # Batch machine: allow concurrent tasks up to capacity
+                # Each task demands 1 unit; total concurrent demand <= capacity
+                demands = [1] * len(intervals)
+                self.model.AddCumulative(intervals, demands, cap)
+                logger.info(f"   🔄 '{r_id}': AddCumulative (batch, capacity={cap}, {len(intervals)} intervals)")
+            else:
+                # Serial machine: no overlap
                 self.model.AddNoOverlap(intervals)
 
         return self
@@ -465,15 +932,67 @@ class TaskModelBuilder:
         2. Inferred: Linking tasks must wait for all Knitting batches of the same
            order to finish — used as a fallback when Go hasn't yet set
            wait_for_batch_task_id on older payload versions.
+
+        Flow continuity: for each A→B dependency where B is not a washing
+        operation, a gap penalty (start_B - end_A) is added to the objective so
+        the solver schedules B immediately after A instead of drifting lazily.
+        Weight = priority_weight * lateness_scale (1000× lighter than lateness
+        per minute, so gaps are closed when cheap but never override urgency).
         """
+        _gap_ctr: List[int] = [0]  # mutable counter for unique CP-SAT var names
+
+        def _add_gap_penalty(parent_id: str, child_id: str) -> None:
+            """Add a flow-continuity gap penalty for the parent→child edge."""
+            child_info = next((t for t in self.tasks if t["task_id"] == child_id), {})
+            # Washing tasks intentionally batch up before starting — no gap pressure.
+            if child_info.get("operation", "").lower() == "washing":
+                return
+            # Pinned tasks can't move; adding a penalty is pointless.
+            if child_info.get("is_pinned", False):
+                return
+            priority = int(child_info.get("priority", 5))
+            # Gap weight is 1/10 of early-start weight so that when L has
+            # multiple K predecessors the solver never delays an early-finishing
+            # K just to shrink its gap (perverse incentive).  The early-start
+            # term on each K already handles unnecessary idle time.
+            _gap_w = max(1, (10 ** (6 - priority)) * self.lateness_scale // 10)
+            _gap_ctr[0] += 1
+            gap_var = self.model.NewIntVar(0, self.horizon, f"gap_{_gap_ctr[0]}")
+            self.model.Add(
+                gap_var >= self.task_vars[child_id]["start"] - self.task_vars[parent_id]["end"]
+            )
+            self.objective_terms.append(gap_var * _gap_w)
+            logger.info(f"   ⏩ GAP: {child_id} should follow {parent_id} immediately (w={_gap_w})")
+
+        def _resolve_dependency(upstream_id: str, downstream_id: str) -> None:
+            """
+            Add the standard end-dependency: downstream must wait for upstream
+            to fully complete before it can start.
+
+            Linking requires full sub-batch output (material is only ready when
+            the knitting run finishes), so no mid-batch pipelining is allowed.
+            """
+            self.model.Add(
+                self.task_vars[downstream_id]["start"] >= self.task_vars[upstream_id]["end"]
+            )
+            _add_gap_penalty(upstream_id, downstream_id)
+
         # 1. Explicit final_depends_on
         logger.info("\n📋 APPLYING DEPENDENCY CONSTRAINTS:")
         for t_id, tv in self.task_vars.items():
             for parent_id in tv["depends_on"]:
-                actual = self.task_translation_map.get(parent_id, parent_id)
+                # Direct-lookup preference: if the dependency ID is already a
+                # schedulable unit (in task_vars), use it as-is so Go can send
+                # granular sub-batch IDs (e.g. K1_b1) and bypass batch aggregation.
+                # Fall back to the translation map only when the direct ID is absent.
+                if parent_id in self.task_vars:
+                    actual = parent_id
+                else:
+                    actual = self.task_translation_map.get(parent_id, parent_id)
+
                 if actual in self.task_vars:
-                    logger.info(f"   ✅ DEP: {t_id} waits for END of {actual} (raw: '{parent_id}')")
-                    self.model.Add(tv["start"] >= self.task_vars[actual]["end"])
+                    logger.info(f"   ✅ DEP: {t_id} ← {actual} (raw: '{parent_id}')")
+                    _resolve_dependency(actual, t_id)
                 else:
                     logger.warning(
                         f"⚠️ Task '{t_id}' depends on '{parent_id}' "
@@ -509,8 +1028,8 @@ class TaskModelBuilder:
                     k_batch_ids.add(batch_id)
 
             for k_batch_id in sorted(k_batch_ids):
-                logger.info(f"   🔗 INFERRED: {l_id} waits for END of {k_batch_id}")
-                self.model.Add(l_tv["start"] >= self.task_vars[k_batch_id]["end"])
+                logger.info(f"   🔗 INFERRED: {l_id} ← {k_batch_id}")
+                _resolve_dependency(k_batch_id, l_id)
 
             if not k_batch_ids:
                 logger.warning(f"   ⚠️ No K batch found for L task '{l_id}' (base: '{l_base}')")
@@ -525,8 +1044,30 @@ class TaskModelBuilder:
 
         Go backend provides:
             WaitOffsets — dictionary mapping BatchTaskID -> offset in minutes
+
+        Overload-adaptive mode:
+            When factory load > 85 %, hard offsets risk making the model infeasible
+            because the solver cannot find a slot that simultaneously satisfies both
+            the machine capacity and the pipeline window.  In that case we relax to
+            soft constraints: a penalty proportional to the pipeline violation is
+            added to the objective (weight = P5_lateness / 10) so the solver can
+            slide the linking start slightly without being declared infeasible.
         """
-        logger.info("\n⏱  BATCH OFFSET CONSTRAINTS (WaitOffsets):")
+        # Compute factory load once to decide hard vs. soft mode.
+        _total_knitting = sum(
+            int(t.get("duration", 0))
+            for t in self.tasks
+            if t.get("operation", "").lower() == "knitting"
+        )
+        _cap = int(self.config.get("max_factory_machines", 100)) * self.horizon
+        _is_overloaded = (_total_knitting / max(1, _cap)) > 0.85
+
+        # PIPELINE_VIOLATION_WEIGHT ≈ P5 lateness weight / 10 (less severe than real lateness)
+        _pipeline_w = 100 * self.lateness_scale
+
+        mode_label = "SOFT (factory overloaded)" if _is_overloaded else "HARD"
+        logger.info(f"\n⏱  BATCH OFFSET CONSTRAINTS (WaitOffsets) — {mode_label}:")
+
         for t in self.tasks:
             t_id = t["task_id"]
             if t_id not in self.task_vars:
@@ -539,7 +1080,7 @@ class TaskModelBuilder:
 
             for raw_batch_id, offset in wait_offsets.items():
                 actual_batch = self.task_translation_map.get(raw_batch_id, raw_batch_id)
-                
+
                 if actual_batch not in self.task_vars:
                     logger.warning(
                         f"   ⚠️ '{t_id}': wait_for_batch '{raw_batch_id}' "
@@ -548,13 +1089,325 @@ class TaskModelBuilder:
                     continue
 
                 offset_val = int(offset)
-                logger.info(f"   ⏱  {t_id} waits for {actual_batch} at offset +{offset_val}")
-                
-                self.model.Add(
-                    self.task_vars[t_id]["start"]
-                    >= self.task_vars[actual_batch]["start"] + offset_val
+
+                if _is_overloaded:
+                    # Soft: penalise pipeline violations but never block the solver.
+                    # violation = max(0, (batch.start + offset) - downstream.start)
+                    viol = self.model.NewIntVar(
+                        0, self.horizon, f"pipe_viol_{t_id}_{actual_batch}"
+                    )
+                    self.model.Add(
+                        viol >= self.task_vars[actual_batch]["start"]
+                               + offset_val
+                               - self.task_vars[t_id]["start"]
+                    )
+                    self.objective_terms.append(viol * _pipeline_w)
+                    logger.info(
+                        f"   ⚠️  SOFT {t_id} ← {actual_batch} +{offset_val}"
+                    )
+                else:
+                    # Hard: strict pipeline dependency.
+                    self.model.Add(
+                        self.task_vars[t_id]["start"]
+                        >= self.task_vars[actual_batch]["start"] + offset_val
+                    )
+                    logger.info(f"   ⏱  {t_id} waits for {actual_batch} at offset +{offset_val}")
+
+        return self
+
+    def apply_smart_batching_constraints(self) -> "TaskModelBuilder":
+        """
+        Assign washing tasks to batch slots, grouped by (color, substance) for compatibility.
+
+        Within each compatibility group, tasks can share slots. Across groups, slots are
+        exclusive to prevent color/fabric mixing.
+
+        Complexity: O(nK) constraints per group (not O(n²K) globally).
+        """
+        import math
+
+        # Collect all washing tasks that made it into task_vars
+        washing_task_ids = sorted([
+            t_id for t_id, tv in self.task_vars.items()
+            if next(
+                (t for t in self.tasks if t["task_id"] == t_id), {}
+            ).get("operation", "").lower() == "washing"
+        ])
+
+        n = len(washing_task_ids)
+        if n == 0:
+            logger.info("🧺 apply_smart_batching_constraints: no washing tasks — skipped")
+            return self
+
+        logger.info(f"\n🧺 SMART BATCHING: {n} washing tasks")
+
+        # 1. CREATE QTY DICTIONARY (Extract qty per task, not count of tasks)
+        task_qtys = {}
+        for t_id in washing_task_ids:
+            task = next((t for t in self.tasks if t["task_id"] == t_id), {})
+            task_qtys[t_id] = int(task.get("qty", 1))
+
+        total_qty = sum(task_qtys.values())
+
+        # 2. COMPUTE K
+        capacity: int = max(1, int(self.config.get("washing_batch_capacity", 10)))
+        min_batches = math.ceil(total_qty / capacity)
+
+        cfg_slots = self.config.get("washing_num_slots")
+        if cfg_slots is not None:
+            # Backend override: dùng K do human chỉ định
+            K = max(1, min(n, int(cfg_slots)))
+            k_source = f"manual (washing_num_slots={cfg_slots})"
+        else:
+            # Auto-calculate: 3× flexibility, tối thiểu 5
+            auto_k: int = max(min_batches * 3, 5)
+            K = min(n, auto_k)
+            cfg_max = self.config.get("max_washing_batches")
+            if cfg_max is not None:
+                K = min(K, int(cfg_max))
+            K = max(1, K)
+            k_source = "auto"
+
+        boolvars_count = n * K
+        if boolvars_count > 50_000:
+            logger.warning(
+                f"   ⚠️  BoolVar matrix lớn: {n} tasks × {K} slots = {boolvars_count:,} BoolVars. "
+                "Solver có thể chậm hoặc timeout. "
+                "Gợi ý: dùng washing_num_slots nhỏ hơn hoặc chia nhỏ payload theo từng màu/chất liệu."
+            )
+
+        logger.info(
+            f"   K={K} slots [{k_source}], capacity={capacity}, n={n} tasks, "
+            f"total_qty={total_qty}, min_batches={min_batches}, "
+            f"boolvars={boolvars_count:,}"
+        )
+
+        # INFO: Log washing task details (helps detect user config errors vs solver errors)
+        for t_id in washing_task_ids[:5]:  # First 5 to avoid spam on large payloads
+            task = next((t for t in self.tasks if t["task_id"] == t_id), {})
+            logger.info(
+                f"   🔍 {t_id}: qty={task.get('qty', 0)}, "
+                f"color={task.get('color', 'N/A')!r}, "
+                f"substance={task.get('substance', 'N/A')!r}, "
+                f"resources={task.get('compatible_resource_ids', [])}"
+            )
+        if n > 5:
+            logger.info(f"   🔍 ... and {n - 5} more tasks")
+
+        # ⚠️ Guard: warn if any task qty > capacity (may cause infeasibility)
+        oversized_tasks = [
+            (t_id, next((t for t in self.tasks if t["task_id"] == t_id), {}).get("qty", 0))
+            for t_id in washing_task_ids
+            if next((t for t in self.tasks if t["task_id"] == t_id), {}).get("qty", 0) > capacity
+        ]
+        if oversized_tasks:
+            logger.warning(
+                f"⚠️  {len(oversized_tasks)} washing tasks exceed batch capacity {capacity}: "
+                f"{oversized_tasks}. Model may become infeasible."
+            )
+
+        # GROUP tasks by (color, substance) for compatibility
+        task_groups = {}
+        for t_id in washing_task_ids:
+            task = next((t for t in self.tasks if t["task_id"] == t_id), {})
+            group_key = (task.get("color", ""), task.get("substance", ""))
+            task_groups.setdefault(group_key, []).append(t_id)
+
+        num_groups = len(task_groups)
+        logger.info(f"   Grouped into {num_groups} color+substance compatibility groups")
+
+        # Create batch slot start IntVars (shared across all groups)
+        batch_starts: List = []
+        for k in range(K):
+            bk = self.model.NewIntVar(0, self.horizon, f"wash_batch_start_{k}")
+            batch_starts.append(bk)
+        self._wash_batch_starts = batch_starts
+
+        # Create assignment BoolVars x[t_id][k]
+        x: Dict[str, List] = {}
+        for t_id in washing_task_ids:
+            x[t_id] = [
+                self.model.NewBoolVar(f"wash_x_{t_id}_{k}")
+                for k in range(K)
+            ]
+        self._wash_x = x
+
+        # Constraint: each washing task assigned to exactly one slot
+        for t_id in washing_task_ids:
+            self.model.AddExactlyOne(x[t_id])
+
+        # 3. CONSTRAINT: capacity per slot (FIXED: multiply by qty per task)
+        # Total quantity in slot k must not exceed capacity
+        for k in range(K):
+            self.model.Add(
+                sum(x[t_id][k] * task_qtys[t_id] for t_id in washing_task_ids) <= capacity
+            )
+
+        # Constraint: each slot serves at most ONE compatibility group
+        # This is O(num_groups * K) = O(nK), not O(n²K)
+        for k in range(K):
+            group_uses_slot = []
+            for group_key, group_task_ids in task_groups.items():
+                uses = self.model.NewBoolVar(f"group_{group_key}_{k}")
+                # uses=1 iff at least one task from this group uses slot k
+                self.model.AddMaxEquality(uses, [x[t_id][k] for t_id in group_task_ids])
+                group_uses_slot.append(uses)
+
+            # At most one group per slot
+            self.model.Add(sum(group_uses_slot) <= 1)
+
+        # Co-location: tasks in the same group that fit in one slot MUST share that slot.
+        # Without this, the solver may spread W1→slot0 (start=100), W2→slot1 (start=150),
+        # W3→slot2 (start=200) — three separate washes instead of one batch.
+        # Correct: all same-group tasks go to the same slot, start = max(dep_ends).
+        #
+        # Guard: only enforce on batch machines (capacity > 1).
+        # Serial machines (capacity=1) cannot run concurrent tasks — co-location at the same
+        # start time would conflict with AddNoOverlap and cause infeasibility.
+        for group_key, group_task_ids in task_groups.items():
+            if len(group_task_ids) < 2:
+                continue
+
+            # Find max resource capacity available to this group's tasks
+            group_resources: set = set()
+            for t_id in group_task_ids:
+                task_info = next((t for t in self.tasks if t["task_id"] == t_id), {})
+                group_resources.update(task_info.get("compatible_resource_ids", []))
+            max_res_cap = max(
+                (int(self.resource_map.get(r_id, {}).get("capacity", 1))
+                 for r_id in group_resources if r_id in self.resource_map),
+                default=1,
+            )
+
+            group_qty = sum(task_qtys.get(t_id, 1) for t_id in group_task_ids)
+
+            if group_qty <= capacity and max_res_cap > 1:
+                # Batch machine + fits in one slot → force co-location
+                t0 = group_task_ids[0]
+                for t_other in group_task_ids[1:]:
+                    for k in range(K):
+                        self.model.Add(x[t0][k] == x[t_other][k])
+                logger.info(
+                    f"   🔒 Group {group_key}: {len(group_task_ids)} tasks co-located "
+                    f"(qty={group_qty} ≤ capacity={capacity}, machine_cap={max_res_cap})"
+                )
+            elif max_res_cap == 1:
+                logger.info(
+                    f"   ⚡ Group {group_key}: serial machine (cap=1) — co-location skipped "
+                    f"(tasks sẽ chạy nối tiếp)"
+                )
+            else:
+                logger.info(
+                    f"   ⚖️  Group {group_key}: qty={group_qty} > capacity={capacity} "
+                    f"— cần nhiều slots, không ép co-location"
                 )
 
+        # Constraint: synchronization — tasks in same slot MUST share start time
+        for t_id in washing_task_ids:
+            tv = self.task_vars[t_id]
+            for k in range(K):
+                self.model.Add(
+                    tv["start"] == batch_starts[k]
+                ).OnlyEnforceIf(x[t_id][k])
+
+        # NOTE: Machine sync (same slot → same machine) cannot be enforced as a hard
+        # constraint because washing machines use AddNoOverlap (serial/capacity=1).
+        # Concurrent tasks on the same machine at the same time violates AddNoOverlap.
+        #
+        # The real fix is for Go to mark washing machines as type=batch (capacity>1)
+        # so Python can use AddCumulative instead of AddNoOverlap for them.
+        #
+        # Current behaviour: tasks in same slot share start time (via batch_starts[k])
+        # and are assigned to different machines running in parallel — which is still
+        # a valid and practical schedule (both machines start simultaneously).
+
+        # Batch activation BoolVars
+        batch_active: List = []
+        for k in range(K):
+            bak = self.model.NewBoolVar(f"wash_batch_active_{k}")
+            self.model.AddMaxEquality(bak, [x[t_id][k] for t_id in washing_task_ids])
+            batch_active.append(bak)
+
+        # FIX 1: SYMMETRY BREAKING (clustering only, no time ordering)
+        # Force batch_active to cluster at the beginning (k=0, 1, 2...) to reduce slot permutations
+        # BUT: Do NOT enforce time ordering — parallel machines may run batches in any order!
+        for k in range(K - 1):
+            self.model.AddImplication(batch_active[k + 1], batch_active[k])
+
+        # FIX 2: LOCK FLOATING VARIABLES (The Silent Killer)
+        # When a batch is inactive, freeze its start time to 0
+        # Otherwise AI wastes time exploring millions of useless values
+        for k in range(K):
+            self.model.Add(batch_starts[k] == 0).OnlyEnforceIf(batch_active[k].Not())
+
+        # Objective term: minimize number of active batches
+        # Increased from 10 to 50 to strongly incentivize merging small batches
+        # When deadline allows, AI will prefer fewer larger batches over many small ones
+        _batch_w: int = 50 * self.lateness_scale
+        for k in range(K):
+            self.objective_terms.append(batch_active[k] * _batch_w)
+
+        # FIX 3: WIP PENALTY (Early-start bias for faster convergence)
+        # Very light penalty: 1 point per minute of start time (negligible vs lateness)
+        for k in range(K):
+            self.objective_terms.append(batch_starts[k] * 1)
+
+        logger.info(f"   ✅ Smart batching: {K} slots, {num_groups} groups, batch_minimize_weight={_batch_w}")
+        return self
+
+    def apply_shift_boundary_constraints(self) -> "TaskModelBuilder":
+        """
+        Ngăn task giặt (washing) bắc qua ranh giới ca làm việc (shift boundary).
+
+        Backend truyền trục thời gian ảo đã loại bỏ giờ nghỉ, nên ranh giới ca
+        là một điểm đơn trong virtual timeline. Máy giặt không thể dừng giữa
+        chừng, nên mỗi task phải kết thúc TRƯỚC ranh giới HOẶC bắt đầu SAU.
+
+        Constraint cho mỗi task t và mỗi ranh giới S:
+            task.end <= S  (kết thúc trong ca hiện tại)
+            OR
+            task.start >= S  (bắt đầu trong ca tiếp theo)
+        """
+        shift_ends: List[int] = [int(s) for s in self.config.get("shift_ends_min", [])]
+        if not shift_ends:
+            return self
+
+        washing_ids = [
+            t_id for t_id, tv in self.task_vars.items()
+            if not tv.get("is_pinned", False)
+            and next(
+                (t for t in self.tasks if t["task_id"] == t_id), {}
+            ).get("operation", "").lower() == "washing"
+        ]
+
+        if not washing_ids:
+            logger.info("⏰ SHIFT BOUNDARY: no washing tasks — skipping")
+            return self
+
+        logger.info(
+            f"⏰ SHIFT BOUNDARY: {len(washing_ids)} washing tasks × "
+            f"{len(shift_ends)} boundaries: {shift_ends}"
+        )
+
+        for t_id in washing_ids:
+            tv = self.task_vars[t_id]
+            task = next((t for t in self.tasks if t["task_id"] == t_id), {})
+            duration = int(task.get("duration", 0))
+            start_after = int(task.get("start_after_min", 0))
+
+            for S in shift_ends:
+                # Cảnh báo nếu task dài hơn khoảng còn lại trong ca hiện tại
+                if start_after < S and (S - start_after) < duration:
+                    logger.warning(
+                        f"   ⚠️  '{t_id}' (duration={duration}min) không vừa trước "
+                        f"ranh giới {S}min — sẽ bị đẩy sang ca tiếp theo"
+                    )
+
+                b = self.model.NewBoolVar(f"before_shift_{t_id}_{S}")
+                self.model.Add(tv["end"] <= S).OnlyEnforceIf(b)
+                self.model.Add(tv["start"] >= S).OnlyEnforceIf(b.Not())
+
+        logger.info(f"   ✅ Shift boundary constraints applied: {len(washing_ids)} tasks × {len(shift_ends)} boundaries")
         return self
 
     def define_objective(self) -> "TaskModelBuilder":
@@ -664,12 +1517,74 @@ class TaskModelBuilder:
     ) -> Dict[str, Any]:
         """Extract assignments and overloads from the solved model."""
         if status not in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-            logger.warning("❌ Infeasible solution")
-            return {"status": "infeasible", "assignments": [], "overloads": []}
+            if status == cp_model.UNKNOWN:
+                logger.warning(
+                    f"⏱ TIMEOUT — solver ran {solver.WallTime():.1f}s without a feasible solution. "
+                    "Model có thể quá lớn hoặc cần tăng max_search_time. "
+                    "Gợi ý: giảm washing_num_slots, giảm n tasks, hoặc tăng thời gian."
+                )
+                return {
+                    "status": "timeout",
+                    "assignments": [],
+                    "overloads": [],
+                    "objective_value": None,
+                    "solve_time_seconds": solver.WallTime(),
+                }
+            if status == cp_model.MODEL_INVALID:
+                logger.error(
+                    "❌ MODEL_INVALID — model bị lỗi cấu trúc (biến trùng tên, bound âm, v.v.). "
+                    "Đây là bug trong builder, không phải do dữ liệu đầu vào."
+                )
+                return {
+                    "status": "model_invalid",
+                    "assignments": [],
+                    "overloads": [],
+                    "objective_value": None,
+                    "solve_time_seconds": solver.WallTime(),
+                }
+            logger.warning(
+                "❌ INFEASIBLE (proven) — không tồn tại lịch hợp lệ. "
+                "Kiểm tra: machine overload, dependency cycle, horizon quá nhỏ."
+            )
+            return {
+                "status": "infeasible",
+                "assignments": [],
+                "overloads": [],
+                "objective_value": None,
+                "solve_time_seconds": solver.WallTime(),
+            }
 
         logger.info(f"✅ Feasible! Objective value: {solver.ObjectiveValue()}")
         assignments = []
         overloads = []
+
+        # ── POST-SOLVE CONCURRENCY DIAGNOSTIC ───────────────────────────────
+        # Scan all knitting tasks grouped by their start time.
+        # Flags any time point where concurrent active knitting tasks + blocked slots > max.
+        _config_max = int(self.config.get("max_factory_machines", 100))
+        _kt_times: Dict[str, tuple] = {}  # t_id -> (start, end)
+        _block_times: list = []           # (start, end, demand)
+        for t_id_d, tv_d in self.task_vars.items():
+            task_info_d = next((t for t in self.tasks if t["task_id"] == t_id_d), {})
+            op_d = task_info_d.get("operation", "").lower()
+            s_d, e_d = solver.Value(tv_d["start"]), solver.Value(tv_d["end"])
+            if op_d == "knitting":
+                _kt_times[t_id_d] = (s_d, e_d)
+            elif op_d == "capacity_block":
+                _block_times.append((s_d, e_d, int(task_info_d.get("demand", 0))))
+        # Check unique start times of knitting tasks
+        _checked = set()
+        for t_id_d, (s_d, e_d) in _kt_times.items():
+            if s_d in _checked:
+                continue
+            _checked.add(s_d)
+            concurrent = sum(1 for (s2, e2) in _kt_times.values() if s2 <= s_d < e2)
+            blocked = sum(dem for (bs, be, dem) in _block_times if bs <= s_d < be)
+            if concurrent + blocked > _config_max:
+                logger.warning(
+                    f"⚠️ CAPACITY VIOLATION at t={s_d}: {concurrent} knitting tasks + "
+                    f"{blocked} blocked demand = {concurrent+blocked} > {_config_max} max"
+                )
 
         for t_id, tv in self.task_vars.items():
             start_val = solver.Value(tv["start"])
@@ -683,6 +1598,15 @@ class TaskModelBuilder:
 
             if selected_res:
                 is_late = end_val > tv["due"]
+
+                # Resolve batch_slot_id for washing tasks
+                batch_slot_id = ""
+                if t_id in self._wash_x:
+                    for k, boolvar in enumerate(self._wash_x[t_id]):
+                        if solver.Value(boolvar) == 1:
+                            batch_slot_id = f"wash_batch_{k}"
+                            break
+
                 assignments.append({
                     "task_id": t_id,
                     "machine_id": selected_res,
@@ -692,8 +1616,9 @@ class TaskModelBuilder:
                     "order_id": tv.get("original_order_id", ""),
                     "quantity": tv.get("qty", 0),
                     "status": "LATE" if is_late else "ON_TIME",
+                    "batch_slot_id": batch_slot_id,
                 })
-                if is_late:
+                if is_late and not tv.get("is_pinned"):
                     overloads.append({
                         "task_id": t_id,
                         "order_id": tv.get("original_order_id", ""),
@@ -706,4 +1631,10 @@ class TaskModelBuilder:
                         "quantity": tv.get("qty", 0),
                     })
 
-        return {"status": "feasible", "assignments": assignments, "overloads": overloads}
+        return {
+            "status": "feasible",
+            "assignments": assignments,
+            "overloads": overloads,
+            "objective_value": solver.ObjectiveValue(),
+            "solve_time_seconds": solver.WallTime(),
+        }

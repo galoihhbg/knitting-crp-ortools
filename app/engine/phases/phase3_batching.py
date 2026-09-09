@@ -1,0 +1,1703 @@
+"""
+Phase 3: Washing Batching — Group-Isolated CP-SAT solver.
+
+Instead of one giant model for all washing tasks, tasks are grouped by
+(color, substance) compatibility and each group gets its own small CP-SAT model.
+This prevents combinatorial explosion: a group with 3 tasks × 5 slots = 15 BoolVars
+vs. the monolithic approach where N tasks share a global K-slot matrix.
+
+Within each group model:
+  - Batch slot start IntVars  batch_start[k]
+  - Assignment BoolVars       x[t][k]  (1 = task t goes to slot k)
+  - Capacity per slot         sum(x[t][k] * qty[t]) <= batch_capacity
+  - Synchronization           task_start == batch_start[k]  when x[t][k]=1
+  - start_lb from Phase 2     batch_start[k] >= linking_end  when x[t][k]=1
+  - Shift boundary            end <= S OR start >= S  per boundary point S
+  - Machine assignment        build_resource_model (NoOverlap / AddCumulative)
+  - Minimize active batches + lateness
+
+Output: BatchInfo list (one entry per active slot across all groups) plus
+end_times dict for Phase 4 downstream lower-bound calculation.
+"""
+import logging
+import math
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+from ortools.sat.python import cp_model
+
+from app.engine.shared import (
+    apply_soft_deadlines,
+    apply_stability_objective,
+    build_resource_model,
+    compute_horizon,
+    extract_results,
+    make_solver,
+)
+from .placement import (  # A1a shared helpers
+    earliest_candidates,
+    overlaps,
+    release_from_deps,
+)
+
+logger = logging.getLogger(__name__)
+
+# Maximum BoolVars per group model before chunking kicks in.
+# At 5 000 the solver typically finishes in < 0.5 s per chunk.
+_BOOLVAR_BUDGET: int = 5_000
+
+PHASE3_OPS = frozenset({"washing"})
+
+
+@dataclass
+class BatchInfo:
+    batch_id: str
+    task_ids: List[str]
+    start_time: int
+    end_time: int  # max task end time within this batch
+
+
+@dataclass
+class Phase3Result:
+    status: str
+    assignments: List[Dict[str, Any]] = field(default_factory=list)
+    overloads: List[Dict[str, Any]] = field(default_factory=list)
+    batches: List[BatchInfo] = field(default_factory=list)
+    end_times: Dict[str, int] = field(default_factory=dict)
+    solve_time_seconds: float = 0.0
+
+
+def solve_washing(
+    tasks: List[Dict[str, Any]],
+    resources: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    p2_end_times: Dict[str, int],
+    shift_ends: List[int],
+    horizon: Optional[int] = None,
+    reschedule_hint: Optional[Dict[str, Any]] = None,
+    workload_shrank: bool = False,
+    all_pipeline_tasks: Optional[List[Dict[str, Any]]] = None,
+) -> Phase3Result:
+    """
+    Solve the washing phase using per-group model isolation.
+
+    Args:
+        tasks:        Washing tasks (operation == 'washing').
+        resources:    Washing machines.
+        config:       Solver config.
+        p2_end_times: task_id → end minute from Phase 2.
+        shift_ends:   Shift boundary points (virtual minutes).
+        all_pipeline_tasks: the FULL task list (all phases).  Used only to compute
+            downstream lead so each washing task's deadline is due − lead (washing
+            is mid-pipeline).  None → lead derived from the washing tasks alone
+            (lead = 0 for them, i.e. deadline == raw due_at_min).
+    """
+    washing_tasks = [t for t in tasks if t.get("operation", "").lower() in PHASE3_OPS]
+    if not washing_tasks:
+        logger.info("⚙️ Phase 3 (Washing): no tasks — skipped.")
+        return Phase3Result(status="empty")
+
+    if horizon is None:
+        horizon = compute_horizon(washing_tasks, config)
+    capacity = max(1, int(config.get("washing_batch_capacity", 10)))
+
+    # Compute start lower-bounds from Phase 2
+    start_lb = _compute_start_lb(washing_tasks, p2_end_times)
+
+    # Lead-adjusted deadline per washing task.  Washing sits in the MIDDLE of the
+    # pipeline (ironing + packing follow), so "washing end ≤ due_at_min" is already
+    # too late for the order.  deadline = max(0, due − downstream_lead), where the
+    # lead is the longest-duration path from this task through its downstream tasks
+    # (reversed final_depends_on DAG).  Drives both the co-location gate and the
+    # soft lateness penalty.  No flag for "short-term" orders is needed: the
+    # deadline arithmetic itself decides which tasks must not be batched late.
+    lead = _compute_downstream_lead(all_pipeline_tasks or washing_tasks)
+    wash_deadline: Dict[str, int] = {
+        t["task_id"]: max(0, int(t.get("due_at_min", horizon)) - lead.get(t["task_id"], 0))
+        for t in washing_tasks
+    }
+
+    # Group by (color, substance)
+    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for t in washing_tasks:
+        key = (t.get("color", ""), t.get("substance", ""))
+        groups.setdefault(key, []).append(t)
+
+    logger.info(f"⚙️ Phase 3 (Washing): {len(washing_tasks)} tasks → {len(groups)} groups")
+
+    all_assignments: List[Dict[str, Any]] = []
+    all_overloads: List[Dict[str, Any]] = []
+    all_batches: List[BatchInfo] = []
+    all_end_times: Dict[str, int] = {}
+    total_solve_time = 0.0
+
+    # Per-group hint subset (Phase 3 is group-isolated by color+substance).
+    washing_groups_hint = (
+        reschedule_hint.get("_washing_groups") if reschedule_hint else None
+    )
+
+    # Cross-group machine occupancy.  Groups are solved sequentially (sorted), each
+    # in an isolated model that cannot see the others.  We accumulate every batch
+    # cycle window each group places on a machine and feed it to all LATER groups
+    # as reserved_windows, so the per-machine NoOverlap forbids two groups from
+    # double-booking the same washing machine at overlapping times.
+    reserved_windows: Dict[str, set] = {}
+
+    for group_key, group_tasks in sorted(groups.items()):
+        group_hint = None
+        if reschedule_hint and washing_groups_hint:
+            group_prev = washing_groups_hint.get(group_key, [])
+            if group_prev:
+                group_hint = {
+                    "previous_assignments": group_prev,
+                    "stability_weight_time_per_min": reschedule_hint.get("stability_weight_time_per_min", 500),
+                    "stability_weight_machine_swap": reschedule_hint.get("stability_weight_machine_swap", 5000),
+                    "match_by_order_fallback": reschedule_hint.get("match_by_order_fallback", True),
+                }
+        result = _solve_group(
+            group_key=group_key,
+            group_tasks=group_tasks,
+            resources=resources,
+            config=config,
+            horizon=horizon,
+            capacity=capacity,
+            start_lb=start_lb,
+            shift_ends=shift_ends,
+            reschedule_hint=group_hint,
+            workload_shrank=workload_shrank,
+            wash_deadline=wash_deadline,
+            reserved_windows=reserved_windows,
+        )
+        all_assignments.extend(result["assignments"])
+        all_overloads.extend(result["overloads"])
+        all_batches.extend(result["batches"])
+        all_end_times.update(result["end_times"])
+        total_solve_time += result["solve_time"]
+
+        # Reserve this group's placed batch cycles for all later groups.  Dedup by
+        # (machine, start, end): batch-mates share one window → one reservation.
+        for a in result["assignments"]:
+            m = a.get("machine_id")
+            s = a.get("start_time")
+            e = a.get("end_time")
+            if m and s is not None and e is not None and int(e) > int(s):
+                reserved_windows.setdefault(m, set()).add((int(s), int(e)))
+
+    return Phase3Result(
+        status="feasible" if all_assignments or not washing_tasks else "infeasible",
+        assignments=all_assignments,
+        overloads=all_overloads,
+        batches=all_batches,
+        end_times=all_end_times,
+        solve_time_seconds=total_solve_time,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-group solver
+# ---------------------------------------------------------------------------
+
+def _solve_group(
+    group_key: Tuple[str, str],
+    group_tasks: List[Dict[str, Any]],
+    resources: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    horizon: int,
+    capacity: int,
+    start_lb: Dict[str, int],
+    shift_ends: List[int],
+    _chunked: bool = False,
+    reschedule_hint: Optional[Dict[str, Any]] = None,
+    workload_shrank: bool = False,
+    wash_deadline: Optional[Dict[str, int]] = None,
+    reserved_windows: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    wash_deadline = wash_deadline or {}
+    # Split pinned vs free tasks.
+    # Pinned tasks have fixed start/end and must NOT consume batch slots or
+    # receive shift-boundary constraints (they are already scheduled and immovable).
+    # They still pass through build_resource_model so their machine intervals
+    # block capacity for free tasks on the same machine.
+    # K and all slot constraints are computed from free tasks only, so that
+    # passing washing_num_slots sized for new orders never causes infeasibility
+    # from pinned tasks consuming slots they don't need.
+    pinned_tasks = [t for t in group_tasks if t.get("is_pinned")]
+    free_tasks   = [t for t in group_tasks if not t.get("is_pinned")]
+    n            = len(free_tasks)
+    all_task_ids = [t["task_id"] for t in group_tasks]
+
+    # Per-task duration and lead-adjusted deadline lookups (used by the co-location
+    # gate and the keep-override).  _deadline falls back to the raw due when no
+    # lead-adjusted value was supplied (e.g. virtual-pinned handoff tasks).
+    _dur     = {t["task_id"]: max(0, int(t.get("duration", 0))) for t in group_tasks}
+    _due_raw = {t["task_id"]: int(t.get("due_at_min", horizon)) for t in group_tasks}
+
+    def _deadline(t_id: str) -> int:
+        return wash_deadline.get(t_id, _due_raw.get(t_id, horizon))
+
+    # Compute K from free tasks only
+    _raw_qtys   = {t["task_id"]: max(0, int(t.get("qty") or 0)) for t in free_tasks}
+    group_qty   = sum(_raw_qtys.values())
+    min_batches = max(1, math.ceil(group_qty / capacity)) if group_qty > 0 else 1
+
+    cfg_slots = config.get("washing_num_slots")
+    if n == 0:
+        K = 0  # all tasks pinned
+    elif cfg_slots is not None:
+        # washing_num_slots là GỢI Ý số mẻ, không phải trần cứng: floor tại
+        # min_batches+2 để config chặt không bao giờ tự bóp chết nhóm.  Đo thực tế
+        # (CP_1783157202628867763): slots=21, capacity=50, tổng qty=1050 → sức chứa
+        # 21×50 = 1050 KHỚP CHÍNH XÁC (slack 0); cold còn xếp hoàn hảo được, nhưng
+        # re-schedule thêm ma sát (hard-keep theo prev + co-location gate theo
+        # deadline) → INFEASIBLE cả nhóm → 135 task washing BIẾN MẤT khỏi output.
+        # +2 slot slack là đủ hấp thụ ma sát; batch_w vẫn thưởng gom nên solver
+        # không lạm dụng slot thừa.
+        K = max(1, min(n, max(int(cfg_slots), min_batches + 2)))
+    else:
+        K = max(1, min(n, min_batches + 2))
+        max_k = config.get("max_washing_batches")
+        if max_k is not None:
+            K = min(K, int(max_k))
+        K = max(1, K)
+
+    # Tier-1: K auto-cap — reduce K to stay within budget, but NEVER below the
+    # min_batches+2 safety floor (bounded by n).  min_batches chỉ là tối thiểu
+    # SỐ HỌC: cắt về đó là zero-slack bin-packing, cộng ma sát (release rải,
+    # co-location gate theo deadline, ranh giới ca) làm solver hết det-budget ở
+    # UNKNOWN → fallback drop cả nhóm (CP_1783650446710927481: K 33→31 →
+    # UNKNOWN 18s → 331 wash task CAPACITY_FULL → job infeasible).
+    if K > 0 and n * K > _BOOLVAR_BUDGET:
+        K_capped = max(min(n, min_batches + 2), _BOOLVAR_BUDGET // max(1, n))
+        if K_capped < K:
+            logger.info(
+                f"   💡 Group {group_key}: K {K}→{K_capped} "
+                f"({n}×{K}={n*K:,} → {n}×{K_capped}={n*K_capped:,} BoolVars)"
+            )
+            K = K_capped
+
+    # Tier-2: chunked solving when min_batches itself is too large for one model.
+    # Activated only from the top-level call (_chunked=False) to avoid recursion.
+    if not _chunked and K > 0 and n * K > _BOOLVAR_BUDGET:
+        chunk_size = max(10, int(math.sqrt(_BOOLVAR_BUDGET * capacity)))
+        if len(free_tasks) > chunk_size:
+            logger.warning(
+                f"   ⚠️ Group {group_key}: {n}×{K}={n*K:,} BoolVars exceeds budget "
+                f"— switching to chunked solving (chunk_size={chunk_size})"
+            )
+            return _solve_group_chunked(
+                group_key, pinned_tasks, free_tasks,
+                resources, config, horizon, capacity, start_lb, shift_ends,
+                workload_shrank=workload_shrank,
+                wash_deadline=wash_deadline,
+                reserved_windows=reserved_windows,
+            )
+
+    logger.info(
+        f"   Group {group_key}: {len(group_tasks)} tasks "
+        f"({len(pinned_tasks)} pinned, {n} free), qty={group_qty}, "
+        f"K={K}, capacity={capacity}, BoolVars={n*K:,}"
+    )
+
+    model = cp_model.CpModel()
+    resource_map: Dict[str, Dict[str, Any]] = {r["id"]: r for r in resources}
+
+    # Override machine capacity -> batch mode (AddCumulative per machine).
+    # Pass ALL group tasks so pinned tasks register intervals and block capacity.
+    washing_resource_ids = set(
+        r_id
+        for t in group_tasks
+        for r_id in (t.get("compatible_resource_ids") or [])
+    )
+    batch_resource_map = {
+        r_id: ({**r, "capacity": capacity} if r_id in washing_resource_ids else r)
+        for r_id, r in resource_map.items()
+    }
+
+    group_start_lb = {t_id: start_lb.get(t_id, 0) for t_id in all_task_ids}
+    task_vars, _, no_res = build_resource_model(
+        model, group_tasks, batch_resource_map, horizon,
+        start_lb=group_start_lb,
+    )
+    if no_res:
+        logger.warning(f"   ⚠️ Group {group_key}: {len(no_res)} tasks unschedulable — no resources.")
+
+    if not task_vars:
+        return {"assignments": [], "overloads": [], "batches": [], "end_times": {}, "solve_time": 0.0}
+
+    # Separate scheduled IDs by pinned vs free (dedup may have renamed some)
+    free_scheduled_ids   = [t_id for t_id in task_vars if not task_vars[t_id].get("is_pinned")]
+    pinned_scheduled_ids = [t_id for t_id in task_vars if     task_vars[t_id].get("is_pinned")]
+
+    # task_qtys only for free tasks
+    task_qtys: Dict[str, int] = {
+        t_id: max(0, int(task_vars[t_id].get("qty") or 0))
+        for t_id in free_scheduled_ids
+    }
+    actual_free_qty = sum(task_qtys.values())
+    for t_id, q in task_qtys.items():
+        if q > capacity:
+            logger.warning(
+                f"   ⚠️ Task {t_id}: qty={q} > batch_capacity={capacity} "
+                f"→ cannot fit alone → group model may be INFEASIBLE"
+            )
+
+    # Early exit: nothing to slot-assign (all tasks pinned).
+    # Pinned tasks have fully known start/end/machine — bypass the solver entirely.
+    # build_resource_model already used NewFixedSizeIntervalVar for them (no BoolVars),
+    # so there is nothing for OR-Tools to decide.
+    if K == 0 or not free_scheduled_ids:
+        logger.info(
+            f"   ⏭️ Group {group_key}: all tasks pinned — extracting directly (no solver)"
+        )
+        return _extract_pinned_result(group_tasks, group_key)
+
+    # ── Batch slot variables ─────────────────────────────────────────────────────
+    batch_starts = [
+        model.NewIntVar(0, horizon, f"wbatch_{group_key}_{k}_start")
+        for k in range(K)
+    ]
+    batch_active = [
+        model.NewBoolVar(f"wbatch_{group_key}_{k}_active")
+        for k in range(K)
+    ]
+
+    # Assignment BoolVars for FREE tasks only
+    x: Dict[str, List] = {
+        t_id: [model.NewBoolVar(f"wx_{t_id}_{k}") for k in range(K)]
+        for t_id in free_scheduled_ids
+    }
+
+    for t_id in free_scheduled_ids:
+        model.AddExactlyOne(x[t_id])
+
+    for k in range(K):
+        model.Add(
+            sum(x[t_id][k] * task_qtys[t_id] for t_id in free_scheduled_ids) <= capacity
+        )
+
+    for t_id in free_scheduled_ids:
+        tv = task_vars[t_id]
+        for k in range(K):
+            model.Add(tv["start"] == batch_starts[k]).OnlyEnforceIf(x[t_id][k])
+            lb = group_start_lb.get(t_id, 0)
+            if lb > 0:
+                model.Add(batch_starts[k] >= lb).OnlyEnforceIf(x[t_id][k])
+
+    for k in range(K):
+        model.AddMaxEquality(batch_active[k], [x[t_id][k] for t_id in free_scheduled_ids])
+
+    for k in range(K - 1):
+        model.AddImplication(batch_active[k + 1], batch_active[k])
+
+    for k in range(K):
+        model.Add(batch_starts[k] == 0).OnlyEnforceIf(batch_active[k].Not())
+
+    if shift_ends:
+        # Only boundaries that a task can actually STRADDLE need a reified
+        # before/after BoolVar.  shift_ends spans the whole factory calendar (236–390
+        # points, up to ~4× the washing horizon), so the vast majority are inert:
+        #   • S ≥ horizon  → end ≤ horizon ≤ S, so "end ≤ S" always holds (b≡True).
+        #   • S ≤ start_lb → start ≥ start_lb ≥ S, so "start ≥ S" always holds (b≡False).
+        # Both produce a fixed BoolVar + two no-op constraints.  Skipping them is
+        # nghiệm-preserving (the disjunction is already satisfied) and removes ~75% of
+        # this phase's BoolVars on real payloads.  Filter the upper bound once, the
+        # lower bound per task (it depends on each task's start_lb).
+        relevant_bounds = [S for S in shift_ends if S < horizon]
+        for t_id in free_scheduled_ids:
+            tv = task_vars[t_id]
+            lb = group_start_lb.get(t_id, 0)
+            for S in relevant_bounds:
+                if S <= lb:
+                    continue
+                b = model.NewBoolVar(f"before_shift_{t_id}_{S}")
+                model.Add(tv["end"] <= S).OnlyEnforceIf(b)
+                model.Add(tv["start"] >= S).OnlyEnforceIf(b.Not())
+
+    # ── Deadline-driven co-location filter (Part 1: the kẹp fix) ─────────────
+    # HARD co-location forces every member into one slot whose start is bounded
+    # below by the LATEST ready-time in the set (batch_start ≥ max start_lb).  If
+    # one member is slow-to-be-ready (late linking) it drags the whole batch late.
+    # A task must NOT be force-co-located if doing so would push it past its own
+    # lead-adjusted deadline.  We compute the co-locatable subset by iteratively
+    # dropping, highest-start_lb first, any member that would be late at the set's
+    # current max start_lb — so dropping a late dragger lowers the max and lets the
+    # remaining tasks re-qualify (avoids over-splitting tasks that were only "late"
+    # because of the dragger).  Dropped tasks keep their free slot variables and
+    # take an early slot on their own.  This is asymmetric by construction: a
+    # slow-but-loose-deadline order stays eligible and may still join an early
+    # batch (the allowed direction); only would-be-late members are released.
+    def _coloc_eligible(ids: List[str]) -> List[str]:
+        coloc = list(ids)
+        while len(coloc) > 1:
+            m = max(group_start_lb.get(t_id, 0) for t_id in coloc)
+            dragged = [t_id for t_id in coloc if m + _dur[t_id] > _deadline(t_id)]
+            if not dragged:
+                break
+            drop = max(dragged, key=lambda t_id: (group_start_lb.get(t_id, 0), t_id))
+            coloc.remove(drop)
+        return coloc
+
+    coloc_ids = _coloc_eligible(free_scheduled_ids)
+    coloc_qty = sum(task_qtys[t_id] for t_id in coloc_ids)
+    if len(coloc_ids) < len(free_scheduled_ids):
+        logger.info(
+            f"   🎯 Group {group_key}: {len(free_scheduled_ids) - len(coloc_ids)} "
+            f"task(s) released from co-location to meet deadline; "
+            f"{len(coloc_ids)} remain co-locatable"
+        )
+
+    # One-slot-one-machine is enforced as a hard constraint below (a washing batch
+    # physically runs on a single machine).  The ONE exception is the disjoint
+    # slot-only co-location branch, which deliberately forces co-located tasks that
+    # share NO common machine into the same slot on DIFFERENT machines — there a
+    # Σ_m slot_on_m[k] ≤ 1 would be infeasible.  This flag is cleared only on that
+    # branch so the hard constraint is skipped for the group in that case.
+    slot_machine_cap_ok = True
+
+    if coloc_qty <= capacity and len(coloc_ids) > 1:
+        # Intersection of compatible machines across the co-locatable tasks.
+        # Non-empty → they can physically share one machine.
+        common_machines: Optional[set] = None
+        for t_id in coloc_ids:
+            t_m = set(task_vars[t_id].get("r_ids") or [])
+            common_machines = t_m if common_machines is None else common_machines & t_m
+        common_machines = common_machines or set()
+
+        group_machine_ids: set = set()
+        for t_id in coloc_ids:
+            group_machine_ids.update(task_vars[t_id].get("r_ids") or [])
+        n_machines = len(group_machine_ids)
+
+        if common_machines:
+            # ── Slot co-location (same batch cycle) ──────────────────────────
+            t0 = coloc_ids[0]
+            for t_other in coloc_ids[1:]:
+                for k in range(K):
+                    model.Add(x[t0][k] == x[t_other][k])
+
+            # ── Machine co-location (same machine) ───────────────────────────
+            # 1. Restrict every co-located task to only machines in the intersection.
+            for t_id in coloc_ids:
+                t_rids = task_vars[t_id].get("r_ids") or []
+                t_lits = task_vars[t_id].get("literals") or []
+                for i, m_id in enumerate(t_rids):
+                    if i < len(t_lits) and m_id not in common_machines:
+                        model.AddBoolAnd([t_lits[i].Not()])
+
+            # 2. Force all co-located tasks to match t0's machine choice.
+            t0_rids = task_vars[t0].get("r_ids") or []
+            t0_lits = task_vars[t0].get("literals") or []
+            t0_ml = {
+                t0_rids[i]: t0_lits[i]
+                for i in range(min(len(t0_rids), len(t0_lits)))
+                if t0_rids[i] in common_machines
+            }
+            for t_other in coloc_ids[1:]:
+                t_other_rids = task_vars[t_other].get("r_ids") or []
+                t_other_lits = task_vars[t_other].get("literals") or []
+                t_other_ml = {
+                    t_other_rids[i]: t_other_lits[i]
+                    for i in range(min(len(t_other_rids), len(t_other_lits)))
+                    if t_other_rids[i] in common_machines
+                }
+                for m_id in common_machines:
+                    if m_id in t0_ml and m_id in t_other_ml:
+                        model.AddImplication(t0_ml[m_id], t_other_ml[m_id])
+                        model.AddImplication(t_other_ml[m_id], t0_ml[m_id])
+
+            logger.info(
+                f"   🔒 Group {group_key}: co-located (slot + machine) "
+                f"(coloc_qty={coloc_qty}≤cap={capacity}, "
+                f"common_machines={len(common_machines)})"
+            )
+        elif n_machines >= len(coloc_ids):
+            # No single machine can hold all co-located tasks, but enough machines
+            # exist for each — force same slot (sequential batches still pack tightly).
+            # This intentionally spreads one slot across machines → the
+            # one-slot-one-machine hard constraint must NOT apply to this group.
+            slot_machine_cap_ok = False
+            t0 = coloc_ids[0]
+            for t_other in coloc_ids[1:]:
+                for k in range(K):
+                    model.Add(x[t0][k] == x[t_other][k])
+            logger.info(
+                f"   🔒 Group {group_key}: slot co-located (no common machine, "
+                f"{n_machines} machines ≥ {len(coloc_ids)} tasks)"
+            )
+        else:
+            logger.info(
+                f"   ⚡ Group {group_key}: NOT co-located "
+                f"(only {n_machines} machines < {len(coloc_ids)} tasks — will serialize)"
+            )
+
+    # ── Batch end times (Condition 1: same-slot tasks end together) ─────────
+    # batch_end[k] = batch_start[k] + max(duration of tasks in slot k).
+    # All tasks in the same washing cycle finish when the longest one finishes.
+    # We derive this by lower-bounding batch_end[k] with each assigned task's
+    # end variable; the solver minimises makespan so it naturally sets batch_end
+    # to exactly the maximum end in the slot.
+    batch_ends: List = []
+    for k in range(K):
+        bend = model.NewIntVar(0, horizon, f"wbatch_{group_key}_{k}_end")
+        for t_id in free_scheduled_ids:
+            model.Add(bend >= task_vars[t_id]["end"]).OnlyEnforceIf(x[t_id][k])
+        model.Add(bend == 0).OnlyEnforceIf(batch_active[k].Not())
+        batch_ends.append(bend)
+
+    # ── Machine-level NoOverlap (Condition 2: batches on same machine cannot
+    # overlap). AddCumulative alone allows overlap when total demand ≤ capacity;
+    # we need an additional constraint that each machine runs one cycle at a time.
+    #
+    # For each machine: build one OptionalIntervalVar per slot spanning
+    # [batch_start[k], batch_end[k]].  If any task in slot k is assigned to
+    # that machine the interval is active.  AddNoOverlap prevents two active
+    # intervals on the same machine from overlapping.
+    group_machine_ids = sorted({
+        r_id for t_id in free_scheduled_ids
+        for r_id in (task_vars[t_id].get("r_ids") or [])
+    })
+    # slot_on_m literals collected per machine so we can derive, after the loop,
+    # machine_ever_used[m] = OR_k slot_on_m[k] (see machine-consolidation term in
+    # the objective below).  Keyed by m_id (group_machine_ids is sorted → det.).
+    machine_slot_lits: Dict[str, List] = {}
+    # slot_on_m literals collected per SLOT k → drives the per-slot machine-spread
+    # penalty in the objective (one slot must not straddle several machines when it
+    # fits one).  Keyed by k (range(K) order → deterministic).
+    slot_machine_lits: Dict[int, List] = {}
+
+    # ── Committed (fully-pinned) batch windows per machine ────────────────────
+    # The free batch-slot intervals above are the ONLY members of the per-machine
+    # AddNoOverlap below, so a free batch could land ON TOP of a committed batch
+    # already running on that machine (those committed intervals live only in the
+    # cap>1 AddCumulative of build_resource_model, which permits overlap up to
+    # capacity → double-booking).  Inject one FIXED interval per committed
+    # (machine, start, end) WINDOW into the NoOverlap set so each washing machine
+    # runs one cycle at a time, committed cycles included.
+    #
+    # Grouped by (start, end) — one interval per window, NOT per task.  A
+    # multi-task committed batch shares a single window; a per-task interval would
+    # make those batch-mates overlap each other → self-conflict → infeasible.
+    pinned_windows: Dict[str, set] = {}
+    for t in pinned_tasks:
+        ps = t.get("pinned_start_time")
+        pe = t.get("pinned_end_time")
+        if ps is None or pe is None or int(pe) <= int(ps):
+            continue
+        m_eff = t.get("pinned_machine_id") or next(
+            iter(t.get("compatible_resource_ids") or []), None
+        )
+        if m_eff is None:
+            continue
+        pinned_windows.setdefault(m_eff, set()).add((int(ps), int(pe)))
+
+    # Cross-group machine reservations.  Phase 3 solves each (color, substance)
+    # group in its OWN isolated model, so the per-machine NoOverlap below sees only
+    # THIS group's intervals.  Two different groups could otherwise place batches on
+    # the same washing machine at overlapping times (a real double-booking observed
+    # in production: White/Cotton vs Mocha/Cotton both on W_WASHING_02).  solve_washing
+    # accumulates the (machine, start, end) windows already taken by earlier-solved
+    # groups and passes them here; we fold them into pinned_windows so they occupy
+    # the machine in the NoOverlap (one washing cycle at a time, across groups too).
+    # These are NOT added to build_resource_model's AddCumulative — they are not
+    # tasks of this group, only machine-occupancy blockers for the NoOverlap.
+    for m_eff, wins in (reserved_windows or {}).items():
+        for (ps, pe) in wins:
+            if pe > ps:
+                pinned_windows.setdefault(m_eff, set()).add((int(ps), int(pe)))
+
+    for m_id in group_machine_ids:
+        machine_batch_ivs: List = []
+        for k in range(K):
+            # slot_on_m: 1 iff at least one free task in slot k is on machine m_id.
+            # Computed as OR(x[t_id][k] AND is_selected_m[t_id]) over all tasks.
+            prods: List = []
+            for t_id in free_scheduled_ids:
+                tv = task_vars[t_id]
+                for idx, r_id in enumerate(tv.get("r_ids", [])):
+                    if r_id == m_id and idx < len(tv.get("literals", [])):
+                        lit_m = tv["literals"][idx]
+                        prod = model.NewBoolVar(f"prod_{t_id}_{k}_{m_id}")
+                        model.AddBoolAnd([x[t_id][k], lit_m]).OnlyEnforceIf(prod)
+                        model.AddBoolOr([x[t_id][k].Not(), lit_m.Not()]).OnlyEnforceIf(prod.Not())
+                        prods.append(prod)
+                        break  # one literal per machine per task
+            if not prods:
+                continue
+            slot_on_m = model.NewBoolVar(f"slot_on_{m_id}_{k}")
+            model.AddBoolOr(prods).OnlyEnforceIf(slot_on_m)
+            model.AddBoolAnd([p.Not() for p in prods]).OnlyEnforceIf(slot_on_m.Not())
+            machine_slot_lits.setdefault(m_id, []).append(slot_on_m)
+            slot_machine_lits.setdefault(k, []).append(slot_on_m)
+
+            # Duration of the batch cycle on this machine
+            batch_dur_km = model.NewIntVar(0, horizon, f"batch_dur_{m_id}_{k}")
+            model.Add(batch_dur_km == batch_ends[k] - batch_starts[k]).OnlyEnforceIf(slot_on_m)
+
+            batch_iv = model.NewOptionalIntervalVar(
+                batch_starts[k], batch_dur_km, batch_ends[k],
+                slot_on_m, f"batch_iv_{m_id}_{k}",
+            )
+            machine_batch_ivs.append(batch_iv)
+
+        # Committed batch windows on this machine (sorted → deterministic build
+        # order).  Fixed intervals, no new BoolVars.  Even a machine with a single
+        # free slot now gets a NoOverlap once a committed window is present, which
+        # is exactly the previously-uncovered case (1 free iv → len==1 → skipped).
+        for (ps, pe) in sorted(pinned_windows.get(m_id, ())):
+            machine_batch_ivs.append(
+                model.NewFixedSizeIntervalVar(
+                    ps, pe - ps, f"committed_iv_{m_id}_{ps}_{pe}"
+                )
+            )
+
+        if len(machine_batch_ivs) > 1:
+            model.AddNoOverlap(machine_batch_ivs)
+
+    # ── Objective ────────────────────────────────────────────────────────────
+    lateness_scale = min(max(1, horizon // 1000), 50)
+    obj_terms: List = []
+
+    batch_w = 50 * lateness_scale
+    for k in range(K):
+        obj_terms.append(batch_active[k] * batch_w)
+
+    for k in range(K):
+        obj_terms.append(batch_starts[k] * 1)
+
+    # Minimise batch_ends so they collapse to exactly max(task.end in slot k).
+    # Without this term batch_ends are only lower-bounded and the solver may
+    # leave them at the horizon, causing downstream phases to use wrong start_lb.
+    for k in range(K):
+        obj_terms.append(batch_ends[k] * 1)
+
+    # ── Machine-consolidation cost ────────────────────────────────────────────
+    # Penalise the NUMBER of distinct machines ever used (machine_ever_used[m] =
+    # OR_k slot_on_m[k]).  Without this, the objective rewards early starts/ends so
+    # the solver runs ≥2 batch slots PARALLEL on separate machines (both finish
+    # early) even when SEQUENTIAL on one machine is fine — wasting electricity.
+    #
+    # The competitor that decides parallel-vs-sequential is the per-task earliest-
+    # start tie-breaker in apply_soft_deadlines (`start × start_coeff`,
+    # start_coeff = max(1, weight//100)) PLUS batch_starts/ends (×1).  Both the
+    # start tie-breaker AND the lateness/is_late penalties scale with a task's
+    # weight = 10**(6-priority), so a FLAT machine_w cannot simultaneously beat the
+    # start tie-breaker of a priority-3 group (needs > ~1300) and stay below the
+    # lateness floor of a priority-5 group (1000/min) — the bands don't overlap.
+    #
+    # Fix: scale machine_w to the group's LOWEST-priority (largest, most easily
+    # delayed → most vulnerable to lateness) task:
+    #   machine_w = 5 * min_weight,   min_weight = min_t 10**(6-priority_t).
+    # • < is_late floor (min_weight*10) and ≪ lateness/min (min_weight*100) → a
+    #   flipped-late task always costs far more than a saved machine → NEVER trades
+    #   a machine for tardiness, at ANY priority (safe by construction).
+    # • > start_coeff (=min_weight//100) by 500× → beats the start tie-breaker for
+    #   small groups (few short batches), consolidating the wasteful cases, while a
+    #   large group's start-mass (∝ N²) still dwarfs it → large groups stay parallel.
+    # • ≪ re-schedule machine-swap weight (50_000 at default p3) → never overrides
+    #   stability on a warm re-solve.
+    _prio_of = {t["task_id"]: int(t.get("priority", 5)) for t in group_tasks}
+    _free_prios = [_prio_of.get(t_id, 5) for t_id in free_scheduled_ids]
+    min_weight = min((10 ** (6 - p) for p in _free_prios), default=10 ** (6 - 5))
+    machine_w = 5 * min_weight
+    for m_id in sorted(machine_slot_lits):
+        used_m = model.NewBoolVar(f"mach_used_{group_key}_{m_id}")
+        model.AddMaxEquality(used_m, machine_slot_lits[m_id])
+        obj_terms.append(used_m * machine_w)
+
+    # ── Prompt-washing (wait-past-ready) penalty ──────────────────────────────
+    # Operational WIP risk: goods that finished linking but sit unwashed for a long
+    # time (e.g. into the next day) can be mislaid.  Penalise each task's WAIT =
+    # start − ready_time so the solver lights an EXTRA washing machine to clear a
+    # genuine BACKLOG — the per-task penalty accumulates across many waiting tasks
+    # until the total tops machine_w (one machine) — while still CONSOLIDATING when
+    # waits are short (small total < machine_w → consolidation wins).  No threshold:
+    # the linear-in-wait penalty self-scales with backlog size.
+    #
+    # Banded against the existing weight ladder (start_coeff=min_weight//100 ≪
+    # machine_w=5*min_weight ≪ is_late=10*min_weight ≪ lateness=100*min_weight):
+    # base wait_w = min_weight // divisor (divisor default 100 → ≈ start_coeff).
+    #
+    # FIFO FAIRNESS — a FLAT wait_w minimises TOTAL wait but is SYMMETRIC about
+    # WHICH item waits: swapping two items between two fixed-time slots leaves the
+    # total unchanged, so the solver may strand an EARLY-ready slice in a late batch
+    # behind LATER-ready ones (observed: a slice ready at 1574 dumped into the 3124
+    # batch next to items ready 3046+).  Fix: scale each task's wait weight by its
+    # EARLINESS, factor = 1 + (max_ready − ready)·FIFO_SPAN // max_ready ∈ [1, ~1+SPAN].
+    # Swap delta = (s2−s1)·(w_late − w_early) < 0 ⇒ the solver always puts the
+    # earlier-ready item in the earlier slot (true FIFO: late material waits, not early).
+    #
+    # SAFE vs tardiness by the PER-MINUTE comparison: max wait weight =
+    # wait_w·(1+SPAN) ≈ (min_weight/100)·51, while a minute of lateness costs
+    # ~100·min_weight — still ~200× more — so it never delays a task past its due to
+    # wash something else promptly.  Cold only (re-schedule keeps the previous layout).
+    if not reschedule_hint and config.get("enable_washing_prompt", True):
+        divisor = int(config.get("washing_prompt_weight_divisor", 100))
+        fifo_span = int(config.get("washing_prompt_fifo_span", 50))
+        wait_w = max(1, min_weight // max(1, divisor))
+        _release = {t["task_id"]: int(t.get("start_after_min", 0) or 0) for t in group_tasks}
+        # ready = when the task's material is on hand AND it may start: max of the
+        # dependency floor (linking end) and its own release.
+        ready_of = {
+            t_id: max(int(group_start_lb.get(t_id, 0)), _release.get(t_id, 0))
+            for t_id in free_scheduled_ids
+        }
+        max_ready = max(ready_of.values(), default=0)
+        for t_id in free_scheduled_ids:
+            r = ready_of[t_id]
+            # Earlier-ready (small r) → larger factor → stranding it costs more.
+            factor = 1 + (max_ready - r) * fifo_span // max(1, max_ready)
+            obj_terms.append((task_vars[t_id]["start"] - r) * (wait_w * factor))
+
+    # ── One-slot-one-machine (HARD) ─────────────────────────────────────────────
+    # machine_w above counts only DISTINCT machines EVER used by the group, so once
+    # a large group lights a 2nd machine for parallelism, spreading any OTHER slot
+    # across that machine too is FREE (used_m already 1).  A single slot whose qty
+    # fits one machine (qty ≤ capacity always — per-slot cap == machine batch cap,
+    # L338) could then split across machines at zero objective cost (observed:
+    # wash_batch_5, 50 qty = cap, split 30/20 over W_WASHING_01+02).
+    #
+    # A SOFT penalty fails exactly here: in a heavily-late group the lateness mass
+    # (~10^8) dwarfs any safe per-slot weight, and the cold solve never reaches
+    # OPTIMAL, so the solver leaves the tie unbroken.  A HARD cap is the right tool:
+    # forbidding the split costs nothing to trade away — a split slot shares one
+    # batch_start so consolidating finishes at the SAME minute (no lateness), and a
+    # slot ≤ cap always fits ONE machine whereas a split needs BOTH machines free in
+    # that window (harder, not easier → never the only feasible option).  Physically
+    # a washing batch runs on a single machine.  Σ_m slot_on_m[k] ≤ 1 per slot.
+    # Skipped only for the disjoint slot-only co-location branch (see above).
+    if slot_machine_cap_ok:
+        for k in range(K):
+            lits = slot_machine_lits.get(k)
+            if lits:
+                model.Add(sum(lits) <= 1)
+
+    task_map = {t["task_id"]: t for t in group_tasks}
+    obj_terms += apply_soft_deadlines(
+        model, task_vars, task_map, horizon, deadline_override=wash_deadline
+    )
+
+    # workload_shrank is detected at the pipeline level (before hint partitioning
+    # drops the removed tasks) and threaded in.  On a shrink (orders removed) the
+    # old absolute starts describe a denser plan; neoing them — hard-keep + soft
+    # |Δ| đối xứng — đóng băng các task còn lại → hở gap đúng chỗ batch đã bị xoá.
+    # Xử lý: GIỮ máy cũ nhưng THẢ start/slot và đổi soft time-penalty sang một
+    # chiều (chỉ phạt dời MUỘN) để solver dồn về đầu.
+
+    # Stability terms kept separate from the production objective so the two-pass
+    # keep solve below can lock the kept layout first, then optimise production.
+    stability_terms: List = []
+    stab_terms, stab_stats = apply_stability_objective(
+        model, task_vars, group_tasks, reschedule_hint, horizon,
+        start_lb=group_start_lb,
+        time_penalty="late_only" if workload_shrank else "abs",
+    )
+    stability_terms += stab_terms
+    if reschedule_hint:
+        logger.info(
+            f"   🎯 Phase3 group={group_key} stability_stats: "
+            f"total_previous={stab_stats.total_previous} matched_exact={stab_stats.matched_exact} "
+            f"matched_via_order={stab_stats.matched_via_order} n_hinted={stab_stats.n_hinted} "
+            f"time_terms={stab_stats.time_terms_added} machine_terms={stab_stats.machine_terms_added}"
+        )
+
+    # ── Conditional hard-keep of the previous batch layout (re-schedule) ─────
+    # The large washing groups do not reach OPTIMAL within budget, so a soft hint
+    # cannot stabilise them — washing start times swing ~1000+ min every re-schedule.
+    # Fix: reconstruct the previous batches (prev tasks grouped by machine+start),
+    # map each to a FIXED slot index (earliest cycle → lowest slot), and HARD-KEEP
+    # each ELIGIBLE task at its previous (slot, machine, start) via
+    # OnlyEnforceIf(keep_lit).  Eligible ⇔ prev_start ≥ start_lb (staying is still
+    # feasible: if upstream/linking hasn't moved, keeping costs nothing; if it moved
+    # later, the task is NOT pinned and can slide).  The two-pass solve below
+    # maximises kept tasks first, so a keep breaks only when genuinely infeasible —
+    # never forcing the group INFEASIBLE.  (Pinning also shrinks the search enough
+    # that the big group reaches OPTIMAL, which is what makes washing converge.)
+    keep_lits: List = []
+    if reschedule_hint:
+        previous = reschedule_hint.get("previous_assignments") or []
+        free_set = set(free_scheduled_ids)
+        # workload_shrank computed above (drives both the soft time-penalty mode
+        # and whether we hard-keep start/slot or only the machine).
+        prev_batches: Dict[Tuple[str, int], List[str]] = {}
+        for p in previous:
+            tid = p.get("task_id")
+            if tid not in free_set:
+                continue  # exact-match only; renamed/new tasks fill remaining slots
+            bkey = (p.get("machine_id", ""), int(p.get("start_time", 0)))
+            prev_batches.setdefault(bkey, []).append(tid)
+        ordered_batches = sorted(prev_batches.items(), key=lambda kv: (kv[0][1], kv[0][0]))
+        w_slot = 2 * batch_w  # soft fallback for matched-but-not-eligible tasks
+        n_soft = 0
+        for slot_idx, ((p_mach, p_start), tids) in enumerate(ordered_batches):
+            if slot_idx >= K:
+                break  # more previous batches than slots — keep the first K
+            if not workload_shrank:
+                # Warm-start the stale layout only when re-solving the same set.
+                # On a shrink these hints would steer the survivors back into the
+                # gapped positions, fighting the compaction we want.
+                model.AddHint(batch_starts[slot_idx], max(0, min(horizon, p_start)))
+            for tid in tids:
+                if tid not in x:
+                    continue
+                tv = task_vars[tid]
+                # Keep-override (Part 3): never re-pin a task to a previous slot
+                # whose start would miss its lead-adjusted deadline.  Releasing it
+                # entirely (no warm-start hint, no hard keep, no soft anchor) lets
+                # it slide to an early slot — the deadline WINS the stability keep,
+                # so a re-schedule can't clamp an urgent order at a stale late slot.
+                if p_start + _dur[tid] > _deadline(tid):
+                    continue
+                if not workload_shrank:
+                    for k in range(K):
+                        model.AddHint(x[tid][k], 1 if k == slot_idx else 0)
+                lb = group_start_lb.get(tid, 0)
+                lits = tv.get("literals") or []
+                r_ids = tv.get("r_ids") or []
+                if p_start >= lb and (p_mach in r_ids) and lits:
+                    kl = model.NewBoolVar(f"wkeep_{group_key}_{tid}")
+                    keep_lits.append(kl)
+                    if not workload_shrank:
+                        # Same-size re-solve: pin the full layout (start + slot).
+                        model.Add(tv["start"] == p_start).OnlyEnforceIf(kl)
+                        model.Add(x[tid][slot_idx] == 1).OnlyEnforceIf(kl)
+                    # Machine is kept in BOTH cases — start/slot are released only
+                    # on a shrink so survivors can re-pack toward the front.
+                    for lit, r_id in zip(lits, r_ids):
+                        if r_id == p_mach:
+                            model.Add(lit == 1).OnlyEnforceIf(kl)
+                    model.AddHint(kl, 1)
+                elif not workload_shrank:
+                    if w_slot > 0:
+                        stability_terms.append((1 - x[tid][slot_idx]) * w_slot)
+                        n_soft += 1
+        if keep_lits or n_soft:
+            logger.info(
+                f"   📌 Group {group_key}: {len(keep_lits)} "
+                f"{'machine-keep (shrink→compact)' if workload_shrank else 'hard-keep'}-eligible, "
+                f"{n_soft} soft-anchored across {min(len(ordered_batches), K)} prev slot(s)"
+            )
+
+    # Pairwise co-location incentive: khi total qty > capacity (không gộp được hết),
+    # vẫn cần ép các cặp vừa vặn vào chung 1 slot thay vì để solver tự quyết.
+    # pair_w = 2 * batch_w → mỗi cặp bị tách tốn gấp đôi chi phí 1 slot active.
+    if actual_free_qty > capacity and len(free_scheduled_ids) >= 2:
+        pair_w = 2 * batch_w
+        ids = free_scheduled_ids
+        n_ids = len(ids)
+        # Guard: bỏ qua nếu số BoolVar sẽ quá lớn (> 8000)
+        if n_ids * (n_ids - 1) // 2 * K <= 8000:
+            for i in range(n_ids):
+                for j in range(i + 1, n_ids):
+                    a, b = ids[i], ids[j]
+                    if task_qtys[a] + task_qtys[b] > capacity:
+                        continue
+                    # same_slot[k] = 1 iff cả a và b cùng ở slot k
+                    same_slots = []
+                    for k in range(K):
+                        s = model.NewBoolVar(f"ss_{i}_{j}_{k}")
+                        model.AddBoolAnd([x[a][k], x[b][k]]).OnlyEnforceIf(s)
+                        model.AddBoolOr([x[a][k].Not(), x[b][k].Not()]).OnlyEnforceIf(s.Not())
+                        same_slots.append(s)
+                    co = model.NewBoolVar(f"co_{i}_{j}")
+                    model.AddMaxEquality(co, same_slots)
+                    # Phạt khi KHÔNG chung slot
+                    obj_terms.append(pair_w - co * pair_w)
+
+    objective_expr = sum(obj_terms + stability_terms) if (obj_terms or stability_terms) else 0
+
+    def _wsolver(full_budget: bool = False) -> cp_model.CpSolver:
+        # Per-group DETERMINISTIC budget.  Cold solves use 1/4 of the global budget
+        # (enough to find a good schedule, keeps the phase tractable when there are
+        # many groups).  The re-schedule keep two-pass uses the FULL budget: pinning
+        # the previous layout shrinks the search so each pass reaches OPTIMAL quickly
+        # once stabilised, but the FIRST re-solve from an external hint needs the
+        # whole budget to converge (a too-small slice left it FEASIBLE/UNKNOWN →
+        # washing drift or a fallback that dropped the group).  No wall-clock cap
+        # (make_solver leaves it +inf) — that would be non-deterministic.
+        s = make_solver(config, has_hint=bool(reschedule_hint))
+        if not full_budget:
+            s.parameters.max_deterministic_time = max(5.0, s.parameters.max_deterministic_time / 4.0)
+        return s
+
+    if keep_lits:
+        # ── Two-pass lexicographic keep (mirrors the knitting phase) ─────────
+        # Pass 1: maximise kept (hard-pinned) tasks = minimise n_broken.  Pass 2:
+        # lock n_broken ≤ d* and minimise the production+stability objective.  Keeps
+        # the previous batch layout for every eligible task that can stay; breaks one
+        # only when infeasible — so washing converges across re-schedules.
+        n_broken = model.NewIntVar(0, len(keep_lits), f"wbroken_{group_key}")
+        model.Add(n_broken == len(keep_lits) - sum(keep_lits))
+        model.Minimize(n_broken)
+        s1 = _wsolver(full_budget=True)
+        p1_status = s1.Solve(model)
+        if p1_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            d_star = int(s1.Value(n_broken))
+            p1_time = s1.WallTime()
+            model.Add(n_broken <= d_star)
+            model.ClearObjective()
+            model.Minimize(objective_expr)
+            s2 = _wsolver(full_budget=True)
+            p2_status = s2.Solve(model)
+            # Pass 2 refines production among max-keep solutions.  If it cannot find
+            # one within budget (UNKNOWN), DON'T discard pass 1 — its solution is
+            # already feasible with the maximum number of kept tasks (the stability
+            # we want).  Falling through to fallback end_times instead would drop the
+            # whole group and destabilise washing far more.
+            if p2_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                solver, status_code = s2, p2_status
+            else:
+                solver, status_code = s1, p1_status
+            logger.info(
+                f"   🔒 Group {group_key} keep two-pass: kept "
+                f"{len(keep_lits) - d_star}/{len(keep_lits)} (broken={d_star}, "
+                f"pass1={p1_time:.1f}s {s1.StatusName(p1_status)}) → "
+                f"pass2 {s2.StatusName(p2_status)}/{s2.WallTime():.1f}s"
+                f"{' [used pass1]' if solver is s1 else ''}"
+            )
+        else:
+            # Pass 1 could not satisfy the model — drop the keep objective so the
+            # group still returns a schedule.
+            model.ClearObjective()
+            model.Minimize(objective_expr)
+            solver = _wsolver()
+            status_code = solver.Solve(model)
+    else:
+        model.Minimize(objective_expr)
+        solver = _wsolver()
+        status_code = solver.Solve(model)
+    logger.info(
+        f"   Group {group_key}: status={solver.StatusName(status_code)}, "
+        f"time={solver.WallTime():.1f}s"
+    )
+
+    status_str, assignments, overloads, start_times, end_times = extract_results(
+        solver, status_code, task_vars, group_tasks, wash_x=x
+    )
+
+    if status_str != "feasible":
+        end_times = _fallback_end_times(group_tasks, group_start_lb)
+        logger.warning(
+            f"   ⚠️ Group {group_key}: solver {status_str} — "
+            f"using fallback end_times (start_lb + duration) for {len(end_times)} tasks"
+        )
+
+    # ── Post-process: enforce same end_time within each batch slot ───────────
+    # Replace individual task end_times (start + duration) with the batch cycle
+    # end (max end in slot) so Phase 4 start_lb uses the correct wash-out time.
+    #
+    # NOTE: derive the cycle end from the actual member END VARS, NOT from the
+    # batch_ends[k] helper var.  batch_ends[k] is only LOWER-bounded (bend ≥ each
+    # member end); the solver is expected to squeeze it to the true max via
+    # makespan minimisation, but a batch that is not on the critical path has no
+    # such pressure → the solver may leave batch_ends[k] slack ABOVE the true max.
+    # Reading that slack stamped a phantom-inflated end on every member (observed:
+    # a 11-min wash reported as 164 min, dragging its ironing start 153 min late).
+    # max(member ends) is always the exact cycle-out time and is monotone-safe
+    # (end can only drop → Phase-4 release relaxes → lateness non-increasing).
+    if status_str == "feasible":
+        for k in range(K):
+            if not solver.Value(batch_active[k]):
+                continue
+            members = [
+                t_id for t_id in free_scheduled_ids
+                if solver.Value(x[t_id][k]) == 1
+            ]
+            if not members:
+                continue
+            batch_end_val = max(solver.Value(task_vars[t_id]["end"]) for t_id in members)
+            for t_id in members:
+                end_times[t_id] = batch_end_val
+        # Propagate corrected end_times into the assignments list
+        et_map = {a["task_id"]: a for a in assignments}
+        for t_id, et in end_times.items():
+            if t_id in et_map:
+                a = et_map[t_id]
+                a["end_time"] = et
+                due = task_vars.get(t_id, {}).get("due", et + 1)
+                a["status"] = "LATE" if et > due else "ON_TIME"
+
+    batches: List[BatchInfo] = []
+    if status_str == "feasible":
+        slot_tasks: Dict[int, List[str]] = {}
+        for t_id in free_scheduled_ids:
+            for k in range(K):
+                if solver.Value(x[t_id][k]) == 1:
+                    slot_tasks.setdefault(k, []).append(t_id)
+                    break
+
+        for k, slot_task_ids in slot_tasks.items():
+            b_start = solver.Value(batch_starts[k])
+            # Same slack correction as the end_time post-pass above: the true cycle
+            # end is the max member end, not the (possibly slack) batch_ends[k].
+            b_end = max(
+                (end_times[t_id] for t_id in slot_task_ids if t_id in end_times),
+                default=solver.Value(batch_ends[k]),
+            )
+            batches.append(BatchInfo(
+                batch_id=f"wash_batch_{'_'.join(str(g) for g in group_key)}_{k}",
+                task_ids=slot_task_ids,
+                start_time=b_start,
+                end_time=b_end,
+            ))
+
+    return {
+        "assignments": assignments,
+        "overloads": overloads,
+        "batches": batches,
+        "end_times": end_times,
+        "solve_time": solver.WallTime(),
+    }
+
+
+def _solve_group_chunked(
+    group_key: Tuple[str, str],
+    pinned_tasks: List[Dict[str, Any]],
+    free_tasks: List[Dict[str, Any]],
+    resources: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    horizon: int,
+    capacity: int,
+    start_lb: Dict[str, int],
+    shift_ends: List[int],
+    workload_shrank: bool = False,
+    wash_deadline: Optional[Dict[str, int]] = None,
+    reserved_windows: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Solve a large group by splitting free tasks into time-sorted chunks and
+    running a separate CP-SAT model per chunk.
+
+    Machine handoff: each chunk's assignments are converted to virtual pinned
+    tasks and passed to the next chunk.  build_resource_model treats them as
+    fixed intervals in AddCumulative, blocking exactly the capacity they used
+    without over-constraining batch machines.
+
+    Why virtual pinned (not unavailability windows):
+      unavailability adds demand=full_capacity, which over-blocks machines that
+      still have free slots.  Virtual pinned tasks add demand=actual_qty so
+      remaining capacity stays available to the next chunk.
+    """
+    free_sorted = sorted(free_tasks, key=lambda t: start_lb.get(t["task_id"], 0))
+    chunk_size = max(10, int(math.sqrt(_BOOLVAR_BUDGET * capacity)))
+    chunks = [free_sorted[i:i + chunk_size] for i in range(0, len(free_sorted), chunk_size)]
+
+    logger.info(
+        f"   💪 Group {group_key}: {len(free_tasks)} free tasks → "
+        f"{len(chunks)} chunks × ≤{chunk_size} tasks "
+        f"(budget={_BOOLVAR_BUDGET:,} BoolVars/chunk)"
+    )
+
+    virtual_pinned: List[Dict[str, Any]] = []
+    all_assignments: List[Dict[str, Any]] = []
+    all_end_times: Dict[str, int] = {}
+    all_batches: List[BatchInfo] = []
+    total_solve_time = 0.0
+
+    for chunk_idx, chunk_free in enumerate(chunks):
+        chunk_tasks = pinned_tasks + virtual_pinned + chunk_free
+        logger.info(
+            f"   ▶ Chunk {chunk_idx + 1}/{len(chunks)}: "
+            f"{len(chunk_free)} free + {len(pinned_tasks)} pinned + {len(virtual_pinned)} virtual"
+        )
+
+        result = _solve_group(
+            group_key=group_key,
+            group_tasks=chunk_tasks,
+            resources=resources,
+            config=config,
+            horizon=horizon,
+            capacity=capacity,
+            start_lb=start_lb,
+            shift_ends=shift_ends,
+            _chunked=True,
+            workload_shrank=workload_shrank,
+            wash_deadline=wash_deadline,
+            reserved_windows=reserved_windows,
+        )
+
+        # Filter virtual pinned tasks out of results before aggregating
+        real_asgn = [a for a in result["assignments"] if not a["task_id"].startswith("__vp_")]
+        all_assignments.extend(real_asgn)
+        all_end_times.update({
+            t_id: et for t_id, et in result["end_times"].items()
+            if not t_id.startswith("__vp_")
+        })
+        all_batches.extend(result["batches"])
+        total_solve_time += result["solve_time"]
+
+        # Machine handoff: add this chunk's assignments as virtual pinned tasks
+        for asgn in real_asgn:
+            virtual_pinned.append(_make_virtual_pinned_task(asgn))
+
+    return {
+        "assignments": all_assignments,
+        "overloads": [],
+        "batches": all_batches,
+        "end_times": all_end_times,
+        "solve_time": total_solve_time,
+    }
+
+
+def _make_virtual_pinned_task(asgn: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert a chunk assignment to a virtual pinned task for machine handoff.
+
+    The virtual task registers a fixed interval on the assigned machine so
+    AddCumulative in the next chunk's model accounts for the capacity already
+    consumed.  It carries the actual qty (not full capacity) so remaining
+    batch capacity on that machine stays usable.
+    """
+    start = asgn["start_time"]
+    end   = asgn["end_time"]
+    m_id  = asgn["machine_id"]
+    return {
+        "task_id":               f"__vp_{asgn['task_id']}",
+        "operation":             "washing",
+        "is_pinned":             True,
+        "pinned_machine_id":     m_id,
+        "pinned_start_time":     start,
+        "pinned_end_time":       end,
+        "compatible_resource_ids": [m_id],
+        "qty":                   asgn.get("quantity", 1),
+        "duration":              max(0, end - start),
+        "due_at_min":            999_999,
+        "start_after_min":       0,
+        "final_depends_on":      [],
+        "color":                 "",
+        "substance":             "",
+        "group_id":              "",
+        "original_order_id":     "",
+        "is_slice":              False,
+        "is_batch":              False,
+        "sub_tasks":             None,
+        "demand":                1,
+        "material_demands":      {},
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _extract_pinned_result(
+    group_tasks: List[Dict[str, Any]],
+    group_key: Tuple[str, str],
+) -> Dict[str, Any]:
+    """
+    Bypass CP-SAT entirely for groups where every task is already pinned.
+    Pinned tasks have known start_time, end_time, and machine_id — there is
+    nothing for the solver to decide.  Constructing the result dict directly
+    is O(n) and takes microseconds vs. milliseconds for model build + solve.
+    Virtual pinned tasks (__vp_*) from machine handoff are excluded from output.
+    """
+    assignments = []
+    end_times: Dict[str, int] = {}
+
+    for t in group_tasks:
+        t_id = t["task_id"]
+        ps = t.get("pinned_start_time")
+        pe = t.get("pinned_end_time")
+        m_id = t.get("pinned_machine_id") or (
+            (t.get("compatible_resource_ids") or [None])[0]
+        )
+
+        if ps is None or pe is None or m_id is None:
+            logger.warning(f"   ⚠️ Pinned task {t_id} missing times/machine — skipped")
+            continue
+
+        start_val = int(ps)
+        end_val = int(pe)
+        due = int(t.get("due_at_min", end_val + 1))
+        end_times[t_id] = end_val
+
+        if t_id.startswith("__vp_"):
+            continue  # virtual handoff task — not part of real output
+
+        assignments.append({
+            "task_id":   t_id,
+            "machine_id": m_id,
+            "start_time": start_val,
+            "end_time":   end_val,
+            "group_id":  t.get("group_id", ""),
+            "order_id":  t.get("original_order_id", ""),
+            "quantity":  t.get("qty", 0),
+            "status":    "LATE" if end_val > due else "ON_TIME",
+            "batch_slot_id": "",
+        })
+
+    logger.info(
+        f"   ✅ Group {group_key}: {len(assignments)} pinned assignments extracted directly"
+    )
+    return {
+        "assignments": assignments,
+        "overloads": [],
+        "batches": [],
+        "end_times": end_times,
+        "solve_time": 0.0,
+    }
+
+
+def _fallback_end_times(
+    tasks: List[Dict[str, Any]],
+    start_lb: Dict[str, int],
+) -> Dict[str, int]:
+    """
+    Conservative end_times when the solver is infeasible or times out.
+    Computes end = max(start_lb, start_after_min) + duration for each task
+    so Phase 4 downstream tasks don't start at T=0.
+    Pinned tasks use their pinned_end_time directly.
+    """
+    result: Dict[str, int] = {}
+    for t in tasks:
+        t_id = t["task_id"]
+        if t.get("is_pinned") and t.get("pinned_end_time") is not None:
+            result[t_id] = int(t["pinned_end_time"])
+        else:
+            lb = max(start_lb.get(t_id, 0), int(t.get("start_after_min", 0)))
+            duration = max(0, int(t.get("duration", 0)))
+            result[t_id] = lb + duration
+    return result
+
+
+def _compute_downstream_lead(all_tasks: List[Dict[str, Any]]) -> Dict[str, int]:
+    """
+    lead[t] = the longest total duration that must still run AFTER task t finishes,
+    following the final_depends_on dependency graph downstream (i.e. iron + pack
+    for a washing task).  Washing is mid-pipeline, so the order's true latest
+    washing-completion is due_at_min − lead[t], not due_at_min.
+
+    Implementation: build the reversed graph (dependency → dependents), then
+    lead[t] = max over direct dependents c of tail(c), where
+    tail(c) = duration(c) + max(tail of c's dependents, 0)   (longest path, not sum).
+    Deterministic (pure arithmetic over the task list); cycle-safe via a recursion
+    stack guard.  A task with no downstream work has lead 0.
+    """
+    by_id = {t["task_id"]: t for t in all_tasks}
+    children: Dict[str, List[str]] = {}
+    for t in all_tasks:
+        for dep in (t.get("final_depends_on") or []):
+            children.setdefault(dep, []).append(t["task_id"])
+
+    tail_memo: Dict[str, int] = {}
+
+    def tail(tid: str, stack: set) -> int:
+        if tid in tail_memo:
+            return tail_memo[tid]
+        if tid in stack:
+            return 0  # cycle guard (graph is expected to be a DAG)
+        stack.add(tid)
+        dur = max(0, int(by_id.get(tid, {}).get("duration", 0)))
+        best_child = 0
+        for c in children.get(tid, []):
+            best_child = max(best_child, tail(c, stack))
+        stack.discard(tid)
+        val = dur + best_child
+        tail_memo[tid] = val
+        return val
+
+    lead: Dict[str, int] = {}
+    for t in all_tasks:
+        tid = t["task_id"]
+        best = 0
+        for c in children.get(tid, []):
+            best = max(best, tail(c, set()))
+        lead[tid] = best
+    return lead
+
+
+def _compute_start_lb(
+    tasks: List[Dict[str, Any]],
+    p2_end_times: Dict[str, int],
+) -> Dict[str, int]:
+    """
+    Set start_lb[task_id] = max Phase 2 end time across its final_depends_on.
+    """
+    lb: Dict[str, int] = {}
+    for t in tasks:
+        t_id = t["task_id"]
+        current_lb = 0
+        for dep_id in (t.get("final_depends_on") or []):
+            if dep_id in p2_end_times:
+                current_lb = max(current_lb, p2_end_times[dep_id])
+        if current_lb > 0:
+            lb[t_id] = current_lb
+    return lb
+
+
+# ---------------------------------------------------------------------------
+# End-of-shift washing flush (COLD-only deterministic post-pass)
+# ---------------------------------------------------------------------------
+def flush_unwashed_end_of_shift(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    shift_ends: List[int],
+    dep_ends: Optional[Dict[str, int]] = None,
+) -> int:
+    """COLD-only: any washing task that became ready (linking done) before a shift
+    boundary but is scheduled to START in a LATER shift is pulled into a flush batch
+    that ENDS exactly at that boundary T (start = T − duration), so the goods wash
+    before the break instead of sitting overnight ("cứ cuối ca là đem đi giặt, không
+    vắt qua giờ nghỉ").  Mutates the washing `assignments` in place; returns #moved.
+
+    Run it BEFORE phase 4 (downstream then schedules a SINGLE solve against the
+    pulled-forward washing ends — no re-solve needed because flush ONLY moves washing
+    EARLIER, so every iron/packing release bound only RELAXES; the phase 4–5 feasible
+    region is a superset → its optimum cannot get worse).  `dep_ends` supplies the
+    dependency end-times for the ready computation (P1+P2 ends when called mid-pipeline,
+    before iron/packing exist); when None, ready is read from `assignments` (the
+    standalone final-output post-pass form, used by the unit tests).
+
+    Guarantees:
+      * new end = T ≤ old start ⇒ washing only moves earlier (linking dep satisfied:
+        start = T−dur ≥ each member's ready);
+      * the flush batch is placed only where the chosen machine's window [T−dur, T] is
+        FREE of every existing washing interval (machine no-overlap preserved);
+      * [T−dur, T] lies wholly inside the ready-shift (T−dur ≥ the previous boundary),
+        so it never straddles a break.
+
+    Batches respect washing_batch_capacity and (color, substance) compatibility.
+    Pinned washing tasks are immovable.  Deterministic.
+    """
+    if not shift_ends:
+        return 0
+    bounds = sorted({int(s) for s in shift_ends})
+    cap = max(1, int(config.get("washing_batch_capacity", 10)))
+    info = {t["task_id"]: t for t in all_tasks}
+    end_of = dict(dep_ends) if dep_ends is not None else {
+        a["task_id"]: int(a["end_time"]) for a in assignments
+    }
+
+    wash_assigns = {
+        a["task_id"]: a for a in assignments
+        if (info.get(a["task_id"]) or {}).get("operation", "").lower() == "washing"
+    }
+    if not wash_assigns:
+        return 0
+
+    # Machine occupancy = every existing washing interval (conservative: vacated space
+    # is NOT reclaimed, so we can never create an overlap with a batch we partly empty).
+    machine_busy: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    for a in wash_assigns.values():
+        machine_busy[a["machine_id"]].append((int(a["start_time"]), int(a["end_time"])))
+
+    def _prev_bound(T: int) -> int:
+        p = 0
+        for b in bounds:
+            if b < T:
+                p = b
+            else:
+                break
+        return p
+
+    def _free(machine: str, s: int, e: int) -> bool:
+        for (bs, be) in machine_busy.get(machine, ()):
+            if overlaps(s, e, bs, be):
+                return False
+        return True
+
+    # ── Collect flush candidates ──────────────────────────────────────────────
+    # candidate ⇔ ready < its-ready-shift-end T  AND  current start ≥ T (spilled into a
+    # later shift)  AND  the task can still finish by T (ready ≤ T−dur, T−dur ≥ prevT).
+    # Grouped by (T, color, substance) so a flush batch is one cycle in one shift.
+    groups: Dict[Tuple[int, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    ready_of: Dict[str, int] = {}
+    for tid, a in wash_assigns.items():
+        t = info[tid]
+        if t.get("is_pinned"):
+            continue
+        # Quirk giữ nguyên: ready washing bỏ qua start_after_min (như bản gốc).
+        ready = release_from_deps(t, end_of, include_start_after=False)
+        T = next((b for b in bounds if b > ready), None)
+        if T is None:
+            continue
+        start = int(a["start_time"])
+        dur = int(a["end_time"]) - start
+        if start < T:
+            continue  # already washed within its ready-shift
+        if T - dur < ready or T - dur < _prev_bound(T):
+            continue  # cannot finish by T without straddling the break / before ready
+        ready_of[tid] = ready
+        groups[(T, t.get("color", ""), t.get("substance", ""))].append(a)
+
+    if not groups:
+        return 0
+
+    moved = 0
+    # Deterministic order: ascending boundary, then color/substance.
+    for (T, _color, _subs) in sorted(groups):
+        members = sorted(
+            groups[(T, _color, _subs)],
+            key=lambda a: (
+                max((end_of[d] for d in (info[a["task_id"]].get("final_depends_on") or [])
+                     if d in end_of), default=0),
+                a["task_id"],
+            ),
+        )
+        prevT = _prev_bound(T)
+        # Greedily pack members into ≤cap batches; each batch shares one machine + cycle.
+        i = 0
+        while i < len(members):
+            batch: List[Dict[str, Any]] = []
+            qty = 0.0
+            common: Optional[set] = None
+            j = i
+            while j < len(members):
+                a = members[j]
+                t = info[a["task_id"]]
+                q = float(a.get("quantity", t.get("qty", 0)) or 0)
+                rids = set(t.get("compatible_resource_ids") or [])
+                nxt_common = rids if common is None else (common & rids)
+                if batch and (qty + q > cap or not nxt_common):
+                    break  # close this batch; member j starts the next
+                batch.append(a)
+                qty += q
+                common = nxt_common
+                j += 1
+            i = j
+
+            # Cycle runs until the LONGEST member finishes → window = [T−maxdur, T].
+            dur = max(int(a["end_time"]) - int(a["start_time"]) for a in batch)
+            s = T - dur
+            # Never start before the shift's previous break, nor before any member's
+            # ready time (a shorter member must not be pulled ahead of its linking end).
+            if s < prevT or not common or s < max(ready_of[a["task_id"]] for a in batch):
+                continue
+            machine = next((m for m in sorted(common) if _free(m, s, T)), None)
+            if machine is None:
+                continue  # no compatible machine free in [T−dur, T] — leave them
+            slot = f"flush_{T}"
+            for a in batch:
+                tid = a["task_id"]
+                due = int(info[tid].get("due_at_min", T + 1) or (T + 1))
+                a["start_time"] = s
+                a["end_time"] = T
+                a["machine_id"] = machine
+                a["status"] = "LATE" if T > due else "ON_TIME"
+                a["batch_slot_id"] = slot
+                end_of[tid] = T
+                moved += 1
+            machine_busy[machine].append((s, T))
+
+    if moved:
+        logger.info(
+            f"   🚿 End-of-shift washing flush: pulled {moved} task(s) into pre-break "
+            f"batches (finish by shift boundary; downstream untouched)."
+        )
+    return moved
+
+
+def left_shift_cold_washing(
+    assignments: List[Dict[str, Any]],
+    all_tasks: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    shift_ends: List[int],
+    dep_ends: Optional[Dict[str, int]] = None,
+    merge_only: bool = False,
+) -> int:
+    """COLD-only: pull washing goods that became ready early but got bundled into a
+    LATER batch into the earliest boundary-safe free wash slot.
+
+    `merge_only=True` runs ONLY the consolidation-positive merge pass (fold a task into
+    an earlier same-machine cycle with spare capacity) and skips the free-window PEEL.
+    Used on the double-solve stabilize pass: its linking is left-shifted tighter than
+    pass-1's, so reused pass-1 washing gains new fold opportunities ("lần giặt sau còn
+    chỗ mà không nhét thêm vào"), but the peel there would shatter full-batch
+    consolidation — merge can only make existing cycles FULLER and starts EARLIER.
+
+    The washing solver minimises batch count + machines used (consolidation) and only
+    weakly rewards early starts, so with loose due dates it co-batches an early-ready
+    slice with a much-later-ready one from another order: the batch is gated by its
+    latest-ready member and the early goods sit unwashed while the (often single
+    compatible) machine stays idle ("đã linking xong nhưng cuối ngày không được gom đi
+    giặt").  The end-of-shift flush only targets the slot that ENDS exactly at a shift
+    boundary, so it cannot help when that pre-break window is occupied — yet the machine
+    may be free right AFTER the break.
+
+    This post-pass peels the early-ready members out of each cycle and re-seats them in
+    the earliest [s', s'+dur] window that is (a) ≥ their ready time, (b) free on a
+    compatible machine, (c) wholly inside one shift (never straddles a break), and
+    (d) STRICTLY earlier than the cycle's current start.  Capacity (washing_batch_
+    capacity) and (color, substance) compatibility are respected; a peeled sub-batch
+    forms its own cycle while the late members stay put.
+
+    Safety: every moved task gets new_end = s' + own_dur < its old end (s' < old start),
+    so washing only moves EARLIER ⇒ every iron/packing release bound only relaxes ⇒
+    downstream stays valid and end-to-end lateness is monotone non-increasing.  Run it
+    BEFORE phase 4 (after the flush) so ironing/packing solve on the earlier ends.
+    Pinned washing tasks are immovable anchors.  Deterministic.  Returns #tasks moved.
+    """
+    cap = max(1, int(config.get("washing_batch_capacity", 10)))
+    bounds = sorted({int(s) for s in shift_ends})
+    info = {t["task_id"]: t for t in all_tasks}
+    end_of = dict(dep_ends) if dep_ends is not None else {
+        a["task_id"]: int(a["end_time"]) for a in assignments
+    }
+
+    wash_assigns = [
+        a for a in assignments
+        if (info.get(a["task_id"]) or {}).get("operation", "").lower() == "washing"
+    ]
+    if not wash_assigns:
+        return 0
+
+    ready_of: Dict[str, int] = {}
+    for a in wash_assigns:
+        # Quirk giữ nguyên: ready washing bỏ qua start_after_min (như bản gốc).
+        ready_of[a["task_id"]] = release_from_deps(
+            info[a["task_id"]], end_of, include_start_after=False,
+        )
+
+    def _qty(a: Dict[str, Any]) -> float:
+        return float(a.get("quantity", info[a["task_id"]].get("qty", 0)) or 0)
+
+    def _grp(a: Dict[str, Any]) -> Tuple[str, str]:
+        t = info[a["task_id"]]
+        return (t.get("color", ""), t.get("substance", ""))
+
+    moved = 0
+
+    # ── Merge pass: fold a washing task into an EARLIER cycle on the SAME machine and
+    # (color, substance) group that still has spare capacity and starts no earlier than
+    # the task's ready time.  The solver sometimes leaves an under-filled trailing cycle
+    # — e.g. a 4-slice batch + a lone 1-slice batch that together fit one 5-slice load —
+    # wasting a whole wash run even though every slice was ready in time.  Merging removes
+    # the extra run and only moves the task EARLIER (target start < its own start ⇒ end
+    # strictly earlier).  Same machine only (never spreads → consolidation preserved);
+    # pinned cycles are neither source nor target.
+    def _cycle_view() -> Dict[Tuple[str, int, int], List[Dict[str, Any]]]:
+        cv: Dict[Tuple[str, int, int], List[Dict[str, Any]]] = defaultdict(list)
+        for a in wash_assigns:
+            cv[(a["machine_id"], int(a["start_time"]), int(a["end_time"]))].append(a)
+        return cv
+
+    cv = _cycle_view()
+    pinned_cycle = {
+        key for key, mem in cv.items()
+        if any(info[a["task_id"]].get("is_pinned") for a in mem)
+    }
+    # Drain trailing (latest-start) cycles into earlier ones first; deterministic.
+    for key in sorted(cv, key=lambda c: (-c[1], c[0])):
+        if key in pinned_cycle:
+            continue
+        for a in sorted(list(cv[key]), key=lambda x: (ready_of[x["task_id"]], x["task_id"])):
+            own_dur = int(a["end_time"]) - int(a["start_time"])
+            rdy = ready_of[a["task_id"]]
+            grp = _grp(a)
+            target = None
+            for tkey in sorted(cv, key=lambda c: c[1]):  # earliest compatible target first
+                if tkey == key or tkey in pinned_cycle or not cv[tkey]:
+                    continue
+                m_t, s_t, e_t = tkey
+                if m_t != a["machine_id"] or s_t >= int(a["start_time"]):
+                    continue                       # must be an earlier cycle on this machine
+                if s_t < rdy or own_dur > (e_t - s_t):
+                    continue                       # not ready by then / wouldn't fit the window
+                if _grp(cv[tkey][0]) != grp:
+                    continue                       # different wash group
+                if sum(_qty(x) for x in cv[tkey]) + _qty(a) > cap:
+                    continue                       # no spare capacity
+                target = tkey
+                break
+            if target is None:
+                continue
+            m_t, s_t, e_t = target
+            due = int(info[a["task_id"]].get("due_at_min", s_t + own_dur + 1)
+                      or (s_t + own_dur + 1))
+            cv[key].remove(a)
+            a["machine_id"] = m_t
+            a["start_time"] = s_t
+            a["end_time"] = s_t + own_dur
+            a["status"] = "LATE" if a["end_time"] > due else "ON_TIME"
+            a["batch_slot_id"] = cv[target][0].get("batch_slot_id", a.get("batch_slot_id", ""))
+            end_of[a["task_id"]] = a["end_time"]
+            cv[target].append(a)
+            moved += 1
+
+    if merge_only:
+        if moved:
+            logger.info(
+                f"   🧺 Washing merge-only: folded {moved} ready task(s) into earlier "
+                f"under-filled cycles (no new cycles — consolidation preserved)."
+            )
+        return moved
+
+    # Machine occupancy = every existing washing CYCLE (a batch = one shared interval).
+    # Conservative: a vacated cycle slot is NOT reclaimed, so we can never overlap a
+    # batch we partly empty.
+    cycles: Dict[Tuple[str, int, int], List[Dict[str, Any]]] = defaultdict(list)
+    for a in wash_assigns:
+        cycles[(a["machine_id"], int(a["start_time"]), int(a["end_time"]))].append(a)
+    machine_busy: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    for (m, s, e) in cycles:
+        machine_busy[m].append((s, e))
+
+    def _straddles(s: int, e: int) -> bool:
+        return any(s < b < e for b in bounds)
+
+    def _earliest(m: str, release: int, dur: int, limit: int) -> Optional[int]:
+        """Earliest s ≥ release with [s, s+dur] free, boundary-safe, and s < limit."""
+        return earliest_candidates(
+            list(machine_busy.get(m, ())), release, dur,
+            extra_candidates=bounds,  # start exactly at a break → next shift
+            limit=limit,
+            accept=lambda s, e: not _straddles(s, e),
+        )
+
+    # Free-window pass: rescue tasks still stranded after the merge pass (no earlier
+    # cycle had room / matching group) by pulling them into an earlier idle gap.
+    # Process cycles earliest-start first; deterministic by (start, machine).
+    for (m0, s0, e0) in sorted(cycles, key=lambda c: (c[1], c[0])):
+        members = cycles[(m0, s0, e0)]
+        if any(info[a["task_id"]].get("is_pinned") for a in members):
+            continue
+        pool = sorted(members, key=lambda a: (ready_of[a["task_id"]], a["task_id"]))
+
+        # Repeatedly extract an early-ready sub-batch (≤ cap) that can reach a strictly
+        # earlier boundary-safe free slot.  Peel the highest-ready member when the whole
+        # candidate set has no earlier slot, so a late member never blocks early goods.
+        progress = True
+        while pool and progress:
+            progress = False
+            sub = list(pool)
+            # Capacity: drop highest-ready members until the cycle fits one wash load.
+            while sub and sum(
+                float(a.get("quantity", info[a["task_id"]].get("qty", 0)) or 0) for a in sub
+            ) > cap:
+                sub.pop()
+            while sub:
+                release = max(ready_of[a["task_id"]] for a in sub)
+                dur = max(int(a["end_time"]) - int(a["start_time"]) for a in sub)
+                # SAME machine only: fill an earlier idle gap on the cycle's own machine.
+                # Re-seating onto a DIFFERENT idle machine would undo the solver's
+                # deliberate machine consolidation (fewer machines is an objective), so we
+                # never spread — we only reclaim idle time the machine already has.
+                best_s = _earliest(m0, release, dur, limit=s0)
+                if best_s is not None:
+                    slot = f"pull_{best_s}"
+                    for a in sub:
+                        tid = a["task_id"]
+                        own_dur = int(a["end_time"]) - int(a["start_time"])
+                        due = int(info[tid].get("due_at_min", best_s + own_dur + 1)
+                                  or (best_s + own_dur + 1))
+                        a["start_time"] = best_s
+                        a["end_time"] = best_s + own_dur
+                        a["status"] = "LATE" if a["end_time"] > due else "ON_TIME"
+                        a["batch_slot_id"] = slot
+                        end_of[tid] = a["end_time"]
+                        moved += 1
+                    machine_busy[m0].append((best_s, best_s + dur))
+                    for a in sub:
+                        pool.remove(a)
+                    progress = True
+                    break
+                sub.pop()  # peel highest-ready member; retry with an earlier subset
+
+    if moved:
+        logger.info(
+            f"   ⬅️ Cold washing left-shift: pulled {moved} ready task(s) to earlier "
+            f"free wash slots (machine was idle; downstream untouched)."
+        )
+    return moved

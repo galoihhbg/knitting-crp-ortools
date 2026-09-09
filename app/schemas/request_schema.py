@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 
 
+
 class TimeWindow(BaseModel):
     start: int
     end: int
@@ -18,57 +19,82 @@ class SolverResource(BaseModel):
     available_at_min: Optional[int] = 0
 
 
-class MachineRoute(BaseModel):
-    operation: str
-    design_item_id: str
-    duration: float
-    setup_time: float = 0.0
-
-
 class Machine(BaseModel):
     id: str
-    capacity: Optional[int] = None
-    type: Optional[str] = None
-    worker_req: int = 1
-    routing: List[MachineRoute]
     design_item_id: str
     color_config: str
+
+
+class YarnConsumption(BaseModel):
+    """Sợi tiêu thụ cho một task (chuẩn bị cho post-pass dyelot — chưa tiêu thụ).
+
+    is_main: True = sợi chính (được cấp dyelot); False = sợi phụ (không cấp dyelot).
+    Default True để tương thích payload cũ chưa có cờ — khi đó mọi entry là sợi chính.
+    """
+    vi: str
+    kg: float
+    # slots = số creel position (cone) task lắp cho vi (Go MinSlots). Dùng cho
+    # creel-up gross trong dyelot allocator; 0/absent = payload cũ → bỏ creel-up.
+    slots: int = 0
+    is_main: bool = True
 
 
 class SolverTask(BaseModel):
     task_id: str = Field(alias="task_id")
     original_order_id: str = Field(alias="original_order_id")
     group_id: str = Field(alias="group_id")
-    operation: str = Field(alias="operation")
+    # ITEM (sản phẩm ghép) mà task này thuộc về — khóa gom DYELOT: mọi batch/panel
+    # CÙNG order_group_id PHẢI dùng chung 1 dyelot per VI (tránh lệch màu khi ghép
+    # thành 1 sản phẩm).  Một item có thể bị rolling-wave tách thành nhiều batch
+    # (vd BATCH_0-665 + BATCH_0-666 cùng item "W9xTMuuLxR-1-200-200").  MỨC ITEM,
+    # KHÔNG phải mức đơn khách: các item khác nhau trong cùng một đơn được phép khác
+    # dyelot.  Để trống "" khi payload cũ chưa gửi — dyelot gom theo original_order_id.
+    order_group_id: str = Field(default="", alias="order_group_id")
+    # ĐƠN KHÁCH (sales order) mà task này thuộc về — khóa gom CO-COMPLETION: tất cả
+    # item của một đơn phải knit cùng wave & xong gần cùng lúc để ship được (đơn chỉ
+    # ship khi MỌI item xong).  Coarser hơn order_group_id (một ship_group_id gom
+    # nhiều order_group_id/item).  CHỈ ảnh hưởng sequencing/objective knitting —
+    # KHÔNG đụng dyelot.  Để trống "" → knitting gom theo original_order_id như cũ.
+    ship_group_id: str = Field(default="", alias="ship_group_id")
+    operation: str = Field(
+        alias="operation",
+        description=(
+            "Solver operation, including capacity_block for knitting workforce "
+            "windows and capacity_block_linking for linking workforce windows."
+        ),
+    )
     qty: float = Field(alias="qty")
     total_qty: float = Field(alias="total_qty")
     priority: int = Field(alias="priority")
-    original_depends_on: List[str] = Field(default=[], alias="original_depends_on")
+    # Đơn "thường" (normal): vẫn nhắm dueDate (giữ phạt lateness nhẹ) nhưng KHÔNG bị
+    # check khắt khe — bỏ phạt đếm số-đơn-trễ (is_late) trong objective và KHÔNG báo
+    # cáo task này vào danh sách overloads dù end > due.  Đơn gấp (is_normal=False)
+    # giữ nguyên hành vi cũ.  Default False để tương thích payload cũ chưa gửi cờ.
+    is_normal: bool = Field(default=False, alias="is_normal")
     final_depends_on: List[str] = Field(default=[], alias="final_depends_on")
     start_after_min: int = Field(default=0, alias="start_after_min")
     due_at_min: int = Field(default=0, alias="due_at_min")
     duration: int = Field(alias="duration")
-    is_slice: bool = Field(default=False, alias="is_slice")
-    parent_task_id: str = Field(default="", alias="parent_task_id")
-    internal_dep: str = Field(default="", alias="internal_dep")
-    slice_index: int = Field(default=0, alias="slice_index")
     is_batch: bool = Field(default=False, alias="is_batch")
     sub_tasks: Optional[List["SolverTask"]] = Field(default=None, alias="sub_tasks")
     design_item_id: str = Field(alias="design_item_id")
     color_config: str = Field(alias="color_config")
+    color: str = Field(default="", alias="color")
+    substance: str = Field(default="", alias="substance")
     compatible_resource_ids: List[str] = Field(default=[], alias="compatible_resource_ids")
-    sub_task_completion_offsets: Optional[Dict[str, int]] = Field(
-        default=None, alias="sub_task_completion_offsets"
-    )
-    # wait_for_batch_task_id: Optional[str] = Field(default=None, alias="wait_for_batch_task_id")
-    # wait_for_offset: Optional[int] = Field(default=None, alias="wait_for_offset")
     wait_offsets: Optional[Dict[str, int]] = Field(default=None, alias="WaitOffsets")
+
+    is_slice: bool = Field(default=False, alias="is_slice")
+    slice_index: int = Field(default=0, alias="SliceIndex")
+    parent_task_id: str = Field(default="", alias="parent_task_id")
 
     is_pinned: bool = Field(default=False, alias="is_pinned")
     pinned_machine_id: Optional[str] = Field(default=None, alias="pinned_machine_id")
     pinned_start_time: Optional[int] = Field(default=None, alias="pinned_start_time")
     pinned_end_time: Optional[int] = Field(default=None, alias="pinned_end_time")
     demand: int = Field(default=1, alias="demand")
+    material_demands: Dict[str, int] = Field(default_factory=dict, alias="material_demands")
+    main_yarn_consumption: List[YarnConsumption] = Field(default_factory=list)
 
     class Config:
         populate_by_name = True
@@ -77,10 +103,313 @@ class SolverTask(BaseModel):
 class SolverConfig(BaseModel):
     horizon_minutes: int = 57600
     max_search_time: int = 300
-    setup_time_minutes: int = 60
     max_factory_machines: int = 40
     random_seed: int = 42       # Fixed seed for deterministic output across runs
     num_search_workers: int = 8  # Set to 1 for byte-identical replay; 8 for production speed
+    # Primary stop criterion: deterministic units (≈ single-core seconds), applied
+    # PER CP-SAT solve (each rolling-wave / phase).  The large disjunctive models
+    # stall at FEASIBLE (LP bound frozen at root → never provably OPTIMAL), so the
+    # solver just burns this budget chasing an unreachable bound; the incumbent hits
+    # its diminishing-returns knee early, so a small budget is the main speed knob.
+    # Default 4.0 (was None→12): measured on a 3360-task payload the /solve
+    # double-solve dropped 66→25 min at det=4 with NO lateness regression (knitting
+    # 18→7 min/pass; the relayout verify auto-derives to det=2 = 4×0.5).  Raise it
+    # only if a payload needs more optimisation.  See make_solver() for full semantics.
+    max_deterministic_time: Optional[float] = 4.0
+    washing_batch_capacity: int = 10
+    max_washing_batches: Optional[int] = None
+    # Số slot (K) tối đa cho washing batching.
+    # Nếu set: ghi đè hoàn toàn auto-calculation (K = min(n_tasks, giá trị này)).
+    # Nếu None: tự tính từ ceil(total_qty / capacity) × 3, tối thiểu 5.
+    washing_num_slots: Optional[int] = None
+    # Virtual-time points (minutes) where each work shift ends.
+    # Washing tasks must complete before, or start at/after, each boundary
+    # because the backend strips breaks from the timeline and washing cannot be interrupted.
+    shift_ends_min: List[int] = Field(default_factory=list)
+    # Two-pass same-qty re-link refinement (cold solve only).  Pass 2 relaxes the
+    # linking floor so a slice may consume the earliest-finished knitting panel of
+    # the SAME (component, qty) bucket instead of its index-paired panel, under
+    # per-task Pareto end-caps + a whole-pipeline pointwise verify: the refined
+    # schedule is accepted only if NO task finishes later than pass 1.
+    # DEFAULT OFF (2026-06-24): measured 0/9 accepted on cold inputs while costing
+    # 16–21% of total pipeline wall-time on ~half of runs (it re-runs phases 2–5).
+    # The EDD knitting hint + panel-sync (shipped after this) make pass-1 linking good
+    # enough that pass 2 only ever REGRESSES (Pareto guard rejects it).  Re-enable per
+    # payload if a future change reopens slack.
+    enable_sameqty_relink: bool = False
+    # Cold-solve knitting EDD warm-start (hints-only AddHint seed; zero new
+    # constraints/objective terms).  Cold knitting routinely stops at FEASIBLE
+    # with due-inversions on the machines; an earliest-due-date incumbent seed
+    # removed 79-85% of total order lateness in offline replays.
+    enable_edd_knitting_hint: bool = True
+    # Linking worker load-balance post-pass (cold solve only).  Re-assigns linking
+    # tasks across interchangeable linking machines to even out per-worker load,
+    # keeping every task's [start, end] fixed — downstream byte-identical, no order
+    # finishes later.  Fixes severe worker idle/imbalance (machine-load stdev 965→40
+    # on real payloads).
+    enable_linking_balance: bool = True
+    # Panel co-completion (cold solve only).  A linking SLICE_k depends on the
+    # knitting batches of EVERY component (front/back/sleeve …) at the same index;
+    # linking can only start once the LAST of that set finishes.  The solver
+    # otherwise has no incentive to finish a whole panel together, so component
+    # ends drift apart (measured ~1228 min mean spread on a 660-task payload) and
+    # linking waits on the straggler.  This phase-1 objective term minimises each
+    # panel's max component-end (the BOM-ready time that gates linking), pulling the
+    # straggler component earlier so its linking slice can start sooner — WITHOUT
+    # extra machines (a sequencing nudge).  Weighted at the flow/slice-sync scale,
+    # so it is a commensurate secondary term (the dominant lateness penalty, ×10^7
+    # per minute vs panel ×10^4, still wins) — architecturally identical to the
+    # already-shipped apply_order_flow / apply_slice_sync objectives.
+    # Measured on cold payloads (78/322/612 tasks, production budget): component-end
+    # spread −61..−65%, linking starts −11..−25%, total lateness unchanged.
+    enable_panel_sync_objective: bool = True
+    # Prompt-washing (cold solve only).  Goods that finished linking but sit unwashed
+    # for a long time risk being mislaid (operational WIP risk).  The washing
+    # objective otherwise minimises batch count + machines used (consolidation) and
+    # rewards early starts only weakly (×1), so with loose due dates an early-ready
+    # slice can be bundled into a late batch and wait a long time.  This adds a
+    # per-task penalty on the WAIT = start − material-ready, weighted min_weight//
+    # washing_prompt_weight_divisor: it accumulates across a backlog until it tops the
+    # machine-consolidation cost (so the solver clears a real pile), while staying far
+    # below the lateness band (lateness costs ~10000× more per minute than wait), so
+    # it NEVER trades a missed due date for prompt washing.  Measured (660-task cold):
+    # an early-ready slice's wait dropped from 1550 min to 0, total washing wait −10%,
+    # total lateness unchanged.  Reschedule keeps the previous layout (promptness must
+    # not fight stability).
+    # Knitting order contiguity (cold solve only).  The knitting objective is
+    # otherwise INDIFFERENT to interleaving (gap→0 leaves it unchanged), so the
+    # solver may split an order into several runs on a machine, weaving other orders
+    # through the middle.  Bosses prefer each order finished before the next ("dứt
+    # điểm đơn đó") even when nothing is late.  This adds a SOFT penalty on each
+    # order's per-(order,machine) footprint span (po_end − po_start), weighted
+    # lateness_scale × knitting_contiguity_mult, so interleaving (which stretches the
+    # span) is discouraged — but it yields when the workforce cap + shift windows
+    # genuinely force a split (a HARD contiguity constraint would be INFEASIBLE there).
+    # Measured: fragmented orders 15→12, longest run 5→3, knit makespan −5%, no
+    # added lateness; the residual is structural (concurrent-machine limit).
+    enable_knitting_contiguity: bool = True
+    knitting_contiguity_mult: int = 4
+    # Scales the in-solver order-cluster (sales-order span + o_end) penalty weight
+    # (apply_order_cluster_objective).  Default 1 = current gentle nudge.  Higher →
+    # push each customer order into a tighter/earlier block harder.  NOTE: on
+    # lateness-bound (overloaded) payloads the in-solver term is largely inert (solver
+    # stalls at FEASIBLE before optimising secondary terms — same as contiguity_mult),
+    # so the effective lever there is the post-pass reorder, not this weight.
+    order_cluster_mult: int = 1
+    # Per-order START-SYNC objective (cold solve only, apply_order_start_sync_objective).
+    # Penalise each sales order's knitting START-spread (max_start − min_start over its
+    # items) so the items run in PARALLEL — one machine each, launched together — instead
+    # of one item being deferred behind other orders' short knits (SPT scatters them).
+    # 0 = OFF (default → baseline byte-identical).  Higher → co-start harder.  Sits in the
+    # lateness band on purpose: to reserve early parallel machines for an order's big item
+    # it MUST out-weigh the ×100 SPT pull, so it trades average completion for co-start /
+    # co-completion (a deliberate, opted-in trade; capped by machine count — not all
+    # orders can co-start at once).  See order_cluster_mult for the softer span-only nudge.
+    # EFFECTIVE default is ON at 500 (engine reads config.get(...,500); Go sends 0 to
+    # disable).  Schema mirrors the effective default for documentation — cf. the other
+    # intentional schema-vs-effective params (workers, sameqty_relink, contiguity_reorder).
+    start_sync_mult: int = 500
+    # Knitting order-contiguity POST-PASS (cold solve only).  The in-solve penalty
+    # above is provably inert on overloaded payloads: the solver stops at FEASIBLE
+    # while minimising lateness (×10^7) and never optimises the secondary contiguity
+    # term (×10^1), so orders stay interleaved on a machine even where slack would
+    # let each finish before the next ("dứt điểm đơn đó").  A warm-start hint is also
+    # inert (single-worker CP-SAT tries it, then improves past it).  This post-pass
+    # re-sequences each machine so an order's tasks run contiguously, re-runs phases
+    # 2–5 on the new knitting ends, and accepts ONLY if total pipeline lateness
+    # (Σ tardiness AND late-task count) does not increase — re-sequencing pushes the
+    # yielding order later, so it is VERIFIED, not safe-by-construction (cf. the
+    # same-qty relink Pareto verify).  Workforce cap is re-checked before the verify;
+    # machines carrying a pinned/in-progress task are left untouched.  Costs ~1 extra
+    # phases-2–5 pass when a candidate is found.
+    enable_knitting_contiguity_reorder: bool = True
+    # Knitting config-continuity reorder (cold-path relayout candidate, verified).  Re-
+    # sequences the FREE knit tasks on each machine so same-yarn runs are contiguous and
+    # the run matching the machine's entry (pinned-tail) config runs first — cutting creel
+    # re-entries when new orders are appended after pinned work (contiguity reorder skips
+    # pinned-anchor machines, so this covers the reschedule-append case).  Default ON.
+    enable_knitting_config_continuity: bool = True
+    # In-solver YARN setup-cost (cold solve only).  Penalises each EXTRA yarn config
+    # (color_config) assigned to a machine → the solver dedicates machines to a config so
+    # the creel is torn down as few times as possible.  With config-continuity packing each
+    # config into one run, distinct-configs-per-machine = the machine's changeover count, so
+    # this minimises total creel changes.  Banded below lateness (never makes an order late).
+    # Default ON.  Verified on synthetic 3A+3B/2-machine: 2 changeovers → 0.
+    enable_knitting_yarn_setup_cost: bool = True
+    knitting_yarn_setup_mult: int = 4
+    # Knitting cross-machine SPREAD post-pass (cold solve only).  The solver stalls at
+    # FEASIBLE and sometimes serialises a PO's tail onto ONE machine while other
+    # compatible machines sit idle (measured: 17 tasks of one PO piled on a single
+    # machine to t=4518 while 21–25 of its 26 compatible machines were free).  Because
+    # a linking panel cannot start until the LAST of its component POs is knit, that
+    # serial tail gates the panel late.  This post-pass re-balances each knitting task
+    # to the earliest feasible start across ALL its compatible machines.  Processing in
+    # original-start order guarantees every task only moves EARLIER (its own machine is
+    # always a slot ≤ its original position), so downstream release bounds only relax →
+    # downstream assignments stay byte-identical and end-to-end lateness is monotone
+    # non-increasing — no re-solve / gate needed.  Abandoned (no-op) if the extra
+    # parallelism would breach the workforce cap; left_shift then handles same-machine.
+    enable_knitting_spread: bool = True
+    # Linking left-shift post-pass (cold solve only).  Linking due dates are usually
+    # far off, so the solver has no lateness incentive to start linking early and
+    # stalls at a FEASIBLE solution that staggers slices late even though every worker
+    # is idle and every knitting panel is ready (measured: starts 406→4024 / makespan
+    # 4225 vs an earliest-free placement of 1009).  This pulls each linking task to its
+    # knitting-derived earliest start on the earliest free compatible worker.  Monotone
+    # (only earlier) → washing/iron/packing release bounds only relax → downstream
+    # byte-identical, lateness non-increasing.  Runs after the knitting left-shift so
+    # linking also inherits any earlier knitting.
+    enable_linking_left_shift: bool = True
+    # FIFO-by-PO linking start floor (in-solver, default ON).  Go ghép cứng linking
+    # SLICE_k ↔ panel BATCH_<comp>_k theo INDEX; khi thứ tự dệt-xong không trùng index
+    # (ví dụ 643_4 + 644_5 cùng xong sớm nhưng index lệch), index-pairing ép SLICE phải
+    # chờ "đúng panel số k" trong khi một panel cùng (component, qty) đã sẵn sàng nằm
+    # chờ → linking khởi động muộn dù đủ panel.  Floor này cho SLICE thứ k chờ panel
+    # XONG-thứ-k của mỗi bucket (component, qty) thay vì panel số-hiệu-k — phản ánh đúng
+    # rằng panel cùng-component-cùng-qty thay-thế-được.  Song ánh slice↔panel ⇒ đơn hoàn
+    # thành KHÔNG đổi (slice cuối vẫn chờ panel cuối); chỉ slice GIỮA nới sớm.  Là NỚI
+    # LỎNG sàn (FIFO floor ≤ index floor luôn) nên solver chỉ tốt-hơn-hoặc-bằng.  Áp dụng
+    # ở CẢ pass 1 lẫn pass 2 (double-solve) — trước đây chỉ left-shift post-pass relax
+    # được, nhưng pass 2 của double-solve skip post-pass nên lợi ích bị mất (lịch trả UI
+    # quay về index floor).  False → giữ index floor cũ (back-compat, byte-identical).
+    enable_fifo_linking_floor: bool = True
+    # Knitting PO setup-change cost (cold solve only).  Switching a knitting machine
+    # between POs costs real setup time at the factory (yarn/pattern re-setup) that the
+    # model otherwise ignores, so the solver freely ping-pongs POs across machines.
+    # This penalises each EXTRA PO assigned to a machine (first PO free), driving the
+    # solver to DEDICATE machines to POs → same-panel component POs run on disjoint
+    # machines in parallel with no ping-pong.  Banded below lateness (never makes an
+    # order late).  Default OFF — MEASURED HARMFUL (2026-06-25, fresh-solve on a real
+    # 854-task payload): enabling it left switches UNCHANGED (286→293) while Σtardiness
+    # rose +25% (279.5k→349k) and late tasks 460→472 — the textbook FEASIBLE-stall
+    # degradation (cf. washing flush, panel-sync B2).  The cross-machine spread post-pass
+    # (enable_knitting_spread) already drives A…B…A re-entries to ~0, so this adds no
+    # contiguity benefit and only hurts.  Kept behind the flag for future experiments.
+    enable_knitting_setup_cost: bool = False
+    knitting_setup_mult: int = 4
+    # Parallel component-PO knitting (cold solve only).  A garment split into component
+    # POs (front 0-641 / back 0-642) can be knit SERIALLY by the solver — all of one PO
+    # before the other — so the first complete PANEL (one batch from EACH PO at the same
+    # index) isn't ready until the 2nd PO's first batch finishes, idling linking workers
+    # through the whole first PO (measured WE3EwiOKOy: first panel 2590 though 641
+    # finished from 914 ≈ 2 shift-days idle).  This DEDICATES disjoint machine subsets to
+    # each component PO (split ∝ workload) so they knit IN PARALLEL → first/middle panels
+    # ready far sooner, feeding linking early; each machine still runs one PO contiguously
+    # (no PO-switch setup).  NOT monotone (first-PO batches move later to free machines)
+    # so it is a VERIFIED reorder post-pass: re-sequence, re-run phases 2–5, accept only
+    # if total lateness + late-order count do not increase.  Skipped on re-schedule.
+    enable_knitting_parallel_pos: bool = True
+    # Cheaper solver budget for the knitting-relayout VERIFY re-solve (parallel-PO +
+    # contiguity now share ONE verified phases-2–5 re-solve).  The verify only checks
+    # that the relayout does not raise lateness; the deterministic left-shift post-passes
+    # repair tightness afterward, so it does not need the full det-time budget.  By
+    # default the verify uses knitting_reorder_verify_frac × the configured
+    # max_deterministic_time; set knitting_reorder_verify_det for an absolute cap.
+    knitting_reorder_verify_frac: float = 0.5
+    knitting_reorder_verify_det: Optional[float] = None
+    enable_washing_prompt: bool = True
+    washing_prompt_weight_divisor: int = 100
+    # FIFO fairness for prompt-washing: a flat wait penalty minimises TOTAL wait but
+    # is symmetric about WHICH item waits, so it can strand one early-ready slice in a
+    # late batch behind later-ready ones.  Scaling each task's wait weight by its
+    # earliness (factor 1..1+span) makes the solver wash earliest-ready material first
+    # (true FIFO).  Measured: an early-ready slice stranded 1550 min → 103, longest
+    # single wait −71%, total wait −22%, lateness unchanged.  0 disables (flat).
+    washing_prompt_fifo_span: int = 50
+    # End-of-shift washing flush — COLD-only deterministic POST-PASS (default OFF).
+    # An in-solver penalty was tried and reverted (it added genuinely-constrained
+    # BoolVars to the FEASIBLE-stuck washing solve and degraded it).  Instead this runs
+    # AFTER all phases on the final output: any washing task that became ready before a
+    # shift boundary but is scheduled to start in a LATER shift is pulled into a flush
+    # batch that ENDS exactly at that boundary (start = boundary − duration, so it never
+    # straddles the break), IF a compatible washing machine has that window free.  It
+    # only moves tasks EARLIER and never touches downstream, so it is safe by
+    # construction: nothing finishes later, machine no-overlap is checked, end-to-end
+    # lateness is unchanged (operational WIP win — goods wash before the break instead of
+    # sitting overnight — not a lateness win).  Skipped on re-schedule.
+    enable_washing_flush: bool = True
+    # Washing left-shift — COLD-only deterministic POST-PASS (default ON), run after the
+    # flush and BEFORE ironing/packing solve.  The washing solver consolidates batches
+    # and only weakly rewards early starts, so it can co-batch an early-ready slice with
+    # a much-later-ready slice of another order: the batch is gated by the latest member
+    # and the early goods sit unwashed while the (often single) compatible machine is
+    # idle.  The flush only fixes the slot that ENDS at a shift boundary; when that
+    # pre-break window is busy it cannot help even though the machine is free right after
+    # the break.  This peels the early-ready members out and re-seats them in the earliest
+    # boundary-safe free wash slot strictly earlier than the cycle's start (respecting
+    # capacity + (color, substance) compatibility + shift boundaries).  Monotone: a task
+    # only moves earlier ⇒ downstream release bounds relax ⇒ ironing/packing stay valid
+    # and end-to-end lateness is non-increasing.  Skipped on re-schedule (washing kept).
+    enable_washing_left_shift: bool = True
+    # Dyelot PIECE-SPLIT (GĐ2 of the relaxation "1 item = 1 dyelot" → "1 áo = 1
+    # dyelot").  True → the dyelot allocator may split one item's integer GARMENT
+    # count across several lots (6 áo lot A + 4 áo lot B); same-lot stays
+    # PREFERRED (each extra lot an item touches is priced in the flush tier).
+    # order_dyelot_assignment then carries one row per (order, vi, dyelot) with
+    # `kg` + `pieces` + `runs` (the share per (machine, piece-kind) run, with its
+    # task ids — GĐ4 per-machine hand-off).  False (default) → the legacy one-hot model, byte-identical:
+    # one dyelot per (order, vi), FRAGMENTED shortages, single-lot remedies.
+    # MUST be declared here: SolverConfig drops unknown keys (extra="ignore"),
+    # so an undeclared flag sent by Go would silently never reach the allocator.
+    dyelot_allow_mixing: bool = False
+
+
+class PreviousAssignment(BaseModel):
+    """One task↔machine assignment from a prior solve, used to seed re-schedule hints."""
+    task_id: str
+    machine_id: str
+    start_time: int
+    end_time: int
+    original_order_id: str = ""
+
+
+class RescheduleHint(BaseModel):
+    """Optional hint payload that drives the re-schedule stability mechanism.
+
+    Calibration (B.4 — measured on the symmetric fixture):
+      * start tie-breaker (per task per start-minute) = max(1, 10**(6-priority)//100).
+        With priority=3 (default) → 10.  Uniform priority=1 → 1000.
+      * lateness coeff (per task per minute late)     = 10**(6-priority)*100.
+        With priority=3 (default) → 100_000.
+
+    Calibration window required: start_coeff  «  w_time  «  lateness_coeff.
+      → w_time = 500 (50× the typical start tie-breaker, 200× below lateness).
+      → w_machine = 50_000 (100× w_time, ≈ 5_000 start-minutes worth — set
+        empirically after observing production payload (732 tasks, 110 machines,
+        60s search) where w_machine=20_000 left keep_rate at 86%.  Combined
+        with solver `repair_hint=True` in make_solver, this raises keep_rate
+        toward the ≥95% target.  Still < lateness coeff (100_000) so no
+        accidental "ổn định thay vì kịp deadline" tradeoff.
+    """
+    previous_assignments: List[PreviousAssignment] = Field(default_factory=list)
+    stability_weight_time_per_min: int = 500
+    stability_weight_machine_swap: int = 50_000
+    match_by_order_fallback: bool = True
+
+
+class DyelotStock(BaseModel):
+    """Tồn kho theo dyelot (chuẩn bị cho post-pass dyelot — chưa tiêu thụ)."""
+    vi: str
+    dyelot: str
+    remaining_kg: float
+    packing_size: float
+    # Phần của remaining_kg nằm ở bin Buffer (sợi đã staged). Post-pass ưu tiên mở
+    # lot có buffer (tier 4) để vét buffer trước khi xuất kho tổng. 0/thiếu = lot raw.
+    buffer_kg: float = 0.0
+
+
+class InProductionDyelot(BaseModel):
+    """Đơn in-production (converted/pinned) đã cam kết một dyelot trên một máy.
+    Cho post-pass dyelot pin đơn đó vào lot đã cam kết + co-lot đơn mới chung máy.
+    Một dòng / (order, vi, máy)."""
+    order: str
+    vi: str
+    dyelot: str
+    machine_id: str
+    start_time: int = 0
+    net_kg: float = 0.0
+    slots: int = 0
+    committed_kg: float = 0.0
 
 
 class SolverPayload(BaseModel):
@@ -89,3 +418,16 @@ class SolverPayload(BaseModel):
     machines: List[Machine]
     resources: List[SolverResource] = Field(default_factory=list)
     tasks: List[SolverTask]
+    material_capacities: Dict[str, int] = Field(
+        default_factory=dict,
+        description="Per-material creel capacity: material_code → total available rolls/slots",
+    )
+    dyelot_stock: List[DyelotStock] = Field(default_factory=list)
+    # Default roll size (kg) per thread vi, incl. vis with zero current stock.
+    # The dyelot post-pass uses it to size a fresh dyelot for a zero-stock vi
+    # (whole-roll / creel-up gross needs a roll size). Empty → net floor fallback.
+    vi_packing_size: Dict[str, float] = Field(default_factory=dict)
+    # In-production (converted/pinned) orders' committed dye lots + knit footprint,
+    # so the dyelot post-pass pins them and co-lots a sharing new order.
+    in_production: List[InProductionDyelot] = Field(default_factory=list)
+    reschedule_hint: Optional[RescheduleHint] = None

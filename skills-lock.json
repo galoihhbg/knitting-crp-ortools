@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "vibe-debug": {
+      "source": "galoihhbg/satori-vibe-coding-template",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/vibe-debug/SKILL.md",
+      "computedHash": "0ccd5189b4e3394cbfba372058e67d75752c704bc9a290182594b0e4d6487d0b"
+    }
+  }
+}

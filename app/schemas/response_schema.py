@@ -11,6 +11,7 @@ class Assignment(BaseModel):
     order_id: str = ""
     quantity: float = 0
     status: str = "ON_TIME"
+    batch_slot_id: str = ""
 
 
 class Overload(BaseModel):

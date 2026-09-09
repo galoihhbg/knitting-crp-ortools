@@ -17,6 +17,14 @@
 - **Comments:** Domain-specific Vietnamese comments in `builder.py` are intentional — they explain yarn-setup business logic to the factory domain team. Do not remove or translate.
 - **Logging:** Every builder method logs its key constraint applications at `INFO`. Warnings for skipped/unresolvable inputs. Never silently skip.
 
+## Material Constraint Invariants
+
+- `build_material_constraints()` is the **only** place `AddCumulative` is called for material limits — no per-task-pair BoolVars
+- Interval for material cumulative is `NewIntervalVar(tv["start"], duration, tv["end"])` — strictly bound to task window; material auto-released on task end
+- `material_capacities` absent from payload → method is a no-op (early return); backward compatible
+- All demands and capacities passed to `AddCumulative` must be `int`
+- Undeclared materials in `task.material_demands` (not in `material_capacities`) are warned and skipped — no crash
+
 ## Quality Gates
 
 - `pytest tests/ -v` must pass before any commit

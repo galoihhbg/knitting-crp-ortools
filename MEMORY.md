@@ -7,12 +7,13 @@ DO NOT delete historical context if it is still relevant. Compress older complet
 ## 🏗️ Active Phase & Goal
 
 **Current Phase:** Phase 1 — Close P1 Gaps
-**Current Phase:** Phase 1 — COMPLETE ✅
-**Next Phase:** Phase 2 — Benchmarks, soft offsets, boolean exclusion option
-**Next Steps (Phase 2):**
-1. Benchmark harness at 200 / 500 / 1000 tasks
-2. Soft pipeline offset relaxation (Phase 2)
-3. Boolean exclusion option for workforce constraints (when RAM > 4 GB at 500+ tasks)
+**Current Phase:** Phase 3 — COMPLETE ✅
+**All MVP phases done.** Codebase is production-ready.
+
+## ✅ Phase 2 Completed Steps
+1. ~~Benchmark harness `scripts/benchmark.py` at 200/500/1000 tasks~~ ✅ (200-task: 0.3s, 69MB)
+2. ~~Soft pipeline offset relaxation in `apply_batch_offset_constraints()` (auto at load > 85%)~~ ✅
+3. ~~Boolean exclusion workforce mode `use_boolean_exclusion` + slot-based NoOverlap~~ ✅ (auto at ghost_count > 200)
 
 ## ✅ Phase 1 Completed Steps
 1. ~~Add `random_seed` + `num_search_workers` to `SolverConfig` and wire in `Engine.solve()`~~ ✅
@@ -22,13 +23,25 @@ DO NOT delete historical context if it is still relevant. Compress older complet
 5. ~~Overload-ratio diagnostic in `model.py` (warn when factory load > 85%)~~ ✅
 6. ~~Dynamic objective weight calibration: `LATENESS:AFFINITY:ACTIVATION ≈ 1000:10:2`, `lateness_scale = max(1, horizon // 1000)`~~ ✅
 
+## ✅ Phase 4 Completed Steps
+
+1. ~~Dynamic material cumulative constraints (`build_material_constraints()` in `builder.py`)~~ ✅
+   - `SolverPayload.material_capacities: Dict[str, int]` — top-level creel capacity map
+   - `SolverTask.material_demands: Dict[str, int]` — per-task yarn-roll consumption
+   - `AddCumulative` (Profile Sweep) per material — O(n log n), no BoolVar explosion
+   - 6 unit tests in `tests/test_material_constraints.py`
+
 ## 📂 Architectural Decisions
 
+- **2026-04-15** — Dynamic material constraints: `build_material_constraints()` uses `AddCumulative` (not BoolVar pairs) per material. Interval anchored to task [start, end] so material is auto-released on task completion. Constraint is a no-op when `material_capacities` is absent — backward compatible.
 - **2026-04-11** — Chose `AddCumulative` + ghost tasks (Option A) for workforce capacity. Keep for MVP. Add ghost-task count guard at 200. Switch to boolean exclusion only if RAM > 4GB at 500+ tasks.
 - **2026-04-11** — `wait_offsets` constraints remain hard for MVP. Add `overload_ratio` warning log when factory load > 85%. Soft relaxation is Phase 2.
 - **2026-04-11** — `root_cause_code` classification lives in Python (`builder.py`), not Go. Go only sees the final JSON — it lacks access to solver variable states and pinned task metadata.
 - **2026-04-11** — Dynamic objective weight calibration: `LATENESS : AFFINITY : ACTIVATION ≈ 1000 : 10 : 2`. `lateness_scale = max(1, horizon // 1000)`. Ship in Phase 1 Step 7.
-- **2026-04-11** — Determinism strategy: `random_seed=42` default + `num_search_workers=1` for regression tests. Production uses `num_search_workers=8` for speed; replay tests must override to 1.
+- **2026-05-06** — Order Flow Optimization: replaced the simple cross-PO start-time gap penalty with a comprehensive "Order Flow" objective in `shared.py`. For each `group_id`, the solver now minimizes `group_end` and `group_end - group_start` (Makespan + Span). This provides a strong incentive (weighted at ~5% of lateness) to parallelize POs across multiple machines, overcoming setup/affinity biases to ensure downstream phases (Linking, Washing) receive material as early as possible.
+- **2026-05-06** — Multi-PO Parallelism: initial fix using start-gap penalty. Upgraded to Flow Optimization in next step.
+- **2026-04-11** — Determinism strategy: `random_seed=42` default + `num_search_workers=1` for regression tests. Production uses `num_search_workers=8` for speed; replay tests must override to 1. Ensure dict iterations are sorted (e.g. `sorted(dict.items())`) to preserve solver determinism.
+- **2026-05-08** — Temporarily disabled material demand constraints in Phase 1 (Knitting) per user request. Infrastructure remains in place in `phase1_knitting.py` and `builder.py` but the call to `_apply_material_constraints` is commented out.
 
 ## 🐛 Known Issues & Quirks
 
@@ -51,4 +64,9 @@ DO NOT delete historical context if it is still relevant. Compress older complet
 - [x] PRD written → `docs/PRD-Knitting-CRP-Ortools-MVP.md`
 - [x] TechDesign written → `docs/TechDesign-Knitting-CRP-Ortools-MVP.md`
 - [x] Phase 1: Wire random_seed, root-cause classifier, ghost-task guard, overload diagnostic, dynamic weights
-- [ ] Phase 2: Benchmarks, soft offsets, boolean exclusion option
+- [x] Phase 2: Benchmark harness, soft pipeline offsets, boolean exclusion workforce mode
+- [x] Phase 3: Webhook retry + structured logging, enhanced /health, E2E test suite (22 tests)
+- [x] Same-qty re-link refinement (2026-06-12): two-pass cold-solve — pass 2 relaxes linking floor to k-th-earliest same-(component,qty) panel (FIFO bucket, never cross-qty), with per-task Pareto end-caps + whole-pipeline pointwise verify (any task later → keep pass 1). `compute_sameqty_start_lb` + `apply_end_caps` + `Pipeline._try_sameqty_relink`; config gate `enable_sameqty_relink` (default True). Tests: tests/test_sameqty_relink.py (7).
+- [x] EDD knitting warm-start (2026-06-12): cold-path AddHint seed via `_edd_warm_start_assignments` + `apply_stability_hints_only` (zero constraints/objective; workforce-aware greedy, pins/blocks/unavailability respected). Real-solve: −75% tot-late, −4 late orders (626-task payload), determinism intact, +53% phase-1 wall. Flag `enable_edd_knitting_hint` (default True). Tests: tests/test_edd_knitting_hint.py (8). Validate-under-caps PHA-V passed (workforce OK, material no-worse; creel constraint currently disabled in phase1).
+- [x] Dyelot allocation post-pass (2026-06-17): `app/engine/dyelot_allocator.py` — per-VI CP-SAT after knitting, replaces Go greedy never-flush. 1 dyelot/(đơn,VI) via `order_group_id` (gom batch của 1 đơn); GROSS reuse-aware capacity (whole-roll + creel-up `slots`); lexicographic objective (assigned ▸ −flush ▸ −lots ▸ drain-small); `una[o]` ⇒ luôn feasible. Output: order_dyelot_assignment / flush_points / unassigned / shortage{net_demand, gross demand, stock, single_lot_deficit, topups[] per-lot alternatives, new_lot_kg}. Schema adds `order_group_id`, `vi_packing_size` (default pk=1). Go: `attachMainYarnConsumption` + `buildDyelotStock`. Full doc: `agent_docs/dyelot_solver_overview.md`. Tests: tests/test_dyelot_allocator.py + test_dyelot_fields.py.
+- [x] Linking worker load-balance (2026-06-13): `balance_linking_load` post-pass (phase2_linking) — re-assign linking tasks across interchangeable machines, [start,end] FIXED → downstream byte-identical, lateness unchanged, zero regression. Real-Engine: linkUsed 16→20, load stdev 965→40. Cold-only, flag `enable_linking_balance`. Tests: tests/test_linking_balance.py (7). Rejected alts: pool floor (violates wait-for-enough-panels), min-max-load CP objective (intractable). Found bug: compute_sameqty_start_lb is no-op (WaitOffsets re-pins to index panel).
